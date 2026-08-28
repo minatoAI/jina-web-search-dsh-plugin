@@ -1,12 +1,13 @@
 {
   "name": "dsh-jina",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "Jina AI tools for DeepSeek Harness: search (incl. arxiv/ssrn academic domains), read, screenshot, embed, rerank, classify, pdf, expand, datetime, primer — with a settings-page API key UI.",
   "type": "module",
   "main": "index.js",
   "exports": {
     ".": "./index.js",
     "./package.json": "./package.json",
+    "./client": "./ui/client.js",
     "./ui": "./ui/index.js",
     "./ui/package.json": "./ui/package.json"
   },
@@ -27,6 +28,12 @@
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-api-remotes"
+      ]
     }
   },
   "license": "MIT",

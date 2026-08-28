@@ -8,6 +8,11 @@ DeepSeek Harness 的 [Jina AI](https://jina.ai/) 插件（bundle）：把 jina-c
 
 > 此处仅展示最新版本，完整版本历史见 [change-log.md](./change-log.md)。
 
+### 0.5.1（2026-08-29）
+
+- **fix** 修复 Web 设置中「Jina Tools」配置选项卡消失的问题（在 dsh 0.1.2-alpha.1 + 运行中的 profile 实测定位）：client-modules 扫描只把「行名 = 精确包名」的行纳入 `window.__DSH_BOOT__` 客户端图，子路径行（`dsh-jina/ui`）不会成为客户端行——浏览器半身从不加载，`settings.plugin.item` 里没有 `jina-tools` 键，配置页因此渲染不出卡片（宿主侧工具与命名空间均正常）。修复：浏览器半身声明上移到**根 manifest**，组合层改为单个双面孔行 `dsh-jina`，删除 `dsh-jina/ui` 行。
+- **docs** 更新「仓库结构」与「开发说明」。
+
 ### 0.5.0（2026-08-29）
 
 - **fix** 适配 dsh 0.1.2-alpha.1 的 apiproxy 重构（`refactor(apiproxy)!: remove settings and credentials RPCs`）：浏览器半身的凭据 RPC 从已移除的 `connection.api.credentials.*` 迁移到 Typert Remote 凭据命名空间 `ctx.remote.credentials`（`credentials/describe|set|unset`）——`describe` 改为批量接收 `refs[]`、`set/unset` 改为位置参数，响应包络由 `{result:{ok,value}}` 改为 `{ok,value|error}`；变更事件 `credentials/updated` 同步更名为 `credentials/reference-updated`（仍由同一 `remote` 服务转发）。
@@ -107,16 +112,16 @@ dsh plugin --profile web remove dsh-jina
 
 ```
 jina-dsh-plugin/
-├── package.json       # manifest: "dsh": { "bundle": { "patch": "./cordis.patch.yml" } }
-├── cordis.patch.yml   # 组合层：插入 dsh-jina（主机工具行）与 dsh-jina/ui（客户端 UI 行）
+├── package.json       # manifest: "dsh": { "bundle": {"patch": ...}, "client": {"platform": "web"} }; 浏览器半身经 exports["./client"] 指向 ui/client.js
+├── cordis.patch.yml   # 组合层：单个双面孔行 dsh-jina（宿主工具 + 浏览器卡片；行名 = 精确包名是 client-modules 扫描的硬条件）
 ├── index.js           # 主机插件：12 个工具（含 jina_search_arxiv / jina_search_ssrn 专用学术检索）+ 网络传输 + JINA_API_KEY 凭据解析
 ├── primer.js          # 纯函数模块：jina_primer 的解析 / 格式化逻辑（零依赖，可单测）
 ├── test/
 │   ├── primer.test.js # jina_primer 单元测试（node --test 自动发现）
 │   └── tools.test.js  # jina_web_search 模型可见契约测试（TDD）
 ├── ui/
-│   ├── package.json   # dsh.client 声明（platform: web）
-│   ├── index.js       # 空主机半身（保证 loader 行可用）
+│   ├── package.json   # 子包 manifest（exports["./client"]；dsh.client 主声明已在根包，此处仅保持子包完整）
+│   ├── index.js       # 空主机半身（保留历史子包结构；组合层不再引用）
 │   └── client.js      # 预构建浏览器 bundle：设置 → 插件 → 配置 的 "Jina Tools" 卡片
 ├── change-log.md      # 完整版本历史（简体中文）
 ├── change-log.en.md   # 完整版本历史（English）
@@ -128,7 +133,7 @@ jina-dsh-plugin/
 
 - 主机插件只依赖 Node 内置模块与 dsh 主机服务（`fs`、`subprocess`、`tools`、`credentials`），无第三方 npm 依赖；凭据走 dsh 原生的 credential seam（引用 `JINA_API_KEY`），任何 profile 组合都可以直接使用。
 - 客户端 bundle 直接提交（`ui/client.js`），无构建步骤，git 安装开箱即用。改 UI 后直接改该文件并重启即可。卡片注册进 Web 设置包声明的 `settings.plugin.item` 插槽（设置 → 插件 → 配置），这是第三方插件配置的标准位置；key 通过标准的 `ctx.remote.credentials` 凭据 Remote（`credentials.describe/set/unset`，变更事件 `credentials/reference-updated`）管理——这是唯一对第三方插件开放的配置通道，settings 命名空间对浏览器有白名单限制。
-- 组合层遵循 dsh 约定：主机行 `dsh-jina` 注册模型工具；客户端行 `dsh-jina/ui` 由 host 的 client-modules 服务通过 `ui/package.json` 的 `dsh.client` 声明发现并接入 Web boot graph。
+- 组合层遵循 dsh 约定：单个双面孔行 `dsh-jina` 同时携带宿主半身与浏览器半身。浏览器半身由**根 manifest** 的 `dsh.client`（platform: web，图边注入 `@deepseek-ai/dsh-api-remotes`）与 `exports["./client"]` 声明，host 的 client-modules 服务扫描时按行名（精确包名）定位根 manifest 并接入 Web boot graph。注意 client-modules 扫描只接受精确包名行：子路径行（如 `dsh-jina/ui`）永远不会被扫描为客户端行——浏览器半身必须声明在根包。
 
 ## 测试
 

@@ -1,16 +1,17 @@
 # dsh-jina bundle layer — applied on top of a dsh profile's composition.
 #
-# Two rows:
-#   - dsh-jina      host plugin: the twelve jina_* model tools and the network
-#                   transport. The API key lives in the host credential seam
-#                   (reference JINA_API_KEY, written by the web settings page
-#                   via credentials.set) — this patch defines no settings.
-#   - dsh-jina/ui   dual-face client package: an empty host half plus the
-#                   prebuilt browser bundle that registers the "Jina Tools"
-#                   page in the web settings panel.
+# One dual-face row (`dsh-jina`), the shape dsh uses for every browser-half
+# package: the host half registers the twelve jina_* model tools and the
+# network transport; the browser half is declared by the ROOT manifest's
+# `dsh.client` + `exports["./client"]` and registers the "Jina Tools" card in
+# the web settings panel. The client-modules scan only accepts rows whose
+# `name` is an exact package name — subpath rows like `dsh-jina/ui` are never
+# scanned into the Web boot graph, so the whole browser half must ride this
+# one row.
+#
+# The API key lives in the host credential seam (reference JINA_API_KEY,
+# written by the web settings page via credentials.set) — this patch defines
+# no settings.
 - insert:
     - id: jina-tools
       name: dsh-jina
-
-    - id: jina-settings-ui
-      name: dsh-jina/ui

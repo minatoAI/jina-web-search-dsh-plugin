@@ -8,6 +8,11 @@ A [Jina AI](https://jina.ai/) plugin (bundle) for DeepSeek Harness: it exposes t
 
 > Only the latest release is listed here; the full version history lives in [change-log.en.md](./change-log.en.md).
 
+### 0.5.1 (2026-08-29)
+
+- **fix** Fix the vanished "Jina Tools" configuration tab in Web settings (diagnosed against a live dsh 0.1.2-alpha.1 + running profile): the client-modules scan only folds rows whose `name` is an exact package name into the `window.__DSH_BOOT__` client graph — subpath rows (`dsh-jina/ui`) never become client rows, so the browser half never loads, `settings.plugin.item` has no `jina-tools` key, and the configuration section renders no card (the host side — tools and namespace — is healthy). Fix: the browser-half declaration moves up to the root manifest, the composition layer becomes one dual-face row `dsh-jina`, and the `dsh-jina/ui` row is deleted.
+- **docs** Update "Repository structure" and "Development notes".
+
 ### 0.5.0 (2026-08-29)
 
 - **fix** Compatible with the dsh 0.1.2-alpha.1 apiproxy refactor (`refactor(apiproxy)!: remove settings and credentials RPCs`): the browser half's credential RPC moves from the removed `connection.api.credentials.*` to the Typert Remote credentials namespace `ctx.remote.credentials` (`credentials/describe|set|unset`) — `describe` now takes a batch `refs[]`, `set`/`unset` take positional arguments, and the response envelope changes from `{result:{ok,value}}` to `{ok,value|error}`; the change event `credentials/updated` is renamed `credentials/reference-updated` (still forwarded by the same `remote` service).
@@ -107,16 +112,16 @@ dsh plugin --profile web remove dsh-jina
 
 ```
 jina-dsh-plugin/
-├── package.json       # manifest: "dsh": { "bundle": { "patch": "./cordis.patch.yml" } }
-├── cordis.patch.yml   # composition layer: injects dsh-jina (host tool row) and dsh-jina/ui (client UI row)
+├── package.json       # manifest: "dsh": { "bundle": {"patch": ...}, "client": {"platform": "web"} }; the browser half is exported via exports["./client"] → ui/client.js
+├── cordis.patch.yml   # composition layer: one dual-face row dsh-jina (host tools + browser card; an exact-package-name row name is a hard requirement of the client-modules scan)
 ├── index.js           # host plugin: 12 tools (incl. dedicated jina_search_arxiv / jina_search_ssrn academic search) + network transport + JINA_API_KEY credential resolution
 ├── primer.js          # pure module: jina_primer parsing/formatting logic (zero deps, unit-testable)
 ├── test/
 │   ├── primer.test.js # jina_primer unit tests (auto-discovered by node --test)
 │   └── tools.test.js  # jina_web_search model-facing contract tests (TDD)
 ├── ui/
-│   ├── package.json   # dsh.client declaration (platform: web)
-│   ├── index.js       # empty host half (keeps the loader row usable)
+│   ├── package.json   # subpackage manifest (exports["./client"]; the dsh.client declaration now lives in the root manifest)
+│   ├── index.js       # empty host half (kept for the historical subpackage shape; the composition no longer references it)
 │   └── client.js      # prebuilt browser bundle: the "Jina Tools" card under Settings → Plugins → Configuration
 ├── change-log.md      # full changelog (Simplified Chinese)
 ├── change-log.en.md   # full changelog (English)
@@ -128,7 +133,7 @@ jina-dsh-plugin/
 
 - The host plugin only depends on Node built-ins and dsh host services (`fs`, `subprocess`, `tools`, `credentials`) — no third-party npm dependencies; credentials go through dsh's native credential seam (referencing `JINA_API_KEY`), so it works with any profile composition out of the box.
 - The client bundle is committed directly (`ui/client.js`), no build step — git installs work as-is. To change the UI, edit that file and restart. The card registers into the `settings.plugin.item` slot declared by the Web settings package (Settings → Plugins → Configuration), the standard place for third-party plugin configuration; the key is managed via the standard `ctx.remote.credentials` credential Remote (`credentials.describe/set/unset`, change event `credentials/reference-updated`) — the only configuration channel open to third-party plugins (the settings namespace is allowlist-restricted for browsers).
-- The composition layer follows dsh conventions: the host row `dsh-jina` registers model tools; the client row `dsh-jina/ui` is discovered by the host's client-modules service through the `dsh.client` declaration in `ui/package.json` and wired into the Web boot graph.
+- The composition layer follows dsh conventions: one dual-face row `dsh-jina` carries both the host half and the browser half. The browser half is declared by the ROOT manifest's `dsh.client` (platform: web, graph edge `@deepseek-ai/dsh-api-remotes`) plus `exports["./client"]`; the host's client-modules service locates the root manifest by the row name (an exact package name) and wires it into the Web boot graph. Note the client-modules scan accepts only exact-package-name rows: subpath rows (e.g. `dsh-jina/ui`) are never scanned as client rows — the browser half must be declared at the package root.
 
 ## Tests
 

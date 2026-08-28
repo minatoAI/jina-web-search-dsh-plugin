@@ -2,6 +2,11 @@
 
 Full version history of dsh-jina; the "Changelog" section of [README.en.md](./README.en.md) keeps only the latest release.
 
+### 0.5.1 (2026-08-29)
+
+- **fix** Fix the vanished "Jina Tools" configuration tab in Web settings (diagnosed against a live dsh 0.1.2-alpha.1 + running profile): the new harness's client-modules scan only folds rows whose `name` is an exact package name into the `window.__DSH_BOOT__` client graph — subpath rows (`dsh-jina/ui`) are classified "permanently not a client row", so the browser half never loads, `settings.plugin.item` has no `jina-tools` key, and the settings section renders no card (the host side — 12 tools and the served `jina-tools` namespace — is healthy, so only the UI is missing). Fix: the browser-half declaration (`dsh.client` + `exports["./client"]`) moves up to the root manifest, the composition layer becomes a single dual-face row `dsh-jina` (the same shape as the harness's own `dsh-client-*` packages), and the `dsh-jina/ui` row is deleted; the card key, credential channel, and event name are unchanged.
+- **docs** Update "Repository structure" and "Development notes" to document the client-modules scan constraint that the browser half must be declared at the package root.
+
 ### 0.5.0 (2026-08-29)
 
 - **fix** Compatible with the dsh 0.1.2-alpha.1 apiproxy refactor (`refactor(apiproxy)!: remove settings and credentials RPCs`, 2026-08-27): the browser half's credential RPC moves from the removed `connection.api.credentials.*` to the Typert Remote credentials namespace `ctx.remote.credentials` (`credentials/describe|set|unset`) — `describe` now takes a batch `refs[]`, `set`/`unset` take positional arguments, and the response envelope changes from `{result:{ok,value}}` to `{ok,value|error}`; the change event `credentials/updated` is renamed `credentials/reference-updated` (still forwarded by the same `remote` service).
