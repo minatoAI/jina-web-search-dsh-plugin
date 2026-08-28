@@ -55,14 +55,22 @@ DeepSeek Harness 的 [Jina AI](https://jina.ai/) 插件（bundle）：把 jina-c
 
 插件按 [bundle](https://github.com/deepseek-ai/deepseek-harness/blob/main/docs/user/develop/basic/publish.md) 方式分发，用 `dsh plugin` 安装进 profile（从源码 checkout 运行时用 `pnpm dsh` 代替 `dsh`）：
 
+
+> 从 GitHub 安装（本项目无 build 脚本，无需 allowBuilds 授权）
+
 ```sh
-# 从 GitHub 安装（本项目无 build 脚本，无需 allowBuilds 授权）
 dsh plugin --profile web add github:minatoAI/jina-web-search-dsh-plugin
+```
 
-# 更稳妥：固定到某个 commit，避免后续推送改变实际安装到的代码
+> 更稳妥：固定到某个 commit，避免后续推送改变实际安装到的代码
+
+```sh
 dsh plugin --profile web add github:minatoAI/jina-web-search-dsh-plugin#<commit-sha>
+```
 
-# 或本地文件夹安装（开发调试用）
+> 或本地文件夹安装（开发调试用）
+
+```sh
 dsh plugin --profile web add ./jina-dsh-plugin
 ```
 
