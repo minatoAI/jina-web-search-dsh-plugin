@@ -54,14 +54,21 @@ Repository: https://github.com/minatoAI/jina-web-search-dsh-plugin
 
 The plugin is distributed as a [bundle](https://github.com/deepseek-ai/deepseek-harness/blob/main/docs/user/develop/basic/publish.md) and installed into a profile with `dsh plugin` (use `pnpm dsh` instead of `dsh` when running from a source checkout):
 
+> install from GitHub (no build script, so no allowBuilds grant needed)
+
 ```sh
-# install from GitHub (no build script, so no allowBuilds grant needed)
 dsh plugin --profile web add github:minatoAI/jina-web-search-dsh-plugin
+```
 
-# more robust: pin to a commit so later pushes don't change the installed code
+> more robust: pin to a commit so later pushes don't change the installed code
+
+```sh
 dsh plugin --profile web add github:minatoAI/jina-web-search-dsh-plugin#<commit-sha>
+```
 
-# or install from a local folder (development)
+> or install from a local folder (development)
+
+```sh
 dsh plugin --profile web add ./jina-dsh-plugin
 ```
 
