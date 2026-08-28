@@ -1,28 +1,35 @@
-// dsh-jina/ui — browser bundle (prebuilt; no build step required).
+// dsh-jina — browser bundle (prebuilt; no build step required).
 //
-// Executing this script only REGISTERS its factory with the module system
-// (`window.__ModuleLoader__.load`). The factory materializes on first import
-// and returns a cordis client plugin that contributes a "Jina Tools" card to
-// the standard plugin configuration surface (Settings → Plugins → Configure,
-// the `settings.plugin.item` KEYED slot declared by the web settings package —
-// the same surface that hosts the Terminal / Agent loop / Web search cards).
-// A keyed entry is keyed by the settings namespace the card edits, so the
-// card registers under `key: 'jina-tools'` — the same namespace the host half
-// (index.js) serves — and the tab renders the card only when both halves
-// agree on that namespace.
+// Executing this script only REGISTERS its factory with the client module
+// system (`window.__ModuleLoader__.load`). The registration id MUST equal the
+// boot-graph row id — the exact package name `dsh-jina` (the host's
+// client-modules scan keys rows by package name; the runtime normalizes a
+// trailing `/client` only, never a subpath). A subpath id (e.g. the historical
+// `dsh-jina/ui`) registers a key nobody asks for, and the module system
+// reports `loaded without registering "dsh-jina"`. The factory materializes on
+// first import and returns a cordis client plugin that contributes a "Jina
+// Tools" card to the standard plugin configuration surface (Settings → Plugins
+// → Configure, the `settings.plugin.item` KEYED slot declared by the web
+// settings package — the same surface that hosts the Terminal / Agent loop /
+// Web search cards). A keyed entry is keyed by the settings namespace the card
+// edits, so the card registers under `key: 'jina-tools'` — the same namespace
+// the host half (index.js) serves — and the tab renders the card only when
+// both halves agree on that namespace.
 //
 // The card manages the `JINA_API_KEY` credential through the standard
-// credentials Remote namespace (`ctx.remote.credentials`, the Typert Remote
-// domain the credentials controller hosts: describe/set/unset): values cross
+// credentials Remote namespace: `remote.credentials` (the generated `$mount`
+// installs it as its own `remote.credentials` cordis service — inject it, do
+// not reach through the `remote` object) with describe/set/unset. Values cross
 // the wire only on save, and the page shows configured state, never the
 // stored value. It refreshes when the Host reports the reference changed
-// (`credentials/reference-updated`). It also runs the key health check: a GET
-// to the host-provided `/api/dsh-jina/primer` route (registered by the
-// bundle's host half when a web server is composed), which answers with the
-// key's Jina identity and credit balance — the same data `jina_primer`
-// reports. The key itself never leaves the host.
+// (`credentials/reference-updated`, observed on the `remote` service itself).
+// It also runs the key health check: a GET to the host-provided
+// `/api/dsh-jina/primer` route (registered by the bundle's host half when a
+// web server is composed), which answers with the key's Jina identity and
+// credit balance — the same data `jina_primer` reports. The key itself never
+// leaves the host.
 window.__ModuleLoader__.load({
-  id: 'dsh-jina/ui',
+  id: 'dsh-jina',
   factory: function (require) {
     var React = require('react')
     var exports = {}
@@ -65,6 +72,7 @@ window.__ModuleLoader__.load({
 
     function JinaCard(props) {
       var remote = props.remote
+      var credentials = props.credentials
       var [open, setOpen] = React.useState(false)
       var [input, setInput] = React.useState('')
       var [status, setStatus] = React.useState('')
@@ -73,7 +81,6 @@ window.__ModuleLoader__.load({
       var [primer, setPrimer] = React.useState({ phase: 'loading', data: undefined, error: undefined })
 
       var refresh = function () {
-        var credentials = remote.credentials
         if (credentials === undefined) return
         credentials.describe([CRED]).then(function (response) {
           if (!response || response.ok !== true) return
@@ -111,7 +118,6 @@ window.__ModuleLoader__.load({
           setStatus('请输入 API key。')
           return
         }
-        var credentials = remote.credentials
         if (credentials === undefined) {
           setStatusKind('bad')
           setStatus('当前环境未挂载凭据控制面（credentials Remote），无法保存。')
@@ -137,7 +143,6 @@ window.__ModuleLoader__.load({
       }
 
       function onClear() {
-        var credentials = remote.credentials
         if (credentials === undefined) {
           setStatusKind('bad')
           setStatus('当前环境未挂载凭据控制面（credentials Remote），无法清除。')
@@ -244,14 +249,15 @@ window.__ModuleLoader__.load({
           : null)
     }
 
-    exports.name = 'dsh-jina-ui'
-    exports.inject = ['slots', 'remote']
+    exports.name = 'dsh-jina'
+    exports.inject = ['slots', 'remote', 'remote.credentials']
 
     exports.apply = function (ctx) {
       var slots = ctx.get('slots')
       if (slots === undefined) return
       var remote = ctx.get('remote')
       if (remote === undefined) return
+      var credentials = ctx.get('remote.credentials')
       // Standard plugin-configuration card slot (Settings → Plugins →
       // Configure). `slots.inject` waits for the declarer package and
       // unregisters automatically if the surface disappears. Keyed by the
@@ -261,7 +267,7 @@ window.__ModuleLoader__.load({
         return slots.register(
           { name: 'settings.plugin.item', key: 'jina-tools' },
           function (slotProps) {
-            return React.createElement(JinaCard, { remote: remote })
+            return React.createElement(JinaCard, { remote: remote, credentials: credentials })
           },
         )
       })

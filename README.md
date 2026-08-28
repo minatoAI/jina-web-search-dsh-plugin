@@ -8,6 +8,12 @@ DeepSeek Harness 的 [Jina AI](https://jina.ai/) 插件（bundle）：把 jina-c
 
 > 此处仅展示最新版本，完整版本历史见 [change-log.md](./change-log.md)。
 
+### 0.5.2（2026-08-29）
+
+- **fix** 修复插件安装后 Web 页面报 `Failed to load plugins` 的问题（`failed to import loader entry … (dsh-jina): client-modules: bundle … loaded without registering "dsh-jina"`）：0.5.1 把组合行改成了精确包名 `dsh-jina`，但浏览器 bundle 里 `window.__ModuleLoader__.load` 的注册 id 仍是旧行名 `dsh-jina/ui`——模块系统只对图行 id（精确包名，`/client` 后缀除外）做匹配，`dsh-jina/ui` 注册在没人要的键上，加载即报「未注册」。修复：注册 id 改为 `dsh-jina`。
+- **fix** 凭据命名空间改为标准注入：`remote.credentials` 在 0.1.2-alpha.1 是由 gateway `$mount` 注册的**独立服务**（`Service(ctx, 'remote.credentials')`），不再挂在 `remote` 对象上；插件 `inject` 增加 `'remote.credentials'`，卡片直接接收该服务（`describe/set/unset` 契约与事件 `credentials/reference-updated` 不变）。
+- **docs** 更新「开发说明」。
+
 ### 0.5.1（2026-08-29）
 
 - **fix** 修复 Web 设置中「Jina Tools」配置选项卡消失的问题（在 dsh 0.1.2-alpha.1 + 运行中的 profile 实测定位）：client-modules 扫描只把「行名 = 精确包名」的行纳入 `window.__DSH_BOOT__` 客户端图，子路径行（`dsh-jina/ui`）不会成为客户端行——浏览器半身从不加载，`settings.plugin.item` 里没有 `jina-tools` 键，配置页因此渲染不出卡片（宿主侧工具与命名空间均正常）。修复：浏览器半身声明上移到**根 manifest**，组合层改为单个双面孔行 `dsh-jina`，删除 `dsh-jina/ui` 行。
@@ -134,7 +140,7 @@ jina-dsh-plugin/
 ## 开发说明
 
 - 主机插件只依赖 Node 内置模块与 dsh 主机服务（`fs`、`subprocess`、`tools`、`credentials`），无第三方 npm 依赖；凭据走 dsh 原生的 credential seam（引用 `JINA_API_KEY`），任何 profile 组合都可以直接使用。
-- 客户端 bundle 直接提交（`ui/client.js`），无构建步骤，git 安装开箱即用。改 UI 后直接改该文件并重启即可。卡片注册进 Web 设置包声明的 `settings.plugin.item` 插槽（设置 → 插件 → 配置），这是第三方插件配置的标准位置；key 通过标准的 `ctx.remote.credentials` 凭据 Remote（`credentials.describe/set/unset`，变更事件 `credentials/reference-updated`）管理——这是唯一对第三方插件开放的配置通道，settings 命名空间对浏览器有白名单限制。
+- 客户端 bundle 直接提交（`ui/client.js`），无构建步骤，git 安装开箱即用。改 UI 后直接改该文件并重启即可。bundle 顶层 `window.__ModuleLoader__.load` 的注册 id **必须等于图行 id（精确包名 `dsh-jina`）**——模块系统只按图行 id 匹配注册（`/client` 后缀除外），注册在别的键上（如旧行名 `dsh-jina/ui`）会报 `loaded without registering "dsh-jina"` 并导致整页 `Failed to load plugins`。卡片注册进 Web 设置包声明的 `settings.plugin.item` 插槽（设置 → 插件 → 配置），这是第三方插件配置的标准位置；key 通过标准的凭据 Remote 命名空间管理：`remote.credentials` 是 gateway `$mount` 时注册的**独立服务**（插件 `inject` 里声明 `'remote.credentials'`，不要从 `remote` 对象上取）——`credentials.describe/set/unset`，变更事件 `credentials/reference-updated` 由 `remote` 服务转发；这是唯一对第三方插件开放的配置通道，settings 命名空间对浏览器有白名单限制。
 - 组合层遵循 dsh 约定：单个双面孔行 `dsh-jina` 同时携带宿主半身与浏览器半身。浏览器半身由**根 manifest** 的 `dsh.client`（platform: web，图边注入 `@deepseek-ai/dsh-api-remotes`）与 `exports["./client"]` 声明，host 的 client-modules 服务扫描时按行名（精确包名）定位根 manifest 并接入 Web boot graph。注意 client-modules 扫描只接受精确包名行：子路径行（如 `dsh-jina/ui`）永远不会被扫描为客户端行——浏览器半身必须声明在根包。
 
 ## 测试
