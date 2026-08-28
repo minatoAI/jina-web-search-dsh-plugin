@@ -14,18 +14,6 @@ DeepSeek Harness 的 [Jina AI](https://jina.ai/) 插件（bundle）：把 jina-c
 - **fix** 凭据命名空间改为标准注入：`remote.credentials` 在 0.1.2-alpha.1 是由 gateway `$mount` 注册的**独立服务**（`Service(ctx, 'remote.credentials')`），不再挂在 `remote` 对象上；插件 `inject` 增加 `'remote.credentials'`，卡片直接接收该服务（`describe/set/unset` 契约与事件 `credentials/reference-updated` 不变）。
 - **docs** 更新「开发说明」。
 
-### 0.5.1（2026-08-29）
-
-- **fix** 修复 Web 设置中「Jina Tools」配置选项卡消失的问题（在 dsh 0.1.2-alpha.1 + 运行中的 profile 实测定位）：client-modules 扫描只把「行名 = 精确包名」的行纳入 `window.__DSH_BOOT__` 客户端图，子路径行（`dsh-jina/ui`）不会成为客户端行——浏览器半身从不加载，`settings.plugin.item` 里没有 `jina-tools` 键，配置页因此渲染不出卡片（宿主侧工具与命名空间均正常）。修复：浏览器半身声明上移到**根 manifest**，组合层改为单个双面孔行 `dsh-jina`，删除 `dsh-jina/ui` 行。
-- **docs** 更新「仓库结构」与「开发说明」。
-
-### 0.5.0（2026-08-29）
-
-- **fix** 适配 dsh 0.1.2-alpha.1 的 apiproxy 重构（`refactor(apiproxy)!: remove settings and credentials RPCs`）：浏览器半身的凭据 RPC 从已移除的 `connection.api.credentials.*` 迁移到 Typert Remote 凭据命名空间 `ctx.remote.credentials`（`credentials/describe|set|unset`）——`describe` 改为批量接收 `refs[]`、`set/unset` 改为位置参数，响应包络由 `{result:{ok,value}}` 改为 `{ok,value|error}`；变更事件 `credentials/updated` 同步更名为 `credentials/reference-updated`（仍由同一 `remote` 服务转发）。
-- **fix** `dsh.client` 声明去掉对 `@deepseek-ai/dsh-client-runtime` 的图边依赖（该包在 0.1.2-alpha.1 已不存在，仅保留对 `@deepseek-ai/dsh-api-remotes` 的边；bundle 本身只依赖 baseline 的 react）。
-- **fix** subprocess 句柄不再暴露 `exitCode` 属性：退出码改从 `handle.done` 的 `SubprocessOutcome` 读取（工具调用方本就不消费，纯契约对齐）。
-- **verify** 其余表面逐项对照 dsh 0.1.2-alpha.1 源码确认兼容：`tools.register` 完整 JSON Schema 参数通过注册期规范化校验、`output {schema, render}` 契约不变、`credentials.resolve`、`webServer.register`、`settings.register`（空命名空间 duck-type schema）、`fs`/`sandboxPolicy`、keyed slot `settings.plugin.item` 与 `window.__ModuleLoader__` 客户端协议均未变化。
-
 ## 功能
 
 安装后所有会话（所有 agent preset）都会获得 12 个 `jina_*` 工具：
