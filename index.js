@@ -138,20 +138,22 @@ export function apply(ctx) {
         resolve(out)
         return
       }
-      const finish = (err) => {
+      const finish = (err, outcome) => {
         try {
           if (err) out.stderr.text = String((err && err.message) || err)
           else {
             const so = handle.collected.stdout.readFrom(0)
             const se = handle.collected.stderr.readFrom(0)
-            out.exitCode = handle.exitCode
+            // The handle contract exposes exit facts through `done`
+            // (SubprocessOutcome), not as a property on the handle itself.
+            out.exitCode = outcome ? outcome.exitCode : undefined
             out.stdout = { text: so.text, lossy: so.lossy, spillPath: so.spillPath }
             out.stderr = { text: se.text }
           }
         } catch (e) { /* keep defaults */ }
         resolve(out)
       }
-      handle.done.then(() => finish(null), (err) => finish(err))
+      handle.done.then((outcome) => finish(null, outcome), (err) => finish(err))
     })
   }
 

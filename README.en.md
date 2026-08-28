@@ -8,6 +8,13 @@ A [Jina AI](https://jina.ai/) plugin (bundle) for DeepSeek Harness: it exposes t
 
 > Only the latest release is listed here; the full version history lives in [change-log.en.md](./change-log.en.md).
 
+### 0.5.0 (2026-08-29)
+
+- **fix** Compatible with the dsh 0.1.2-alpha.1 apiproxy refactor (`refactor(apiproxy)!: remove settings and credentials RPCs`): the browser half's credential RPC moves from the removed `connection.api.credentials.*` to the Typert Remote credentials namespace `ctx.remote.credentials` (`credentials/describe|set|unset`) — `describe` now takes a batch `refs[]`, `set`/`unset` take positional arguments, and the response envelope changes from `{result:{ok,value}}` to `{ok,value|error}`; the change event `credentials/updated` is renamed `credentials/reference-updated` (still forwarded by the same `remote` service).
+- **fix** The `dsh.client` declaration drops the graph edge to `@deepseek-ai/dsh-client-runtime` (no longer a package in 0.1.2-alpha.1), keeping only the edge to `@deepseek-ai/dsh-api-remotes`; the bundle itself only consumes baseline `react`.
+- **fix** The subprocess handle no longer exposes an `exitCode` property: the exit code now comes from the `SubprocessOutcome` of `handle.done` (callers never consumed it anyway — pure contract alignment).
+- **verify** Every other face was checked against the dsh 0.1.2-alpha.1 sources and remains compatible: `tools.register` full-JSON-Schema parameters pass the registration-time normalization, the `output {schema, render}` contract is unchanged, and `credentials.resolve`, `webServer.register`, `settings.register` (duck-typed empty-namespace schema), `fs`/`sandboxPolicy`, the keyed `settings.plugin.item` slot, and the `window.__ModuleLoader__` client protocol all stayed the same.
+
 ### 0.4.0 (2026-08-18)
 
 - **feat** The web search tool is renamed `jina_search` → `jina_web_search` so the tool name itself signals "web search", matching the built-in `web_search` naming signal. The description is rewritten task-first with a when-to-use trigger: it opens with what it returns (optional summary + official-source-first source list), a `Use this whenever...` clause states when to pick it (time-sensitive content, news, time filters) and the division of labor with the built-in `web_search` (broader general/engineering coverage); the `query` parameter description now points to the `time` parameter for recency-sensitive searches.
@@ -120,7 +127,7 @@ jina-dsh-plugin/
 ## Development notes
 
 - The host plugin only depends on Node built-ins and dsh host services (`fs`, `subprocess`, `tools`, `credentials`) — no third-party npm dependencies; credentials go through dsh's native credential seam (referencing `JINA_API_KEY`), so it works with any profile composition out of the box.
-- The client bundle is committed directly (`ui/client.js`), no build step — git installs work as-is. To change the UI, edit that file and restart. The card registers into the `settings.plugin.item` slot declared by the Web settings package (Settings → Plugins → Configuration), the standard place for third-party plugin configuration; the key is managed via the standard `credentials.describe/set/unset` RPCs (the only configuration channel open to third-party plugins — the settings namespace is allowlist-restricted for browsers).
+- The client bundle is committed directly (`ui/client.js`), no build step — git installs work as-is. To change the UI, edit that file and restart. The card registers into the `settings.plugin.item` slot declared by the Web settings package (Settings → Plugins → Configuration), the standard place for third-party plugin configuration; the key is managed via the standard `ctx.remote.credentials` credential Remote (`credentials.describe/set/unset`, change event `credentials/reference-updated`) — the only configuration channel open to third-party plugins (the settings namespace is allowlist-restricted for browsers).
 - The composition layer follows dsh conventions: the host row `dsh-jina` registers model tools; the client row `dsh-jina/ui` is discovered by the host's client-modules service through the `dsh.client` declaration in `ui/package.json` and wired into the Web boot graph.
 
 ## Tests

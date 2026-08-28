@@ -12,13 +12,15 @@
 // agree on that namespace.
 //
 // The card manages the `JINA_API_KEY` credential through the standard
-// credentials RPC domain: values cross the wire only on save
-// (credentials.set), and the page shows configured state, never the stored
-// value. It also runs the key health check: a GET to the host-provided
-// `/api/dsh-jina/primer` route (registered by the bundle's host half when a
-// web server is composed), which answers with the key's Jina identity and
-// credit balance — the same data `jina_primer` reports. The key itself never
-// leaves the host.
+// credentials Remote namespace (`ctx.remote.credentials`, the Typert Remote
+// domain the credentials controller hosts: describe/set/unset): values cross
+// the wire only on save, and the page shows configured state, never the
+// stored value. It refreshes when the Host reports the reference changed
+// (`credentials/reference-updated`). It also runs the key health check: a GET
+// to the host-provided `/api/dsh-jina/primer` route (registered by the
+// bundle's host half when a web server is composed), which answers with the
+// key's Jina identity and credit balance — the same data `jina_primer`
+// reports. The key itself never leaves the host.
 window.__ModuleLoader__.load({
   id: 'dsh-jina/ui',
   factory: function (require) {
@@ -62,7 +64,6 @@ window.__ModuleLoader__.load({
     }
 
     function JinaCard(props) {
-      var api = props.api
       var remote = props.remote
       var [open, setOpen] = React.useState(false)
       var [input, setInput] = React.useState('')
@@ -72,9 +73,11 @@ window.__ModuleLoader__.load({
       var [primer, setPrimer] = React.useState({ phase: 'loading', data: undefined, error: undefined })
 
       var refresh = function () {
-        api.credentials.describe({ refs: [CRED] }).then(function (response) {
-          if (!response.result.ok) return
-          setView(response.result.value.credentials[CRED])
+        var credentials = remote.credentials
+        if (credentials === undefined) return
+        credentials.describe([CRED]).then(function (response) {
+          if (!response || response.ok !== true) return
+          setView(response.value[CRED])
         }, function () { /* keep previous view */ })
       }
 
@@ -91,14 +94,14 @@ window.__ModuleLoader__.load({
       React.useEffect(function () {
         refresh()
         loadPrimer()
-        var dispose = remote.$on('credentials/updated', function (ref) {
+        var dispose = remote.$on('credentials/reference-updated', function (ref) {
           if (ref === CRED) {
             refresh()
             loadPrimer()
           }
         })
         return dispose
-      }, [api, remote])
+      }, [remote])
 
       function onInput(e) { setInput(e.target.value) }
 
@@ -108,10 +111,16 @@ window.__ModuleLoader__.load({
           setStatus('请输入 API key。')
           return
         }
+        var credentials = remote.credentials
+        if (credentials === undefined) {
+          setStatusKind('bad')
+          setStatus('当前环境未挂载凭据控制面（credentials Remote），无法保存。')
+          return
+        }
         setStatusKind('info')
         setStatus('保存中…')
-        api.credentials.set({ ref: CRED, value: input.trim() }).then(function (response) {
-          if (response.result.ok) {
+        credentials.set(CRED, input.trim()).then(function (response) {
+          if (response && response.ok === true) {
             setStatusKind('ok')
             setStatus('已保存。')
             setInput('')
@@ -119,7 +128,7 @@ window.__ModuleLoader__.load({
             loadPrimer()
           } else {
             setStatusKind('bad')
-            setStatus('保存失败：' + String((response.result.error && response.result.error.message) || '未知错误'))
+            setStatus('保存失败：' + String((response && response.error && response.error.message) || '未知错误'))
           }
         }, function () {
           setStatusKind('bad')
@@ -128,17 +137,23 @@ window.__ModuleLoader__.load({
       }
 
       function onClear() {
+        var credentials = remote.credentials
+        if (credentials === undefined) {
+          setStatusKind('bad')
+          setStatus('当前环境未挂载凭据控制面（credentials Remote），无法清除。')
+          return
+        }
         setStatusKind('info')
         setStatus('清除中…')
-        api.credentials.unset({ ref: CRED }).then(function (response) {
-          if (response.result.ok) {
+        credentials.unset(CRED).then(function (response) {
+          if (response && response.ok === true) {
             setStatusKind('ok')
             setStatus('已清除。')
             refresh()
             loadPrimer()
           } else {
             setStatusKind('bad')
-            setStatus('清除失败：' + String((response.result.error && response.result.error.message) || '未知错误'))
+            setStatus('清除失败：' + String((response && response.error && response.error.message) || '未知错误'))
           }
         }, function () {
           setStatusKind('bad')
@@ -230,15 +245,13 @@ window.__ModuleLoader__.load({
     }
 
     exports.name = 'dsh-jina-ui'
-    exports.inject = ['slots', 'connection', 'remote']
+    exports.inject = ['slots', 'remote']
 
     exports.apply = function (ctx) {
       var slots = ctx.get('slots')
       if (slots === undefined) return
-      var connection = ctx.get('connection')
-      var api = connection ? connection.api : undefined
       var remote = ctx.get('remote')
-      if (api === undefined || remote === undefined) return
+      if (remote === undefined) return
       // Standard plugin-configuration card slot (Settings → Plugins →
       // Configure). `slots.inject` waits for the declarer package and
       // unregisters automatically if the surface disappears. Keyed by the
@@ -248,7 +261,7 @@ window.__ModuleLoader__.load({
         return slots.register(
           { name: 'settings.plugin.item', key: 'jina-tools' },
           function (slotProps) {
-            return React.createElement(JinaCard, { api: api, remote: remote })
+            return React.createElement(JinaCard, { remote: remote })
           },
         )
       })

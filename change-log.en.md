@@ -2,6 +2,14 @@
 
 Full version history of dsh-jina; the "Changelog" section of [README.en.md](./README.en.md) keeps only the latest release.
 
+### 0.5.0 (2026-08-29)
+
+- **fix** Compatible with the dsh 0.1.2-alpha.1 apiproxy refactor (`refactor(apiproxy)!: remove settings and credentials RPCs`, 2026-08-27): the browser half's credential RPC moves from the removed `connection.api.credentials.*` to the Typert Remote credentials namespace `ctx.remote.credentials` (`credentials/describe|set|unset`) — `describe` now takes a batch `refs[]`, `set`/`unset` take positional arguments, and the response envelope changes from `{result:{ok,value}}` to `{ok,value|error}`; the change event `credentials/updated` is renamed `credentials/reference-updated` (still forwarded by the same `remote` service).
+- **fix** The `dsh.client` declaration drops the graph edge to `@deepseek-ai/dsh-client-runtime` (no longer a package in 0.1.2-alpha.1), keeping only the edge to `@deepseek-ai/dsh-api-remotes`; the bundle itself only consumes baseline `react` and requests no `external` modules.
+- **fix** The subprocess handle no longer exposes an `exitCode` property: the exit code now comes from the `SubprocessOutcome` of `handle.done` (callers never consumed it anyway — pure contract alignment).
+- **verify** Every other face was checked against the dsh 0.1.2-alpha.1 sources and remains compatible: `tools.register` full-JSON-Schema parameters pass the registration-time normalization (`normalizeRegisteredParameters`), the `output {schema, render}` contract is unchanged, and `credentials.resolve`, `webServer.register`, `settings.register` (duck-typed empty-namespace schema), `fs`/`sandboxPolicy`, the keyed `settings.plugin.item` slot, and the `window.__ModuleLoader__` client protocol all stayed the same.
+- **docs** README/README.en.md changelog sections synced to 0.5.0.
+
 ### 0.4.0 (2026-08-18)
 
 - **feat** The web search tool is renamed `jina_search` → `jina_web_search` so the tool name itself signals "web search", matching the built-in `web_search` naming signal. The description is rewritten task-first with a when-to-use trigger: it opens with what it returns (optional summary + official-source-first source list), a `Use this whenever...` clause states when to pick it (time-sensitive content, news, time filters) and the division of labor with the built-in `web_search` (broader general/engineering coverage); the `query` parameter description now points to the `time` parameter for recency-sensitive searches.
