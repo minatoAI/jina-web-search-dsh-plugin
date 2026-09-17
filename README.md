@@ -13,14 +13,6 @@ DeepSeek Harness 的 [Jina AI](https://jina.ai/) 插件（bundle）：把 jina-c
 - **fix** 修复 0.7.0 引入的配置表单崩溃导致 **API key 与本地代理输入框在 Plugins 页整块消失**（实测控制台：`ReferenceError: input is not defined` → `slot entry crashed in 'plugins.bundle.config'`）：0.7.0 把表单函数 `body()` 提到了 factory 作用域，而它读取的全是 `JinaCard` 组件内部的 state 与 handler（`input` / `onInput` / `onSave` / `configured` / `proxyBlock` …）。修复：把 `body()` 移回组件内部；旧的折叠卡片展开时崩溃的问题一并恢复。
 - **test** 新增 `test/client-render.test.js`：在 VM 中真实执行浏览器 bundle、按 cordis 契约挂载插件、以 React 的方式渲染 `summary` / `page` 两种视图（含旧卡片展开态），断言两个输入框都被渲染——原有的契约测试只做源码正则，测不到这类作用域缺陷。
 
-### 0.7.0（2026-09-17）
-
-- **compat** 适配新版 dsh：插件配置插槽由 `settings.plugin.item`（keyed，Settings → Plugins → Configure）改为 `plugins.bundle.config`（keyed by bundle 包名，随 Plugins 页的 dsh-jina bundle 卡片渲染，宿主索取 `summary` / `page` 两种视图）。旧插槽已在新版 harness 中被删除，不适配会导致卡片**静默消失**、无法配置 key 与代理。
-- **compat** 同时保留旧的 `settings.plugin.item` 注册，新旧两代 harness 都能配置；等不再需要兼容旧版时，删除 `ui/client.js` 中标注 Legacy 的那段即可。
-- **test** 浏览器 bundle 契约测试新增新插槽与两种视图的断言，旧插槽断言保留。
-
-> 0.6.1（2026-09-16）：修复 0.6.0 浏览器半身崩溃导致卡片整块消失（`cannot get property "remote.settings" without inject`）；完整历史见 [change-log.md](./change-log.md)。
-
 ## 功能
 
 安装后所有会话（所有 agent preset）都会获得 12 个 `jina_*` 工具：
