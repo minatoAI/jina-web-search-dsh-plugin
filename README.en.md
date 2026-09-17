@@ -8,18 +8,18 @@ A [Jina AI](https://jina.ai/) plugin (bundle) for DeepSeek Harness: it exposes t
 
 > Only the latest release is listed here; the full version history lives in [change-log.en.md](./change-log.en.md).
 
+### 0.7.1 (2026-09-18)
+
+- **fix** Fixed the configuration-form crash 0.7.0 introduced, which made the **API key and local-proxy fields disappear from the Plugins page** (live console: `ReferenceError: input is not defined` → `slot entry crashed in 'plugins.bundle.config'`). 0.7.0 hoisted the form function `body()` out of the `JinaCard` component into factory scope to share it between views, but it reads only that component's own state and handlers (`input`, `onInput`, `onSave`, `configured`, `proxyBlock`, …). Fix: `body()` moved back inside the component; the legacy collapsible card, which crashed the same way on expand, is restored by the same change.
+- **test** Added `test/client-render.test.js`: it runs the browser bundle for real in a VM, mounts the plugin through the cordis contract, and renders the `summary` and `page` views (plus the legacy card's expanded state) the way React does, asserting that both fields are rendered — the existing contract tests only grep the source and cannot see a scoping defect.
+
 ### 0.7.0 (2026-09-17)
 
 - **compat** Adapted to the current dsh: the configuration slot moved from `settings.plugin.item` (keyed; Settings → Plugins → Configure) to `plugins.bundle.config` (keyed by the bundle's package name, rendered on the dsh-jina bundle card on the Plugins page; the host asks for `summary` and `page` views). The old slot is removed upstream, so without this change the card **silently disappears** and neither the key nor the proxy can be configured.
 - **compat** The legacy `settings.plugin.item` registration is kept, so both harness generations can configure the bundle; drop the arm marked Legacy in `ui/client.js` when old harnesses no longer matter.
 - **test** The browser-bundle contract tests gained assertions for the new slot and its two views; the legacy-slot assertions remain.
 
-### 0.6.1 (2026-09-16)
-
-- **fix** Fixed the browser-half crash 0.6.0 introduced, which made the whole **Jina Tools card disappear** (live console: `Error: cannot get property "remote.settings" without inject` → `slot entry crashed in 'settings.plugin.item'`). The gateway mounts every Remote namespace as its own cordis service `remote.<ns>`, and a consumer must declare that service name in its own `inject` before reading the property; `'remote.settings'` is now declared and the read is wrapped in try/catch, so a missing service degrades to a notice instead of crashing the slot.
-- **test** The browser-bundle contract tests now verify that `exports.inject` lists exactly the `remote.<ns>` services the card reads.
-
-> 0.6.0 (2026-09-15): **manual local-proxy configuration** (card field, proxy precedence, connection diagnostics) — see the "Local proxy" section below; full history in [change-log.en.md](./change-log.en.md).
+> 0.6.1 (2026-09-16): fixed the 0.6.0 browser-half crash that made the whole card disappear (`cannot get property "remote.settings" without inject`); full history in [change-log.en.md](./change-log.en.md).
 
 ## Features
 

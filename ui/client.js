@@ -440,40 +440,23 @@ window.__ModuleLoader__.load({
         primerLines,
         probeLines)
 
-      var title = 'Jina Tools'
-      var description = 'Jina AI 搜索/阅读/嵌入等工具的 API key 与本地代理。'
-
-      // The Plugins page draws the card's title, icon, and crumb itself and
-      // asks a configuration entry for one of two views: `summary` is the
-      // one-liner under the title, `page` is the form with its own save
-      // control.
-      if (props.view === 'summary') return description
-      if (props.view === 'page') return body()
-
-      // Legacy Settings → Plugins → Configure card (`settings.plugin.item`):
-      // that slot carries no page chrome, so the card owns a header toggle and
-      // a collapsible body. Drop this arm and the legacy registration in
-      // `apply` once no supported harness declares that slot.
-      return React.createElement('li', { style: S.card },
-        React.createElement('button', {
-          type: 'button',
-          style: S.header,
-          'aria-expanded': open,
-          onClick: function () { setOpen(!open) },
-        },
-          React.createElement('span', { style: S.headText },
-            React.createElement('span', { style: S.name }, title),
-            React.createElement('span', { style: S.description }, description)),
-          React.createElement(Chevron, { open: open })),
-        open ? body() : null)
-    }
-
-    /**
-     * The configuration form both surfaces render.
-     * @returns the form column.
-     */
-    function body() {
-      return React.createElement('div', { style: S.body },
+      /**
+       * The configuration form both surfaces render.
+       *
+       * Defined INSIDE the component on purpose: the form reads this
+       * component's own state and handlers (`input`, `onInput`, `onSave`,
+       * `onClear`, `configured`, `status`, `statusStyle`, `shown`,
+       * `proxyBlock`, `primerBlock`, `view`, `writable`). Hoisting it to
+       * factory scope — as 0.7.0 did — leaves every one of those bindings
+       * unresolved: the slot entry throws
+       * `ReferenceError: input is not defined`, the Plugins page swaps the
+       * whole configuration section for an error boundary, and the API key
+       * plus local-proxy fields silently disappear from the UI.
+       * `test/client-render.test.js` renders both views to keep it here.
+       * @returns the form column.
+       */
+      function body() {
+        return React.createElement('div', { style: S.body },
             React.createElement('p', { style: S.note }, 'jina_web_search / jina_read 等工具会优先使用这里保存的 key。免费 key 可在 ', React.createElement('a', { style: S.link, href: 'https://jina.ai/?sui=apikey', target: '_blank', rel: 'noreferrer' }, 'jina.ai'), ' 获取。'),
             React.createElement('div', { style: S.row },
               React.createElement('input', {
@@ -501,6 +484,34 @@ window.__ModuleLoader__.load({
             view !== undefined && !writable ? React.createElement('p', { style: S.note }, '当前环境只读：key 由环境变量等来源提供，无法在此修改。') : null,
             React.createElement('p', { style: S.note }, 'key 解析顺序：1. 工具参数 apiKey；2. 本页保存的 key（credential 引用 ' + CRED + '，由 dsh 凭据存储持久化）；3. 会话工作区的 jina-api-key.txt；4. dsh 主目录下的 jina-api-key.txt。保存后立即生效。'),
             React.createElement('p', { style: S.note }, '代理优先级：1. 本页「本地代理」保存的地址；2. 环境变量 JINA_PROXY_URL；3. Windows 系统代理（自动发现，端口变化会自愈）；4. 继承启动环境的 HTTP_PROXY / HTTPS_PROXY。只有 http(s) 代理可用于网络 helper。中国大陆网络环境下调用 Jina 需要代理；本地代理只监听端口、未开启系统代理时，请填上面的「本地代理」。'))
+      }
+
+      var title = 'Jina Tools'
+      var description = 'Jina AI 搜索/阅读/嵌入等工具的 API key 与本地代理。'
+
+      // The Plugins page draws the card's title, icon, and crumb itself and
+      // asks a configuration entry for one of two views: `summary` is the
+      // one-liner under the title, `page` is the form with its own save
+      // control.
+      if (props.view === 'summary') return description
+      if (props.view === 'page') return body()
+
+      // Legacy Settings → Plugins → Configure card (`settings.plugin.item`):
+      // that slot carries no page chrome, so the card owns a header toggle and
+      // a collapsible body. Drop this arm and the legacy registration in
+      // `apply` once no supported harness declares that slot.
+      return React.createElement('li', { style: S.card },
+        React.createElement('button', {
+          type: 'button',
+          style: S.header,
+          'aria-expanded': open,
+          onClick: function () { setOpen(!open) },
+        },
+          React.createElement('span', { style: S.headText },
+            React.createElement('span', { style: S.name }, title),
+            React.createElement('span', { style: S.description }, description)),
+          React.createElement(Chevron, { open: open })),
+        open ? body() : null)
     }
 
     exports.name = 'dsh-jina'

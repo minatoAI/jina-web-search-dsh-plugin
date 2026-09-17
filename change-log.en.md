@@ -2,6 +2,12 @@
 
 Full version history of dsh-jina; the "Changelog" section of [README.en.md](./README.en.md) keeps only the latest release.
 
+### 0.7.1 (2026-09-18)
+
+- **fix** Fixed the configuration-form crash 0.7.0 introduced, which made the **API key and local-proxy fields disappear from the Plugins page** (reported from a live console: `ReferenceError: input is not defined`, then `slot entry crashed in 'plugins.bundle.config'`). To share one form between the `summary` and `page` views, 0.7.0 hoisted the form function `body()` out of the `JinaCard` component into factory scope — but it reads only that component's own state and handlers (`input`, `onInput`, `onSave`, `onClear`, `configured`, `status`, `statusStyle`, `shown`, `proxyBlock`, `primerBlock`, `view`, `writable`). None of those bindings resolve at factory scope, so the first render threw, and the Plugins page replaced the entire configuration section with an error boundary. Fix: `body()` moved back inside the component (with a comment recording why it must stay there).
+- **fix** The same defect also crashed the legacy `settings.plugin.item` collapsible card the moment it was expanded; that arm is restored by the same change.
+- **test** Added `test/client-render.test.js`: it runs `ui/client.js` for real inside `node:vm`, takes the factory through the `window.__ModuleLoader__` contract, mounts the plugin against a fake cordis context, and renders the `summary` and `page` views (plus the legacy card's expanded state) the way React does, asserting that both the API key field and the local-proxy field are rendered. The existing `test/client-bundle.test.js` only greps the source, so it **cannot see a scoping defect** — this test is the regression line for that blind spot.
+
 ### 0.7.0 (2026-09-17)
 
 - **compat** Adapted to the current dsh: the host slot carrying a plugin's configuration moved from `settings.plugin.item` (keyed; Settings → Plugins → Configure) to `plugins.bundle.config` (keyed by the bundle's package name; rendered on the dsh-jina bundle card on the Plugins page). The old slot is **removed** upstream, so without this change `slots.inject` waits for a declarer that never appears and the card silently disappears, leaving no way to configure the API key or the local proxy. The bundle now registers `{ name: 'plugins.bundle.config', key: 'dsh-jina' }`; the page asks each entry for two views — `summary` (the one-liner under the title) and `page` (the form with its own save control) — and `ui/client.js` branches on `props.view`.

@@ -2,6 +2,12 @@
 
 本文件记录 dsh-jina 的完整版本历史；[README.md](./README.md) 的「更新日志」一节只保留最新版本。
 
+### 0.7.1（2026-09-18）
+
+- **fix** 修复 0.7.0 引入的**配置表单崩溃 → API key 与本地代理输入框在 Plugins 页整块消失**（实测控制台：`ReferenceError: input is not defined`，随后 `slot entry crashed in 'plugins.bundle.config'`）：0.7.0 为了给 `summary` / `page` 两种视图复用，把表单函数 `body()` 从 `JinaCard` 组件里提到了 factory 作用域，但它读取的全是组件内的 state 与 handler（`input` / `onInput` / `onSave` / `onClear` / `configured` / `status` / `statusStyle` / `shown` / `proxyBlock` / `primerBlock` / `view` / `writable`）——这些绑定在 factory 作用域全都解析不到，slot 一渲染就抛错，Plugins 页把整个配置区替换为 error boundary。修复：把 `body()` 移回组件内部（并加注释说明它必须留在里面，以及为什么）。
+- **fix** 同一缺陷也让旧的 `settings.plugin.item` 折叠卡片在展开时崩溃，随本次修复一并恢复。
+- **test** 新增 `test/client-render.test.js`：在 `node:vm` 中真实执行 `ui/client.js`、按 `window.__ModuleLoader__` 契约取出 factory、用假 cordis 上下文挂载插件，再按 React 的方式渲染 `summary` 与 `page` 两种视图（含旧卡片的展开态），断言 API key 输入框与本地代理输入框都被渲染出来。原有的 `test/client-bundle.test.js` 只对源码做正则匹配，**测不到这类作用域缺陷**——本测试即为该盲区的回归线。
+
 ### 0.7.0（2026-09-17）
 
 - **compat** 适配新版 dsh：插件配置页的宿主插槽由 `settings.plugin.item`（keyed，Settings → Plugins → Configure）改为 `plugins.bundle.config`（keyed by bundle 包名，随 Plugins 页的 dsh-jina bundle 卡片一起渲染）。旧插槽在新版 harness 上**已被删除**，若不适配，`slots.inject` 会一直等待一个永不出现的声明方 → 卡片静默消失，用户无法再配置 API key 与本地代理。新增注册：`{ name: 'plugins.bundle.config', key: 'dsh-jina' }`；新宿主会向条目索取两种视图——`summary`（标题下的一行说明）与 `page`（自带保存控件的表单），`ui/client.js` 按 `props.view` 分支渲染。
