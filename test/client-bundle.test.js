@@ -10,8 +10,11 @@
  *     the graph row id (the exact package name); anything else makes the module
  *     system report `loaded without registering "dsh-jina"` and the whole page
  *     fails to load its plugins.
- *   - the card registers under `key: 'jina-tools'` — the settings namespace the
- *     host half serves, which is also what the configuration tab dispatches on.
+ *   - the configuration form registers into the Plugins page's
+ *     `plugins.bundle.config` slot, keyed by the bundle's package name
+ *     (`dsh-jina`) — the surface current harnesses declare — and into the
+ *     older `settings.plugin.item` slot, keyed by the settings namespace the
+ *     host half serves (`jina-tools`), so one bundle configures on either.
  *   - the manual proxy field (`proxyUrl`) rides the standard `remote.settings`
  *     transport (`describe` / `mutate`), and external edits arrive through
  *     `settings/document-updated`.
@@ -34,7 +37,18 @@ test('client bundle: registers under the graph row id (exact package name)', () 
   assert.doesNotMatch(SOURCE, /id:\s*'dsh-jina\/ui'/)
 })
 
-test('client bundle: card is keyed by the settings namespace the host serves', () => {
+test('client bundle: configures through the Plugins page bundle slot', () => {
+  // The Plugins page declares `plugins.bundle.config` keyed by the bundle's
+  // package name; it draws the card's title, icon, and crumb itself and asks
+  // the entry for two views: `summary` (the one-liner under the title) and
+  // `page` (the form with its own save control).
+  assert.match(SOURCE, /name:\s*'plugins\.bundle\.config'/)
+  assert.match(SOURCE, /key:\s*'dsh-jina'/)
+  assert.match(SOURCE, /props\.view === 'summary'/)
+  assert.match(SOURCE, /props\.view === 'page'/)
+})
+
+test('client bundle: still registers the legacy settings card for older harnesses', () => {
   assert.match(SOURCE, /name:\s*'settings\.plugin\.item'/)
   assert.match(SOURCE, /key:\s*'jina-tools'/)
   assert.match(SOURCE, /NS\s*=\s*'jina-tools'/)

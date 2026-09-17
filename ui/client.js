@@ -7,14 +7,22 @@
 // trailing `/client` only, never a subpath). A subpath id (e.g. the historical
 // `dsh-jina/ui`) registers a key nobody asks for, and the module system
 // reports `loaded without registering "dsh-jina"`. The factory materializes on
-// first import and returns a cordis client plugin that contributes a "Jina
-// Tools" card to the standard plugin configuration surface (Settings → Plugins
-// → Configure, the `settings.plugin.item` KEYED slot declared by the web
-// settings package — the same surface that hosts the Terminal / Agent loop /
-// Web search cards). A keyed entry is keyed by the settings namespace the card
-// edits, so the card registers under `key: 'jina-tools'` — the same namespace
-// the host half (index.js) serves — and the tab renders the card only when
-// both halves agree on that namespace.
+// first import and returns a cordis client plugin that contributes the
+// configuration form for the `dsh-jina` bundle to the Plugins page
+// (sidebar → Plugins → the dsh-jina bundle), through the
+// `plugins.bundle.config` KEYED slot declared by the web plugin-manager
+// package — keyed by the bundle's package name, so the registration uses
+// `key: 'dsh-jina'`. The page draws the title, icon, and crumb, and asks the
+// entry for one of two views: `summary` (the one-liner under the title) and
+// `page` (the form with its own save control).
+//
+// A harness whose Plugins page predates that slot declares only the older
+// `settings.plugin.item` KEYED slot (Settings → Plugins → Configure, keyed by
+// the settings namespace the card edits, so `key: 'jina-tools'` — the
+// namespace the host half (index.js) serves). The same card registers there
+// too, so one bundle configures on either surface; `slots.inject` waits for
+// whichever declarer exists. Drop that arm once no supported harness declares
+// it.
 //
 // The card manages the `JINA_API_KEY` credential through the standard
 // credentials Remote namespace: `remote.credentials` (the generated `$mount`
@@ -432,6 +440,20 @@ window.__ModuleLoader__.load({
         primerLines,
         probeLines)
 
+      var title = 'Jina Tools'
+      var description = 'Jina AI 搜索/阅读/嵌入等工具的 API key 与本地代理。'
+
+      // The Plugins page draws the card's title, icon, and crumb itself and
+      // asks a configuration entry for one of two views: `summary` is the
+      // one-liner under the title, `page` is the form with its own save
+      // control.
+      if (props.view === 'summary') return description
+      if (props.view === 'page') return body()
+
+      // Legacy Settings → Plugins → Configure card (`settings.plugin.item`):
+      // that slot carries no page chrome, so the card owns a header toggle and
+      // a collapsible body. Drop this arm and the legacy registration in
+      // `apply` once no supported harness declares that slot.
       return React.createElement('li', { style: S.card },
         React.createElement('button', {
           type: 'button',
@@ -440,11 +462,18 @@ window.__ModuleLoader__.load({
           onClick: function () { setOpen(!open) },
         },
           React.createElement('span', { style: S.headText },
-            React.createElement('span', { style: S.name }, 'Jina Tools'),
-            React.createElement('span', { style: S.description }, 'Jina AI 搜索/阅读/嵌入等工具的 API key 与本地代理。')),
+            React.createElement('span', { style: S.name }, title),
+            React.createElement('span', { style: S.description }, description)),
           React.createElement(Chevron, { open: open })),
-        open
-          ? React.createElement('div', { style: S.body },
+        open ? body() : null)
+    }
+
+    /**
+     * The configuration form both surfaces render.
+     * @returns the form column.
+     */
+    function body() {
+      return React.createElement('div', { style: S.body },
             React.createElement('p', { style: S.note }, 'jina_web_search / jina_read 等工具会优先使用这里保存的 key。免费 key 可在 ', React.createElement('a', { style: S.link, href: 'https://jina.ai/?sui=apikey', target: '_blank', rel: 'noreferrer' }, 'jina.ai'), ' 获取。'),
             React.createElement('div', { style: S.row },
               React.createElement('input', {
@@ -472,7 +501,6 @@ window.__ModuleLoader__.load({
             view !== undefined && !writable ? React.createElement('p', { style: S.note }, '当前环境只读：key 由环境变量等来源提供，无法在此修改。') : null,
             React.createElement('p', { style: S.note }, 'key 解析顺序：1. 工具参数 apiKey；2. 本页保存的 key（credential 引用 ' + CRED + '，由 dsh 凭据存储持久化）；3. 会话工作区的 jina-api-key.txt；4. dsh 主目录下的 jina-api-key.txt。保存后立即生效。'),
             React.createElement('p', { style: S.note }, '代理优先级：1. 本页「本地代理」保存的地址；2. 环境变量 JINA_PROXY_URL；3. Windows 系统代理（自动发现，端口变化会自愈）；4. 继承启动环境的 HTTP_PROXY / HTTPS_PROXY。只有 http(s) 代理可用于网络 helper。中国大陆网络环境下调用 Jina 需要代理；本地代理只监听端口、未开启系统代理时，请填上面的「本地代理」。'))
-          : null)
     }
 
     exports.name = 'dsh-jina'
@@ -490,15 +518,32 @@ window.__ModuleLoader__.load({
       var remote = ctx.get('remote')
       if (remote === undefined) return
       var credentials = ctx.get('remote.credentials')
-      // Standard plugin-configuration card slot (Settings → Plugins →
-      // Configure). `slots.inject` waits for the declarer package and
-      // unregisters automatically if the surface disappears. Keyed by the
-      // settings namespace this card edits — 'jina-tools' — which the host
-      // half serves; the tab dispatches one entry per served namespace.
+      // The Plugins page's bundle-configuration slot (sidebar → Plugins → the
+      // dsh-jina bundle), keyed by the bundle's package name: the page draws
+      // the card and the entry supplies the form. `slots.inject` waits for the
+      // declarer package and unregisters automatically if the surface goes
+      // away.
+      ctx.slots.inject('plugins.bundle.config', function () {
+        return slots.register(
+          { name: 'plugins.bundle.config', key: 'dsh-jina' },
+          function (slotProps) {
+            return React.createElement(JinaCard, {
+              remote: remote,
+              credentials: credentials,
+              view: slotProps === undefined ? undefined : slotProps.view,
+            })
+          },
+        )
+      })
+
+      // Legacy Settings → Plugins → Configure card, kept so the bundle still
+      // configures on a harness whose Plugins page declares only this slot.
+      // Keyed by the settings namespace this card edits — 'jina-tools' — which
+      // the host half serves. Remove once no supported harness declares it.
       ctx.slots.inject('settings.plugin.item', function () {
         return slots.register(
           { name: 'settings.plugin.item', key: 'jina-tools' },
-          function (slotProps) {
+          function () {
             return React.createElement(JinaCard, { remote: remote, credentials: credentials })
           },
         )

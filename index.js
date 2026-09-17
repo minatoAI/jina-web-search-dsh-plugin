@@ -11,9 +11,9 @@
  * operation (the seam's contract: never cache across operations). The web
  * settings pairing: this host half serves the `jina-tools` settings
  * namespace — whose `proxyUrl` field carries a manually configured local
- * proxy address — and the browser half registers its card for that namespace,
- * so the Settings → Plugins tab (Settings → Plugins → Configure) renders the
- * card only when the two halves agree.
+ * proxy address — and the browser half registers its configuration form for
+ * that namespace, so the Plugins page (the `dsh-jina` bundle card) renders the
+ * form only when the two halves agree.
  *
  * The API key is resolved per call in this order:
  *   1. the tool's own `apiKey` parameter,
@@ -1012,13 +1012,12 @@ export function apply(ctx) {
   })
 
   // ---- web settings namespace ------------------------------------------------
-  // The web Settings → Plugins tab is keyed by the settings namespace a card
-  // edits and renders a card only for namespaces the Host serves. This
-  // registration makes the deployment's settings provider serve "jina-tools",
-  // pairing it with the "Jina Tools" card the browser half registers under
-  // `key: 'jina-tools'`. The namespace carries the manually configured local
-  // proxy address (`proxyUrl`); the API key stays in the credential seam and
-  // never rides the settings document.
+  // This registration makes the deployment's settings provider serve
+  // "jina-tools", the namespace the browser half's configuration form edits
+  // (through the Plugins page's bundle-configuration slot, or the older
+  // Settings → Plugins → Configure card). The namespace carries the manually
+  // configured local proxy address (`proxyUrl`); the API key stays in the
+  // credential seam and never rides the settings document.
   //
   // Zero-dependency note: the settings service consumes a schemastery schema
   // as a function (schema(value) → resolved value), serializes it through

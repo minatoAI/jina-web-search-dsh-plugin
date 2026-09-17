@@ -2,11 +2,17 @@
 
 # dsh-jina
 
-A [Jina AI](https://jina.ai/) plugin (bundle) for DeepSeek Harness: it exposes the full jina-cli API surface to the model as tool calls, and adds a **Jina Tools** card under **Plugins → Configuration** in the Web settings (the same standard plugin configuration location as Terminal / Agent Loop / Web Search) to configure your API key and a **local proxy address**.
+A [Jina AI](https://jina.ai/) plugin (bundle) for DeepSeek Harness: it exposes the full jina-cli API surface to the model as tool calls, and adds a configuration form on the Web **Plugins** page (on the `dsh-jina` bundle card) for your API key and a **local proxy address**; on older harnesses the same card falls back to **Settings → Plugins → Configure**.
 
 ## Changelog
 
 > Only the latest release is listed here; the full version history lives in [change-log.en.md](./change-log.en.md).
+
+### 0.7.0 (2026-09-17)
+
+- **compat** Adapted to the current dsh: the configuration slot moved from `settings.plugin.item` (keyed; Settings → Plugins → Configure) to `plugins.bundle.config` (keyed by the bundle's package name, rendered on the dsh-jina bundle card on the Plugins page; the host asks for `summary` and `page` views). The old slot is removed upstream, so without this change the card **silently disappears** and neither the key nor the proxy can be configured.
+- **compat** The legacy `settings.plugin.item` registration is kept, so both harness generations can configure the bundle; drop the arm marked Legacy in `ui/client.js` when old harnesses no longer matter.
+- **test** The browser-bundle contract tests gained assertions for the new slot and its two views; the legacy-slot assertions remain.
 
 ### 0.6.1 (2026-09-16)
 

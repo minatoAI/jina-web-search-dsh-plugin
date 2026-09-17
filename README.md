@@ -2,11 +2,17 @@
 
 # dsh-jina
 
-DeepSeek Harness 的 [Jina AI](https://jina.ai/) 插件（bundle）：把 jina-cli 的全部 API 能力以模型工具的形式装进 dsh，并在 Web 设置的**插件 → 配置**页（与 终端 / Agent 循环 / 网页搜索 相同的标准插件配置位置）提供 **Jina Tools** 卡片来配置 API key 与**本地代理地址**。
+DeepSeek Harness 的 [Jina AI](https://jina.ai/) 插件（bundle）：把 jina-cli 的全部 API 能力以模型工具的形式装进 dsh，并在 Web 的 **Plugins** 侧边栏页（`dsh-jina` bundle 卡片）提供配置表单来设置 API key 与**本地代理地址**；旧版 harness 上则回落到 **设置 → 插件 → 配置** 的同名卡片。
 
 ## 更新日志
 
 > 此处仅展示最新版本，完整版本历史见 [change-log.md](./change-log.md)。
+
+### 0.7.0（2026-09-17）
+
+- **compat** 适配新版 dsh：插件配置插槽由 `settings.plugin.item`（keyed，Settings → Plugins → Configure）改为 `plugins.bundle.config`（keyed by bundle 包名，随 Plugins 页的 dsh-jina bundle 卡片渲染，宿主索取 `summary` / `page` 两种视图）。旧插槽已在新版 harness 中被删除，不适配会导致卡片**静默消失**、无法配置 key 与代理。
+- **compat** 同时保留旧的 `settings.plugin.item` 注册，新旧两代 harness 都能配置；等不再需要兼容旧版时，删除 `ui/client.js` 中标注 Legacy 的那段即可。
+- **test** 浏览器 bundle 契约测试新增新插槽与两种视图的断言，旧插槽断言保留。
 
 ### 0.6.1（2026-09-16）
 

@@ -2,6 +2,12 @@
 
 Full version history of dsh-jina; the "Changelog" section of [README.en.md](./README.en.md) keeps only the latest release.
 
+### 0.7.0 (2026-09-17)
+
+- **compat** Adapted to the current dsh: the host slot carrying a plugin's configuration moved from `settings.plugin.item` (keyed; Settings → Plugins → Configure) to `plugins.bundle.config` (keyed by the bundle's package name; rendered on the dsh-jina bundle card on the Plugins page). The old slot is **removed** upstream, so without this change `slots.inject` waits for a declarer that never appears and the card silently disappears, leaving no way to configure the API key or the local proxy. The bundle now registers `{ name: 'plugins.bundle.config', key: 'dsh-jina' }`; the page asks each entry for two views — `summary` (the one-liner under the title) and `page` (the form with its own save control) — and `ui/client.js` branches on `props.view`.
+- **compat** The legacy `settings.plugin.item` registration (`key: 'jina-tools'`) is kept so one bundle configures on both harness generations: each `slots.inject` waits for its own declarer, and whichever exists mounts. Remove the arm marked Legacy in `ui/client.js` once every supported harness declares the new slot.
+- **test** `test/client-bundle.test.js` gains contracts for the new slot and its two views; the legacy-slot assertions stay as the back-compat regression line.
+
 ### 0.6.1 (2026-09-16)
 
 - **fix** Fixed the browser-half crash 0.6.0 introduced, which made the whole **Jina Tools card disappear** (reported from a live console: `Error: cannot get property "remote.settings" without inject`, then `slot entry crashed in 'settings.plugin.item'`). The gateway mounts every Remote namespace as its **own cordis service** `remote.<ns>`, and a consumer must declare that service name in its `inject` before reading the property; 0.6.0 declared only `slots` / `remote` / `remote.credentials`, so the moment `settingsApi()` read `remote.settings` the property access itself threw, the error reached the slot boundary, and the card was replaced by an error boundary. Fix: `exports.inject` now declares `'remote.settings'` (the bundled `ui-settings` client declares `['remote','remote.settings']` too), and the read is wrapped in try/catch so a missing service degrades to the "settings Remote not mounted" notice instead of crashing the slot.
