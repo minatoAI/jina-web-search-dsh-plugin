@@ -155,9 +155,12 @@ test('jina_read: ocr switches the pipeline and steers the page', async () => {
 test('jina_read: ocr without a key is refused before any request is spawned', async () => {
   const host = createHost()
   apply(host.ctx, resolveSettings(host.settingsValue))
-  const text = await callRead(host, { url: 'https://example.com/paper.pdf', ocr: true })
-  assert.match(text, /requires a Jina API key/)
-  assert.match(text, /Vision Language Model/)
+  const err = await callRead(host, { url: 'https://example.com/paper.pdf', ocr: true }).then(
+    () => assert.fail('a key-gated refusal must throw, not return a successful-looking string'),
+    (e) => e,
+  )
+  assert.match(err.message, /requires a Jina API key/)
+  assert.match(err.message, /Vision Language Model/)
   assert.equal(host.requests.length, 0, 'a key-gated feature must not spend a doomed request')
 })
 

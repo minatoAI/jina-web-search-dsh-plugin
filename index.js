@@ -480,6 +480,23 @@ export function apply(ctx, config) {
     return msg
   }
 
+  /**
+   * Statuses where the model must change its call or its credential: these
+   * throw so the harness marks the result `isError: true` — the only shape
+   * that reliably stops the model from treating the payload as data.
+   * Environmental / transient statuses (0 network, 402 quota, 429 rate limit,
+   * 5xx) stay returned: their hint tells the model to relay the problem to the
+   * user or retry, not to "fix" its own arguments.
+   */
+  const FATAL_JINA_STATUSES = new Set([401, 422])
+
+  /** Turn a failed response into an error (fatal status) or a returned hint. */
+  function failJina(res) {
+    const message = describeJinaError(res)
+    if (FATAL_JINA_STATUSES.has(res.status || 0)) throw new Error(message)
+    return message
+  }
+
   /** Per-call session workspace + signal; run at the top of every execute. */
   const enterExec = (exec) => {
     const cwd = sessionCwdOf(exec)
@@ -715,6 +732,27 @@ export function apply(ctx, config) {
       + ' (arguments received: ' + argsReceived(args) + ')')
   }
 
+  /**
+   * Reject a missing or non-http(s) required URL argument.
+   * Same contract and same reasoning as {@link requireStringArg}: a returned
+   * string is a *successful* result the model may read as data, so an argument
+   * the model got wrong must throw instead.
+   * @param name - tool name, quoted into the message.
+   * @param args - raw model arguments.
+   * @param key - the required property name.
+   * @param aliases - names a caller may have used by mistake, reported as a hint.
+   * @returns nothing when the value is an http(s) URL string; otherwise throws.
+   */
+  function requireUrlArg(name, args, key, aliases) {
+    const value = argAt(args, key)
+    if (typeof value === 'string' && /^https?:\/\//i.test(value)) return
+    const got = value === undefined ? 'nothing' : '(' + typeof value + ') ' + JSON.stringify(value)
+    const typo = (aliases || []).find((alias) => argAt(args, alias) !== undefined)
+    throw new Error('invalid arguments: ' + name + ' requires an http(s) "' + key + '" string, but got ' + got
+      + (typo === undefined ? '' : ' — did you mean "' + key + '" instead of "' + typo + '"?')
+      + ' (arguments received: ' + argsReceived(args) + ')')
+  }
+
   /** Shared executor for the search tools (jina_web_search / jina_search_arxiv / jina_search_ssrn). */
   async function runSearch(args, exec, fixedType) {
     const name = fixedType === 'arxiv' ? 'jina_search_arxiv' : fixedType === 'ssrn' ? 'jina_search_ssrn' : 'jina_web_search'
@@ -736,7 +774,7 @@ export function apply(ctx, config) {
       headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
       body, timeoutMs: 60000, needsKey: true, apiKey: args.apiKey, signal,
     })
-    if (!res.ok) return describeJinaError(res)
+    if (!res.ok) return failJina(res)
     return fmtSearch(res.text, args.json === true)
   }
 
@@ -850,15 +888,15 @@ export function apply(ctx, config) {
     },
     output: OUT,
     async execute(args, exec) {
+      requireUrlArg('jina_read', args, 'url', ['uri', 'link', 'href'])
       const signal = enterExec(exec)
-      if (!/^https?:\/\//i.test(String(args.url))) return 'invalid url: ' + args.url + ' (must start with http:// or https://)'
       const defaults = toolSettings()
       const useOcr = args.ocr === true || (args.ocr === undefined && defaults.useOcr === true)
       const key = args.apiKey || await loadKey()
       if (useOcr && !key) {
-        return 'ocr requires a Jina API key: the Reader rejects jina-ocr-v1 for anonymous callers (HTTP 401, '
+        throw new Error('ocr requires a Jina API key: the Reader rejects jina-ocr-v1 for anonymous callers (HTTP 401, '
           + '"Authentication is required to use this feature (Vision Language Model / OCR)"). '
-          + 'Save a key in the Plugins → dsh-jina card, or pass apiKey.'
+          + 'Save a key in the Plugins → dsh-jina card, or pass apiKey.')
       }
       // Alt-text generation is key-gated AND mutually exclusive with
       // X-Respond-With, so it is only ever sent for the plain pipeline.
@@ -915,7 +953,7 @@ export function apply(ctx, config) {
           content = retryContent
         }
       }
-      if (!res.ok) return describeJinaError(res)
+      if (!res.ok) return failJina(res)
       if (args.json) return res.text
       if (content === '') return res.text
       const payload = readPayload(res.text)
@@ -945,14 +983,14 @@ export function apply(ctx, config) {
     },
     output: OUT,
     async execute(args, exec) {
+      requireUrlArg('jina_screenshot', args, 'url', ['uri', 'link', 'href'])
       const signal = enterExec(exec)
-      if (!/^https?:\/\//i.test(String(args.url))) return 'invalid url: ' + args.url + ' (must start with http:// or https://)'
       const res = await callJina({
         url: READER, method: 'POST',
         headers: { Accept: 'application/json', 'Content-Type': 'application/json', 'X-Return-Format': args.fullPage ? 'pageshot' : 'screenshot' },
         body: { url: String(args.url) }, timeoutMs: 120000, needsKey: true, apiKey: args.apiKey, signal,
       })
-      if (!res.ok) return describeJinaError(res)
+      if (!res.ok) return failJina(res)
       return fmtScreenshot(res.text)
     },
   })
@@ -971,14 +1009,14 @@ export function apply(ctx, config) {
     },
     output: OUT,
     async execute(args, exec) {
+      requireUrlArg('jina_datetime', args, 'url', ['uri', 'link', 'href'])
       const signal = enterExec(exec)
-      if (!/^https?:\/\//i.test(String(args.url))) return 'invalid url: ' + args.url + ' (must start with http:// or https://)'
       const res = await callJina({
         url: READER, method: 'POST',
         headers: { Accept: 'application/json', 'Content-Type': 'application/json', 'X-Return-Format': 'datetime' },
         body: { url: String(args.url) }, timeoutMs: 60000, needsKey: false, signal,
       })
-      if (!res.ok) return describeJinaError(res)
+      if (!res.ok) return failJina(res)
       return fmtDatetime(res.text, args.json === true)
     },
   })
@@ -1005,7 +1043,7 @@ export function apply(ctx, config) {
         headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
         body: { q: String(args.query), query_expansion: true }, timeoutMs: 60000, needsKey: true, apiKey: args.apiKey, signal,
       })
-      if (!res.ok) return describeJinaError(res)
+      if (!res.ok) return failJina(res)
       return fmtExpand(res.text, args.json === true)
     },
   })
@@ -1037,7 +1075,7 @@ export function apply(ctx, config) {
         headers: { 'Content-Type': 'application/json' },
         body, timeoutMs: 90000, needsKey: true, apiKey: args.apiKey, signal,
       })
-      if (!res.ok) return describeJinaError(res)
+      if (!res.ok) return failJina(res)
       return fmtEmbed(res.text, args.json === true)
     },
   })
@@ -1070,7 +1108,7 @@ export function apply(ctx, config) {
         headers: { 'Content-Type': 'application/json' },
         body, timeoutMs: 90000, needsKey: true, apiKey: args.apiKey, signal,
       })
-      if (!res.ok) return describeJinaError(res)
+      if (!res.ok) return failJina(res)
       return fmtRerank(res.text, args.documents, args.json === true)
     },
   })
@@ -1101,7 +1139,7 @@ export function apply(ctx, config) {
         headers: { 'Content-Type': 'application/json' },
         body, timeoutMs: 90000, needsKey: true, apiKey: args.apiKey, signal,
       })
-      if (!res.ok) return describeJinaError(res)
+      if (!res.ok) return failJina(res)
       return fmtClassify(res.text, args.json === true)
     },
   })
@@ -1134,7 +1172,7 @@ export function apply(ctx, config) {
         headers: { 'Content-Type': 'application/json' },
         body, timeoutMs: 120000, needsKey: true, apiKey: args.apiKey, signal,
       })
-      if (!res.ok) return describeJinaError(res)
+      if (!res.ok) return failJina(res)
       return fmtPdf(res.text, args.json === true)
     },
   })

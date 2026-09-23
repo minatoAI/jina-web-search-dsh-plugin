@@ -8,25 +8,12 @@ DeepSeek Harness 的 [Jina AI](https://jina.ai/) 插件（bundle）：把 jina-c
 
 > 此处仅展示最新版本，完整版本历史见 [change-log.md](./change-log.md)。
 
-### 0.8.1（2026-09-23）
+### 0.8.2（2026-09-23）
 
-- **fix** **修复新版 harness 上「阅读工具选项」与两个保存按钮全部变灰、无法修改**（用户实测截图）：dsh `601d6761e4` 删除了 `settings.register(ns, schema)`，设置命名空间改为 **Loader 组合条目 id**，插件须导出 schemastery 形态的 `Config`（字段节点带 `meta.volatile`）并接收 `apply(ctx, config)`。旧代码调用已不存在的 `sctx.settings.register`，异常被 try/catch 吞掉 → `jina-tools` 从未出现在 `settings.describe()` 里 → 卡片 `phase = 'unavailable'` → 所有控件 `disabled`。**不是 CSS / 权限 / 只读 profile 问题**，同一根因也让配置根本存不进去。
-- **fix** **保存即时生效**：字段是跨副本安全的 volatile 引用（`Symbol.for('cosmokit.volatile.write')`），保存时 harness 只改写引用，`fiber.config` 身份不变、不重挂载，插件每次操作重新读取——与 API key 同一条契约。
-- **fix** 逐字段 `meta.volatile`（**不能**整段 volatile，否则 `strip()` 会丢掉文档里未声明的键）；`validate` 同步返回纯对象且对 `undefined` / 脏值容错（`describe()` 是整个 Plugins 页共用的，抛错会波及所有卡片）；`toJSON()` 每次返回新节点（`plainSchema()` 会 `delete meta.volatile`）。
-- **change** 宿主半身不再 `inject(['settings'])`；`/api/dsh-jina/primer` 的 `settingsError` 改为 `settingsLive` 健康检查。
-- **test** 四个测试文件全部迁移到新 seam，新增「保存后下一次调用即生效」端到端回归；全套 104 例（103 通过 / 1 例按需跳过）。
-
-### 0.8.0（2026-09-18）
-
-- **feat** **`jina_read` 新增 OCR 开关（jina-ocr-v1）**：`ocr: true` 或在卡片里设为默认后，改走官方 3.4B 文档解析模型，一次过把扫描件 / 图片型 PDF / 复杂表格与公式转成 Markdown（表格出 HTML、公式出 LaTeX），多页文档可用 `page` 指定单页。约 **40× token**，且**必须有 API key**（官方对匿名请求直接 401），因此没检测到 key 时**不发请求**、直接给可操作提示。
-- **feat** **每次读取固定发送三个零副作用参数**：`X-Preset: agent`（官方为 AI agent 预调的预设，**只填充未显式设置的选项**）、`X-Base: final`（用跳转后的 URL 解析相对链接）、`X-Timeout: 120`（与客户端 120s 上限对齐的慢页面兜底）。
-- **feat** **选择器组默认开启 + 空结果自动回退**：默认发保守的正文选择器与噪声排除列表，新增 `targetSelector` / `waitForSelector` / `removeSelector` / `noCache` 调用参数；选择器不命中导致结果过短时**自动去掉选择器组重试**，不会返回空页。
-- **feat** **图片策略回到官方默认 `all`**（可选 `alt` / `none`），不再硬编码 `none`；设置卡片新增「阅读工具选项」区块（OCR / 图片策略 / alt 生成 / 选择器组 / 选择器覆盖），与 `proxyUrl` 同走一条 revision 栅栏写入路径。
-- **fix** `X-With-Generated-Alt` 改为**默认关闭**：需 key、与 OCR 互斥，而且**带 key 的请求才计费**——默认开启会把"匿名免费读取"静默变成"计费读取"。
-- **fix** `createSettingsSchema()` 此前只保留 `proxyUrl`，新增字段会被静默丢弃；现保留全部已知字段，并新增 `toolSettingsOf()` 把"未设置"解析为默认值（设置文档仍只存偏离默认值的部分）。
-- **fix** **必填参数不再被静默转成字符串 `"undefined"`**：`ctx.tools.register` 运行期不校验参数，模型把键名写错（如用内置 `web_search` 的 `queries` 代替本插件的 `query`）时 `String(args.query)` 会把它变成搜索词 `undefined`，Jina 返回 MDN 的 `undefined` 词条——**`isError: false`、看起来像真结果**。现对 `jina_web_search` / `jina_search_arxiv` / `jina_search_ssrn` / `jina_expand` / `jina_rerank` / `jina_embed` / `jina_classify` / `jina_pdf` 的必填参数前置校验并**直接抛错**（`isError: true`），报错点名工具、参数与疑似笔误，且不发任何请求。
-- **change** `jina_read` 固定用 `Accept: application/json`，解包成带 `Title` / `URL Source` / `[Usage: …]` 的 markdown；不可解析的响应原文返回。
-- **test** 新增 `test/reader-headers.test.js`（14 例，解码网络 helper 的 stdin 逐条断言真实发出的请求头）与 `test/tool-args.test.js`（9 例，以实测现场那次 `{queries:[…],num:6}` 错误调用为第一条断言，含"被拒调用零请求"与合法路径不回归）；`client-render.test.js` 与 `client-bundle.test.js` 增加选项控件的渲染与接线断言。完整说明见 [change-log.md](./change-log.md)。
+- **fix** **收口错误传播的最后两处不一致**（0.8.0 记为「暂未改动」）：`jina_read` / `jina_screenshot` / `jina_datetime` 的 URL 校验此前是**返回字符串**（`invalid url: undefined ...`），实测为 **`isError: false`**，模型可能把它当数据读；根因是这一行是**本地前置校验**、位于 `callJina` 之前、从未发出请求，与上游错误码无关。现改为**抛错**（`requireUrlArg()`）：文案点名工具、`"url"`、实际收到的类型与值（如 `(number) 42`），键名写错时给出 `did you mean "url" instead of "uri"?`，并上移到任何副作用之前，仍为零请求。
+- **fix** `jina_read` 的 **OCR 无 key** 路径同样由「返回字符串」改为**抛错**（文案一字不改）；它是前置拒绝而非 API 响应，「检测不到 key 就不发请求」的承诺不变。
+- **change** **上游错误按状态码分流**：`401`（key 无效/缺失）与 `422`（参数非法）**抛错**——模型必须改 key 或改参数；`0`（网络/代理）、`402`（额度）、`429`（限流）、`5xx` **保持返回**——它们的提示是给模型转述给用户或稍后重试的。`jina_primer` 的「the tool never throws」契约不受影响。
+- **test** `tool-args.test.js` 追加 10 例：三个 URL 工具的四种拒绝形态（均断言零请求）、合法 URL 仍照发请求的正向用例、OCR 无 key 仍零请求，以及 401/422 抛错 / 429 返回 / `jina_primer` 永不抛错四条分流回归线；全套 114 例（113 通过 / 1 例按需跳过）。
 
 ## 功能
 
