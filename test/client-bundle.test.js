@@ -101,3 +101,17 @@ test('client bundle: the card shows the proxy the probe actually used', () => {
 test('client bundle: a non-http(s) address is refused before it can be saved', () => {
   assert.match(SOURCE, /只支持 http:\/\/ 或 https:\/\/ 代理/)
 })
+
+test('client bundle: the reader options ride the same namespace and write path', () => {
+  // The bundle is hand-edited, so a dropped field would silently make the
+  // control a no-op: the card would render a checkbox that writes nothing.
+  for (const field of ['useOcr', 'imagePolicy', 'autoAltText', 'useSelectors', 'targetSelector', 'removeSelector']) {
+    assert.match(SOURCE, new RegExp("'" + field + "'"), field + ' must be wired into the card')
+  }
+  assert.match(SOURCE, /jina-ocr-v1/, 'the OCR switch must name the model it turns on')
+  assert.match(SOURCE, /40× token/, 'the OCR cost must be stated where the switch is')
+  // One writer, revision-fenced: the options must not grow a second mutate path.
+  const mutations = SOURCE.match(/\.mutate\(/g) || []
+  assert.equal(mutations.length, 1, 'exactly one settings write path')
+  assert.match(SOURCE, /mutate\(NS,\s*ops,\s*proxyView\.revision\)/)
+})

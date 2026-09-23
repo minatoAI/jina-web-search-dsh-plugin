@@ -155,3 +155,22 @@ test('client bundle: the legacy settings card renders its collapsible body when 
   assert.ok(inputs.some(props => props.placeholder === 'http://127.0.0.1:7897'),
     'the opened legacy card must render the local-proxy field too')
 })
+
+test('client bundle: the page view renders the reader option controls', () => {
+  const { registrations, elements } = mount()
+  const entry = bundleEntry(registrations)
+  renderView(entry, 'page')
+  const inputs = elements.filter(node => node.type === 'input').map(node => node.props)
+  const checkboxes = inputs.filter(props => props.type === 'checkbox')
+  assert.equal(checkboxes.length, 3, 'the OCR, alt-text and selector toggles must render')
+  assert.ok(checkboxes.every(props => typeof props.onChange === 'function'),
+    'every toggle must carry a real handler, not a missing binding')
+  assert.ok(inputs.some(props => props.placeholder === '正文选择器（留空使用内置列表）'),
+    'the target-selector override must render')
+  assert.ok(inputs.some(props => props.placeholder === '排除选择器（留空使用内置列表）'),
+    'the remove-selector override must render')
+  const selects = elements.filter(node => node.type === 'select').map(node => node.props)
+  assert.equal(selects.length, 1, 'the image-policy select must render')
+  assert.equal(selects[0].value, 'all', 'the select must default to the API image policy')
+  assert.equal(selects[0].onChange !== undefined, true, 'the select must carry a handler')
+})

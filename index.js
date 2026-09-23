@@ -11,7 +11,9 @@
  * operation (the seam's contract: never cache across operations). The web
  * settings pairing: this host half serves the `jina-tools` settings
  * namespace — whose `proxyUrl` field carries a manually configured local
- * proxy address — and the browser half registers its configuration form for
+ * proxy address and whose remaining fields carry the reader policy
+ * (`useOcr`, `imagePolicy`, `autoAltText`, `useSelectors` and the selector
+ * overrides) — and the browser half registers its configuration form for
  * that namespace, so the Plugins page (the `dsh-jina` bundle card) renders the
  * form only when the two halves agree.
  *
@@ -42,8 +44,10 @@
 import { homedir } from 'node:os'
 import { buildPrimer, formatPrimer, parseIpInfo, parseJinaRoot } from './primer.js'
 import {
-  PROXY_ENV_VAR, SETTINGS_NAMESPACE,
-  createSettingsSchema, describeRejectReason, proxySettingOf, selectProxy,
+  DEFAULT_REMOVE_SELECTORS, DEFAULT_TARGET_SELECTORS, PROXY_ENV_VAR,
+  READER_BASE, READER_PRESET, READER_TIMEOUT_SECONDS, SELECTOR_RETRY_MIN_CHARS,
+  SETTINGS_NAMESPACE,
+  createSettingsSchema, describeRejectReason, proxySettingOf, selectProxy, toolSettingsOf,
 } from './proxy.js'
 import { WEB_SEARCH_TOOL } from './tool-contracts.js'
 
@@ -284,6 +288,17 @@ export function apply(ctx) {
   function settingProxy() {
     if (settingsScope === undefined) return ''
     try { return proxySettingOf(settingsScope.get()) } catch (err) { return '' }
+  }
+
+  /**
+   * The reader policy stored by the settings card, re-read per operation (same
+   * contract as the proxy address and the API key: a saved change reaches the
+   * next call without a restart). proxy.js owns the normalization and the
+   * defaults, so a profile without a settings provider gets the defaults.
+   */
+  function toolSettings() {
+    if (settingsScope === undefined) return toolSettingsOf(undefined)
+    try { return toolSettingsOf(settingsScope.get()) } catch (err) { return toolSettingsOf(undefined) }
   }
 
   /**
@@ -687,17 +702,62 @@ export function apply(ctx) {
     },
   })
 
+  /**
+   * Unwrap a Reader JSON payload.
+   *
+   * Every read now asks for `Accept: application/json` — that is what carries
+   * the title, the post-redirect URL and the token usage. A shape surprise must
+   * never lose the body, so an unparsable response comes back as `content`.
+   */
+  function readPayload(text) {
+    const raw = typeof text === 'string' ? text : ''
+    try {
+      const parsed = JSON.parse(raw)
+      const d = parsed && typeof parsed === 'object' && parsed.data && typeof parsed.data === 'object' ? parsed.data : parsed
+      if (d && typeof d === 'object') {
+        return {
+          title: typeof d.title === 'string' ? d.title : '',
+          url: typeof d.url === 'string' ? d.url : '',
+          published: typeof d.publishedTime === 'string' ? d.publishedTime : '',
+          content: typeof d.content === 'string' ? d.content : '',
+        }
+      }
+    } catch (err) { /* not JSON — fall through to the raw body */ }
+    return { title: '', url: '', published: '', content: raw }
+  }
+
+  /** Token accounting, appended when the payload reports usage. */
+  function usageFooter(text) {
+    try {
+      const parsed = JSON.parse(text)
+      const usage = (parsed && parsed.usage) || (parsed && parsed.data && parsed.data.usage)
+      if (usage && typeof usage === 'object') {
+        const parts = Object.keys(usage)
+          .filter((k) => typeof usage[k] === 'number')
+          .map((k) => k + '=' + usage[k])
+        if (parts.length > 0) return '\n\n[Usage: ' + parts.join(', ') + ']'
+      }
+    } catch (err) { /* nothing to report */ }
+    return ''
+  }
+
   ctx.tools.register({
     name: 'jina_read',
-    description: 'Read a web page and extract clean markdown via Jina Reader (r.jina.ai), mirroring the jina-cli \'read\' command. Works without an API key (rate-limited); pass a key for higher limits. Use links/images to include link/image summaries.',
+    description: 'Read a web page as clean markdown via Jina Reader (r.jina.ai), mirroring the jina-cli \'read\' command. Uses the vendor\'s `agent` preset, resolves relative links against the post-redirect URL, and strips page chrome by default. Set ocr for scanned PDFs or image-heavy documents. Works without an API key (rate-limited) except for ocr.',
     parameters: {
       type: 'object',
       additionalProperties: false,
       properties: {
         url: { type: 'string', description: 'Page URL, starting with http:// or https://.' },
+        ocr: { type: 'boolean', description: 'Read through jina-ocr-v1 (document OCR: scanned PDFs, image-heavy pages, complex tables and formulas). Costs roughly 40x the tokens and requires an API key.' },
+        page: { type: 'number', description: 'With ocr: transcribe one page of a multi-page document (1-indexed).' },
+        targetSelector: { type: 'string', description: 'CSS selector(s) to keep instead of the whole page (overrides the configured default list).' },
+        waitForSelector: { type: 'string', description: 'CSS selector to wait for before extracting (dynamically rendered pages).' },
+        removeSelector: { type: 'string', description: 'CSS selector(s) to drop before extracting (overrides the configured default list).' },
+        noCache: { type: 'boolean', description: 'Bypass the Jina cache and fetch the page fresh.' },
         links: { type: 'boolean', description: 'Include hyperlinks in the output.' },
         images: { type: 'boolean', description: 'Include image summaries in the output.' },
-        json: { type: 'boolean', description: 'Return the raw JSON response instead of markdown.' },
+        json: { type: 'boolean', description: 'Return the raw JSON response instead of the extracted markdown.' },
         apiKey: { type: 'string', description: 'Optional Jina API key override.' },
       },
       required: ['url'],
@@ -706,20 +766,81 @@ export function apply(ctx) {
     async execute(args, exec) {
       const signal = enterExec(exec)
       if (!/^https?:\/\//i.test(String(args.url))) return 'invalid url: ' + args.url + ' (must start with http:// or https://)'
-      const headers = {
-        Accept: args.json ? 'application/json' : 'text/markdown',
-        'Content-Type': 'application/json',
-        'X-Md-Link-Style': 'discarded',
+      const defaults = toolSettings()
+      const useOcr = args.ocr === true || (args.ocr === undefined && defaults.useOcr === true)
+      const key = args.apiKey || await loadKey()
+      if (useOcr && !key) {
+        return 'ocr requires a Jina API key: the Reader rejects jina-ocr-v1 for anonymous callers (HTTP 401, '
+          + '"Authentication is required to use this feature (Vision Language Model / OCR)"). '
+          + 'Save a key in the Plugins → dsh-jina card, or pass apiKey.'
       }
-      if (args.links) headers['X-With-Links-Summary'] = 'all'
-      if (args.images) headers['X-With-Images-Summary'] = 'true'
-      else headers['X-Retain-Images'] = 'none'
-      const res = await callJina({
+      // Alt-text generation is key-gated AND mutually exclusive with
+      // X-Respond-With, so it is only ever sent for the plain pipeline.
+      const useAltText = !useOcr && defaults.autoAltText === true && key !== undefined
+      const selectorsOn = defaults.useSelectors !== false
+
+      /** Build one request's headers; the retry flips `withSelectors` off. */
+      const buildHeaders = (withSelectors) => {
+        const headers = {
+          Accept: 'application/json',
+          'Content-Type': 'application/json',
+          'X-Md-Link-Style': 'discarded',
+          'X-Preset': READER_PRESET,
+          'X-Base': READER_BASE,
+          'X-Timeout': String(READER_TIMEOUT_SECONDS),
+          'X-Retain-Images': defaults.imagePolicy,
+        }
+        if (args.links) headers['X-With-Links-Summary'] = 'all'
+        if (args.images) headers['X-With-Images-Summary'] = 'true'
+        if (useOcr) {
+          headers['X-Respond-With'] = 'jina-ocr-v1'
+          if (args.page !== undefined) headers['X-Page'] = String(args.page)
+        } else if (useAltText) {
+          headers['X-With-Generated-Alt'] = 'true'
+        }
+        if (args.noCache) headers['X-No-Cache'] = 'true'
+        if (withSelectors) {
+          const target = args.targetSelector || defaults.targetSelector || DEFAULT_TARGET_SELECTORS
+          const wait = args.waitForSelector || defaults.waitForSelector
+          const remove = args.removeSelector || defaults.removeSelector || DEFAULT_REMOVE_SELECTORS
+          if (target !== '') headers['X-Target-Selector'] = target
+          if (wait !== '') headers['X-Wait-For-Selector'] = wait
+          if (remove !== '') headers['X-Remove-Selector'] = remove
+        }
+        return headers
+      }
+
+      const request = (headers) => callJina({
         url: READER, method: 'POST', headers,
-        body: { url: String(args.url) }, timeoutMs: 120000, needsKey: false, apiKey: args.apiKey, signal,
+        body: { url: String(args.url) }, timeoutMs: 120000,
+        needsKey: useOcr || useAltText, apiKey: args.apiKey, signal,
       })
+
+      let res = await request(buildHeaders(selectorsOn))
+      let content = res.ok ? readPayload(res.text).content : ''
+      // A target selector that matches nothing returns an empty (or near-empty)
+      // page. Retry once without the selector group and keep the longer body:
+      // the group is a default, never a trap.
+      if (selectorsOn && res.ok && content.length < SELECTOR_RETRY_MIN_CHARS) {
+        const retry = await request(buildHeaders(false))
+        const retryContent = retry.ok ? readPayload(retry.text).content : ''
+        if (retry.ok && retryContent.length > content.length) {
+          res = retry
+          content = retryContent
+        }
+      }
       if (!res.ok) return describeJinaError(res)
-      return res.text
+      if (args.json) return res.text
+      if (content === '') return res.text
+      const payload = readPayload(res.text)
+      let out = content
+      if (payload.title !== '' && out.indexOf(payload.title) === -1) {
+        out = 'Title: ' + payload.title
+          + '\nURL Source: ' + (payload.url !== '' ? payload.url : String(args.url))
+          + (payload.published !== '' ? '\nPublished Time: ' + payload.published : '')
+          + '\n\nMarkdown Content:\n' + out
+      }
+      return out + usageFooter(res.text)
     },
   })
 
@@ -1016,8 +1137,14 @@ export function apply(ctx) {
   // "jina-tools", the namespace the browser half's configuration form edits
   // (through the Plugins page's bundle-configuration slot, or the older
   // Settings → Plugins → Configure card). The namespace carries the manually
-  // configured local proxy address (`proxyUrl`); the API key stays in the
-  // credential seam and never rides the settings document.
+  // configured local proxy address (`proxyUrl`) plus the reader policy
+  // (`useOcr`, `imagePolicy`, `autoAltText`, `useSelectors` and the three
+  // selector overrides); the API key stays in the credential seam and never
+  // rides the settings document.
+  //
+  // The stored document only ever holds what the user changed — defaults live
+  // in proxy.js (`toolSettingsOf`) so "unset" keeps meaning "default" and a
+  // later default change reaches users who never touched the field.
   //
   // Zero-dependency note: the settings service consumes a schemastery schema
   // as a function (schema(value) → resolved value), serializes it through

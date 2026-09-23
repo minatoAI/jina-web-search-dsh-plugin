@@ -56,6 +56,16 @@ window.__ModuleLoader__.load({
     var CRED = 'JINA_API_KEY'
     var NS = 'jina-tools'
     var PROXY_FIELD = 'proxyUrl'
+    // Reader-policy fields of the same `jina-tools` namespace. The host owns
+    // the defaults (proxy.js `toolSettingsOf`), so the card only ever writes
+    // deviations: `set` for opt-in flags, `unset` to fall back to a default.
+    var OCR_FIELD = 'useOcr'
+    var IMAGE_POLICY_FIELD = 'imagePolicy'
+    var AUTO_ALT_FIELD = 'autoAltText'
+    var SELECTORS_FIELD = 'useSelectors'
+    var TARGET_SELECTOR_FIELD = 'targetSelector'
+    var REMOVE_SELECTOR_FIELD = 'removeSelector'
+    var IMAGE_POLICIES = ['all', 'alt', 'none']
     // Host-reported proxy source → the label the card shows.
     var PROXY_SOURCES = {
       setting: '设置卡片',
@@ -95,6 +105,9 @@ window.__ModuleLoader__.load({
       mono: { fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace', fontSize: 12, lineHeight: '18px', color: 'var(--dsw-alias-label-primary)', margin: 0, wordBreak: 'break-all' },
       note: { fontSize: 12, lineHeight: '18px', color: 'var(--dsw-alias-label-tertiary, rgba(127,127,127,0.6))', margin: 0 },
       link: { color: 'var(--dsw-alias-label-link, var(--dsw-alias-label-primary))', textDecoration: 'underline', cursor: 'pointer' },
+      checkRow: { display: 'flex', alignItems: 'flex-start', gap: 8, cursor: 'pointer' },
+      checkLabel: { fontSize: 12, lineHeight: '18px', color: 'var(--dsw-alias-label-primary)', flex: 1 },
+      select: { boxSizing: 'border-box', height: 32, borderRadius: 8, border: '1px solid rgba(127,127,127,0.35)', background: 'var(--dsw-alias-bg-layer-1, transparent)', color: 'var(--dsw-alias-label-primary)', padding: '0 8px', fontSize: 12, fontFamily: 'inherit' },
     }
 
     function Chevron(props) {
@@ -121,11 +134,24 @@ window.__ModuleLoader__.load({
       // `proxyView` mirrors the host's `jina-tools` namespace: phase 'ready'
       // carries the stored address, the revision the next write is fenced
       // against, and whether the document accepts writes at all.
-      var [proxyView, setProxyView] = React.useState({ phase: 'loading', url: '', revision: undefined, writable: false, error: '' })
+      var [proxyView, setProxyView] = React.useState({ phase: 'loading', url: '', revision: undefined, writable: false, error: '', options: undefined })
       var [proxyInput, setProxyInput] = React.useState('')
       var [proxyStatus, setProxyStatus] = React.useState('')
       var [proxyStatusKind, setProxyStatusKind] = React.useState('info')
       var proxyDirty = React.useRef(false)
+      // ---- reader options (same namespace, same revision-fenced write path) --
+      // NOTE: every hook is declared before any early return below; the state
+      // order is load-bearing for `test/client-render.test.js`, which renders
+      // by overriding the first `useState` (the collapsible `open` flag).
+      var [ocrInput, setOcrInput] = React.useState(false)
+      var [imagePolicyInput, setImagePolicyInput] = React.useState('all')
+      var [autoAltInput, setAutoAltInput] = React.useState(false)
+      var [selectorsInput, setSelectorsInput] = React.useState(true)
+      var [targetSelectorInput, setTargetSelectorInput] = React.useState('')
+      var [removeSelectorInput, setRemoveSelectorInput] = React.useState('')
+      var [optsStatus, setOptsStatus] = React.useState('')
+      var [optsStatusKind, setOptsStatusKind] = React.useState('info')
+      var optsDirty = React.useRef(false)
 
       var settingsApi = function () {
         // `remote.settings` is its own cordis service (the gateway mounts every
@@ -160,15 +186,35 @@ window.__ModuleLoader__.load({
 
       /** Adopt one settings namespace view (describe row or mutate answer). */
       var adoptProxy = function (row, writable) {
-        var url = row && row.value && typeof row.value[PROXY_FIELD] === 'string' ? row.value[PROXY_FIELD] : ''
+        var value = row && row.value && typeof row.value === 'object' ? row.value : {}
+        var url = typeof value[PROXY_FIELD] === 'string' ? value[PROXY_FIELD] : ''
+        var options = {
+          ocr: value[OCR_FIELD] === true,
+          imagePolicy: IMAGE_POLICIES.indexOf(value[IMAGE_POLICY_FIELD]) >= 0 ? value[IMAGE_POLICY_FIELD] : 'all',
+          autoAlt: value[AUTO_ALT_FIELD] === true,
+          selectors: value[SELECTORS_FIELD] !== false,
+          targetSelector: typeof value[TARGET_SELECTOR_FIELD] === 'string' ? value[TARGET_SELECTOR_FIELD] : '',
+          removeSelector: typeof value[REMOVE_SELECTOR_FIELD] === 'string' ? value[REMOVE_SELECTOR_FIELD] : '',
+        }
         setProxyView({
           phase: 'ready',
           url: url,
           revision: row ? row.revision : undefined,
           writable: writable === true,
           error: '',
+          options: options,
         })
+        // An unsaved edit is never clobbered by a refresh; a field the user
+        // never touched follows the document (another tab, settings.yaml).
         if (!proxyDirty.current) setProxyInput(url)
+        if (!optsDirty.current) {
+          setOcrInput(options.ocr)
+          setImagePolicyInput(options.imagePolicy)
+          setAutoAltInput(options.autoAlt)
+          setSelectorsInput(options.selectors)
+          setTargetSelectorInput(options.targetSelector)
+          setRemoveSelectorInput(options.removeSelector)
+        }
         return url
       }
 
@@ -197,42 +243,42 @@ window.__ModuleLoader__.load({
         })
       }
 
-      /** Write one field operation into the namespace, fenced by our revision. */
-      var writeProxy = function (ops, okMessage) {
+      /**
+       * Write operations into the namespace, fenced by the revision the card
+       * read. One writer serves both blocks (proxy + reader options) so the
+       * revision can never drift between them; `report` lets a block render its
+       * own status line while sharing the same write.
+       */
+      var writeProxy = function (ops, okMessage, report) {
+        var say = report || function (kind, message) { setProxyStatusKind(kind); setProxyStatus(message) }
         var api = settingsApi()
         if (api === undefined || typeof api.mutate !== 'function') {
-          setProxyStatusKind('bad')
-          setProxyStatus('当前环境未挂载 settings Remote，无法保存。')
+          say('bad', '当前环境未挂载 settings Remote，无法保存。')
           return
         }
         if (proxyView.phase !== 'ready') {
-          setProxyStatusKind('bad')
-          setProxyStatus('设置尚未加载完成，请稍后重试。')
+          say('bad', '设置尚未加载完成，请稍后重试。')
           return
         }
         if (!proxyView.writable) {
-          setProxyStatusKind('bad')
-          setProxyStatus('当前环境只读（设置文档不可写），无法在此保存。')
+          say('bad', '当前环境只读（设置文档不可写），无法在此保存。')
           return
         }
-        setProxyStatusKind('info')
-        setProxyStatus('保存中…')
+        say('info', '保存中…')
         api.mutate(NS, ops, proxyView.revision).then(function (response) {
           if (response && response.ok === true) {
             adoptProxy(response.value, proxyView.writable)
-            setProxyStatusKind('ok')
-            setProxyStatus(okMessage)
+            say('ok', okMessage)
             loadPrimer()
           } else {
             var message = (response && response.error && response.error.message) || '未知错误'
-            setProxyStatusKind('bad')
-            setProxyStatus('保存失败：' + message + '（已重新读取当前设置，请重试）')
+            say('bad', '保存失败：' + message + '（已重新读取当前设置，请重试）')
             proxyDirty.current = false
+            optsDirty.current = false
             loadProxy()
           }
         }, function () {
-          setProxyStatusKind('bad')
-          setProxyStatus('保存失败，请重试。')
+          say('bad', '保存失败，请重试。')
         })
       }
 
@@ -392,6 +438,112 @@ window.__ModuleLoader__.load({
           ? React.createElement('p', { style: S.note }, '当前环境只读（设置文档不可写），无法在此修改；可用环境变量 JINA_PROXY_URL 代替。')
           : null)
 
+      // ---- reader options block ---------------------------------------------
+      // The reader policy of the same namespace: the OCR switch, the image
+      // policy, and the selector group. All of it is written through the same
+      // revision-fenced `writeProxy`, so a save here cannot clobber a proxy
+      // edit made in the other block.
+      var optsReady = proxyView.phase === 'ready' && proxyView.writable
+      var optsStatusStyle = optsStatusKind === 'ok' ? S.statusOk : (optsStatusKind === 'bad' ? S.statusBad : S.status)
+      var optsReport = function (kind, message) { setOptsStatusKind(kind); setOptsStatus(message) }
+
+      function onOptsCheck(setter) {
+        return function (e) {
+          optsDirty.current = true
+          setter(e.target.checked)
+        }
+      }
+
+      function onOptsText(setter) {
+        return function (e) {
+          optsDirty.current = true
+          setter(e.target.value)
+        }
+      }
+
+      function onOptsSave() {
+        // Only deviations are stored: `unset` is how a field returns to the
+        // host default (see proxy.js `toolSettingsOf`).
+        var ops = [
+          { op: ocrInput ? 'set' : 'unset', path: [OCR_FIELD], value: true },
+          { op: imagePolicyInput === 'all' ? 'unset' : 'set', path: [IMAGE_POLICY_FIELD], value: imagePolicyInput },
+          { op: autoAltInput ? 'set' : 'unset', path: [AUTO_ALT_FIELD], value: true },
+          { op: selectorsInput ? 'unset' : 'set', path: [SELECTORS_FIELD], value: false },
+        ]
+        var target = targetSelectorInput.trim()
+        var remove = removeSelectorInput.trim()
+        ops.push(target === ''
+          ? { op: 'unset', path: [TARGET_SELECTOR_FIELD] }
+          : { op: 'set', path: [TARGET_SELECTOR_FIELD], value: target })
+        ops.push(remove === ''
+          ? { op: 'unset', path: [REMOVE_SELECTOR_FIELD] }
+          : { op: 'set', path: [REMOVE_SELECTOR_FIELD], value: remove })
+        optsDirty.current = false
+        writeProxy(ops, '工具选项已保存，下一次调用立即生效。', optsReport)
+      }
+
+      var optionsBlock = React.createElement('div', { style: S.infoBox },
+        React.createElement('p', { style: S.infoLabel }, '阅读工具选项'),
+        React.createElement('label', { style: S.checkRow },
+          React.createElement('input', {
+            type: 'checkbox',
+            checked: ocrInput,
+            onChange: onOptsCheck(setOcrInput),
+            disabled: !optsReady,
+          }),
+          React.createElement('span', { style: S.checkLabel }, '使用 jina-ocr-v1 解析文档（扫描件 / 图片型 PDF / 复杂表格与公式；约 40× token，需要 API key，与下面的 alt 生成互斥）')),
+        React.createElement('label', { style: S.checkRow },
+          React.createElement('input', {
+            type: 'checkbox',
+            checked: autoAltInput,
+            onChange: onOptsCheck(setAutoAltInput),
+            disabled: !optsReady,
+          }),
+          React.createElement('span', { style: S.checkLabel }, '自动为缺少说明的图片生成 alt 文本（需要 API key，会计入 token 消耗）')),
+        React.createElement('label', { style: S.checkRow },
+          React.createElement('input', {
+            type: 'checkbox',
+            checked: selectorsInput,
+            onChange: onOptsCheck(setSelectorsInput),
+            disabled: !optsReady,
+          }),
+          React.createElement('span', { style: S.checkLabel }, '自动去除页眉/页脚/广告等噪声并优先取正文容器（命中不到时自动回退整页，不会返回空）')),
+        React.createElement('div', { style: S.row },
+          React.createElement('span', { style: S.checkLabel }, '图片保留策略'),
+          React.createElement('select', {
+            style: S.select,
+            value: imagePolicyInput,
+            onChange: onOptsText(setImagePolicyInput),
+            disabled: !optsReady,
+          },
+            React.createElement('option', { value: 'all' }, 'all —— 保留全部图片（Jina 默认）'),
+            React.createElement('option', { value: 'alt' }, 'alt —— 只保留 alt 文本（省 token）'),
+            React.createElement('option', { value: 'none' }, 'none —— 不保留图片'))),
+        React.createElement('input', {
+          style: S.input,
+          type: 'text',
+          value: targetSelectorInput,
+          placeholder: '正文选择器（留空使用内置列表）',
+          onChange: onOptsText(setTargetSelectorInput),
+          autoComplete: 'off',
+          spellCheck: false,
+          disabled: !optsReady,
+        }),
+        React.createElement('input', {
+          style: S.input,
+          type: 'text',
+          value: removeSelectorInput,
+          placeholder: '排除选择器（留空使用内置列表）',
+          onChange: onOptsText(setRemoveSelectorInput),
+          autoComplete: 'off',
+          spellCheck: false,
+          disabled: !optsReady,
+        }),
+        React.createElement('div', { style: S.row },
+          React.createElement('button', { type: 'button', style: S.button, onClick: onOptsSave, disabled: !optsReady }, '保存选项')),
+        optsStatus !== '' ? React.createElement('p', { style: optsStatusStyle }, optsStatus) : null,
+        React.createElement('p', { style: S.note }, '每次 jina_read 都会固定发送三个零副作用的 Reader 参数：X-Preset: agent（官方 agent 预设，只填充未显式设置的项）、X-Base: final（用跳转后的 URL 解析相对链接）、X-Timeout: 120（与客户端 120s 上限对齐，慢页面兜底）。'))
+
       // ---- key health block -------------------------------------------------
       var primerLines
       if (primer.phase === 'loading') {
@@ -480,6 +632,7 @@ window.__ModuleLoader__.load({
             status !== '' ? React.createElement('p', { style: statusStyle }, status) : null,
             React.createElement('p', { style: S.note }, shown),
             proxyBlock,
+            optionsBlock,
             primerBlock,
             view !== undefined && !writable ? React.createElement('p', { style: S.note }, '当前环境只读：key 由环境变量等来源提供，无法在此修改。') : null,
             React.createElement('p', { style: S.note }, 'key 解析顺序：1. 工具参数 apiKey；2. 本页保存的 key（credential 引用 ' + CRED + '，由 dsh 凭据存储持久化）；3. 会话工作区的 jina-api-key.txt；4. dsh 主目录下的 jina-api-key.txt。保存后立即生效。'),
@@ -487,7 +640,7 @@ window.__ModuleLoader__.load({
       }
 
       var title = 'Jina Tools'
-      var description = 'Jina AI 搜索/阅读/嵌入等工具的 API key 与本地代理。'
+      var description = 'Jina AI 搜索/阅读/嵌入等工具的 API key、本地代理与阅读选项。'
 
       // The Plugins page draws the card's title, icon, and crumb itself and
       // asks a configuration entry for one of two views: `summary` is the
