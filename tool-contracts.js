@@ -15,7 +15,7 @@ export const WEB_SEARCH_TOOL = {
     type: 'object',
     additionalProperties: false,
     properties: {
-      query: { type: 'string', description: 'The search query. Pair it with the time parameter to narrow recency-sensitive searches (news, events, current info).' },
+      query: { type: 'string', description: 'The search query. One string here — not the built-in web_search\'s `queries` array (that key is rejected). Pair it with the time parameter to narrow recency-sensitive searches (news, events, current info).' },
       type: { type: 'string', enum: ['web', 'arxiv', 'ssrn', 'images', 'blog'], description: 'Search domain. Default: web. For academic papers prefer the jina_search_arxiv / jina_search_ssrn tools.' },
       num: { type: 'number', description: 'Number of results. Default: 5.' },
       time: { type: 'string', enum: ['h', 'd', 'w', 'm', 'y'], description: 'Only results from the last hour/day/week/month/year.' },

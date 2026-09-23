@@ -53,6 +53,15 @@ test('web search tool: query parameter gives real guidance mentioning the time f
   assert.ok(q.description.length >= 60, 'query description should be real guidance, not a bare label')
 })
 
+test('web search tool: query parameter warns off the built-in web_search `queries` key', () => {
+  // A live session sent `{queries: [...]}` and the plugin searched for the
+  // literal string "undefined" (see test/tool-args.test.js). The parameter
+  // description is the cheapest place to stop that at the source.
+  const q = WEB_SEARCH_TOOL.parameters.properties.query
+  assert.match(q.description, /queries/)
+  assert.match(q.description, /web_search/)
+})
+
 test('web search tool: model-facing description stays within the context-budget budget', () => {
   assert.ok(WEB_SEARCH_TOOL.description.length <= 600,
     'a bloated description is permanent per-request prefix token cost; keep it lean')

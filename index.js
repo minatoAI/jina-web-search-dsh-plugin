@@ -631,8 +631,70 @@ export function apply(ctx) {
     render(_args, value) { return [{ type: 'text', text: value }] },
   }
 
+  /** Read one key from arguments the model may have sent as anything at all. */
+  const argAt = (args, key) => (args !== null && typeof args === 'object' ? args[key] : undefined)
+
+  /** The keys the model actually sent, for an argument-error message. */
+  function argsReceived(args) {
+    if (args === null || typeof args !== 'object') return args === undefined ? 'nothing' : typeof args
+    const keys = Object.keys(args)
+    return keys.length === 0 ? 'no arguments' : keys.join(', ')
+  }
+
+  /**
+   * Reject a missing or blank required string argument before it reaches the API.
+   *
+   * `ctx.tools.register` forwards `parameters` to the model API but never
+   * enforces it — only the first-party `defineTool` path runs the argument
+   * validator — so a key the model got wrong arrives here untouched. Without
+   * this guard `String(args.query)` quietly turns a missing query into the
+   * search term `undefined`, and Jina dutifully answers with MDN's `undefined`
+   * page: a well-formed, `isError: false` result that reads exactly like a real
+   * search (observed live — the model had sent `queries` instead of `query`).
+   *
+   * Throwing (rather than returning an error string) is deliberate: only a
+   * thrown error becomes `isError: true`, the one shape that reliably stops the
+   * model from treating junk as data.
+   * @param name - tool name, quoted into the message.
+   * @param args - raw model arguments.
+   * @param key - the required property name.
+   * @param aliases - names a caller may have used by mistake, reported as a hint.
+   * @returns nothing when the value is a non-blank string; otherwise throws.
+   */
+  function requireStringArg(name, args, key, aliases) {
+    const value = argAt(args, key)
+    if (typeof value === 'string' && value.trim() !== '') return
+    const got = value === undefined ? 'nothing' : '(' + typeof value + ') ' + JSON.stringify(value)
+    const typo = (aliases || []).find((alias) => argAt(args, alias) !== undefined)
+    throw new Error('invalid arguments: ' + name + ' requires a non-empty "' + key + '" string, but got ' + got
+      + (typo === undefined ? '' : ' — did you mean "' + key + '" instead of "' + typo + '"?')
+      + ' (arguments received: ' + argsReceived(args) + ')')
+  }
+
+  /**
+   * Reject a missing, empty or non-string required string-array argument.
+   * Same contract and same reasoning as {@link requireStringArg}.
+   * @param name - tool name, quoted into the message.
+   * @param args - raw model arguments.
+   * @param key - the required property name.
+   * @returns nothing when the value is a non-empty array of strings; otherwise throws.
+   */
+  function requireStringArrayArg(name, args, key) {
+    const value = argAt(args, key)
+    if (Array.isArray(value) && value.length > 0 && value.every((item) => typeof item === 'string')) return
+    const got = value === undefined
+      ? 'nothing'
+      : Array.isArray(value)
+        ? 'an array of ' + value.length + ' entries, not all strings'
+        : '(' + typeof value + ') ' + JSON.stringify(value)
+    throw new Error('invalid arguments: ' + name + ' requires a non-empty array of strings in "' + key + '", but got ' + got
+      + ' (arguments received: ' + argsReceived(args) + ')')
+  }
+
   /** Shared executor for the search tools (jina_web_search / jina_search_arxiv / jina_search_ssrn). */
   async function runSearch(args, exec, fixedType) {
+    const name = fixedType === 'arxiv' ? 'jina_search_arxiv' : fixedType === 'ssrn' ? 'jina_search_ssrn' : 'jina_web_search'
+    requireStringArg(name, args, 'query', ['queries', 'q'])
     const signal = enterExec(exec)
     const body = { q: String(args.query) }
     const t = fixedType || args.type
@@ -912,6 +974,7 @@ export function apply(ctx) {
     },
     output: OUT,
     async execute(args, exec) {
+      requireStringArg('jina_expand', args, 'query', ['queries', 'q'])
       const signal = enterExec(exec)
       const res = await callJina({
         url: SEARCH, method: 'POST',
@@ -941,6 +1004,7 @@ export function apply(ctx) {
     },
     output: OUT,
     async execute(args, exec) {
+      requireStringArrayArg('jina_embed', args, 'texts')
       const signal = enterExec(exec)
       const body = { model: args.model || 'jina-embeddings-v5-text-small', task: args.task || 'text-matching', input: args.texts }
       if (args.dimensions !== undefined) body.dimensions = args.dimensions
@@ -972,6 +1036,8 @@ export function apply(ctx) {
     },
     output: OUT,
     async execute(args, exec) {
+      requireStringArg('jina_rerank', args, 'query', ['queries', 'q'])
+      requireStringArrayArg('jina_rerank', args, 'documents')
       const signal = enterExec(exec)
       const body = { model: args.model || 'jina-reranker-v3.5', query: String(args.query), documents: args.documents }
       if (args.topN !== undefined) body.top_n = args.topN
@@ -1002,6 +1068,8 @@ export function apply(ctx) {
     },
     output: OUT,
     async execute(args, exec) {
+      requireStringArrayArg('jina_classify', args, 'texts')
+      requireStringArrayArg('jina_classify', args, 'labels')
       const signal = enterExec(exec)
       const body = { model: args.model || 'jina-embeddings-v5-text-small', input: args.texts, labels: args.labels }
       const res = await callJina({
@@ -1035,7 +1103,7 @@ export function apply(ctx) {
       const body = { max_edge: args.maxEdge !== undefined ? args.maxEdge : 1024 }
       if (args.arxivId) body.id = String(args.arxivId)
       else if (args.url) body.url = String(args.url)
-      else return 'provide either url or arxivId (jina pdf URL_OR_ARXIV_ID)'
+      else throw new Error('invalid arguments: jina_pdf requires either a "url" or an "arxivId" (arguments received: ' + argsReceived(args) + ')')
       if (args.extractType) body.type = args.extractType
       const res = await callJina({
         url: SEARCH + 'extract-pdf', method: 'POST',
