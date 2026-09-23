@@ -8,10 +8,17 @@ DeepSeek Harness 的 [Jina AI](https://jina.ai/) 插件（bundle）：把 jina-c
 
 > 此处仅展示最新版本，完整版本历史见 [change-log.md](./change-log.md)。
 
-### 0.7.1（2026-09-18）
+### 0.8.0（2026-09-18）
 
-- **fix** 修复 0.7.0 引入的配置表单崩溃导致 **API key 与本地代理输入框在 Plugins 页整块消失**（实测控制台：`ReferenceError: input is not defined` → `slot entry crashed in 'plugins.bundle.config'`）：0.7.0 把表单函数 `body()` 提到了 factory 作用域，而它读取的全是 `JinaCard` 组件内部的 state 与 handler（`input` / `onInput` / `onSave` / `configured` / `proxyBlock` …）。修复：把 `body()` 移回组件内部；旧的折叠卡片展开时崩溃的问题一并恢复。
-- **test** 新增 `test/client-render.test.js`：在 VM 中真实执行浏览器 bundle、按 cordis 契约挂载插件、以 React 的方式渲染 `summary` / `page` 两种视图（含旧卡片展开态），断言两个输入框都被渲染——原有的契约测试只做源码正则，测不到这类作用域缺陷。
+- **feat** **`jina_read` 新增 OCR 开关（jina-ocr-v1）**：`ocr: true` 或在卡片里设为默认后，改走官方 3.4B 文档解析模型，一次过把扫描件 / 图片型 PDF / 复杂表格与公式转成 Markdown（表格出 HTML、公式出 LaTeX），多页文档可用 `page` 指定单页。约 **40× token**，且**必须有 API key**（官方对匿名请求直接 401），因此没检测到 key 时**不发请求**、直接给可操作提示。
+- **feat** **每次读取固定发送三个零副作用参数**：`X-Preset: agent`（官方为 AI agent 预调的预设，**只填充未显式设置的选项**）、`X-Base: final`（用跳转后的 URL 解析相对链接）、`X-Timeout: 120`（与客户端 120s 上限对齐的慢页面兜底）。
+- **feat** **选择器组默认开启 + 空结果自动回退**：默认发保守的正文选择器与噪声排除列表，新增 `targetSelector` / `waitForSelector` / `removeSelector` / `noCache` 调用参数；选择器不命中导致结果过短时**自动去掉选择器组重试**，不会返回空页。
+- **feat** **图片策略回到官方默认 `all`**（可选 `alt` / `none`），不再硬编码 `none`；设置卡片新增「阅读工具选项」区块（OCR / 图片策略 / alt 生成 / 选择器组 / 选择器覆盖），与 `proxyUrl` 同走一条 revision 栅栏写入路径。
+- **fix** `X-With-Generated-Alt` 改为**默认关闭**：需 key、与 OCR 互斥，而且**带 key 的请求才计费**——默认开启会把"匿名免费读取"静默变成"计费读取"。
+- **fix** `createSettingsSchema()` 此前只保留 `proxyUrl`，新增字段会被静默丢弃；现保留全部已知字段，并新增 `toolSettingsOf()` 把"未设置"解析为默认值（设置文档仍只存偏离默认值的部分）。
+- **fix** **必填参数不再被静默转成字符串 `"undefined"`**：`ctx.tools.register` 运行期不校验参数，模型把键名写错（如用内置 `web_search` 的 `queries` 代替本插件的 `query`）时 `String(args.query)` 会把它变成搜索词 `undefined`，Jina 返回 MDN 的 `undefined` 词条——**`isError: false`、看起来像真结果**。现对 `jina_web_search` / `jina_search_arxiv` / `jina_search_ssrn` / `jina_expand` / `jina_rerank` / `jina_embed` / `jina_classify` / `jina_pdf` 的必填参数前置校验并**直接抛错**（`isError: true`），报错点名工具、参数与疑似笔误，且不发任何请求。
+- **change** `jina_read` 固定用 `Accept: application/json`，解包成带 `Title` / `URL Source` / `[Usage: …]` 的 markdown；不可解析的响应原文返回。
+- **test** 新增 `test/reader-headers.test.js`（14 例，解码网络 helper 的 stdin 逐条断言真实发出的请求头）与 `test/tool-args.test.js`（9 例，以实测现场那次 `{queries:[…],num:6}` 错误调用为第一条断言，含"被拒调用零请求"与合法路径不回归）；`client-render.test.js` 与 `client-bundle.test.js` 增加选项控件的渲染与接线断言。完整说明见 [change-log.md](./change-log.md)。
 
 ## 功能
 
@@ -22,7 +29,7 @@ DeepSeek Harness 的 [Jina AI](https://jina.ai/) 插件（bundle）：把 jina-c
 | `jina_web_search` | `jina search` | 通用网页搜索（默认 web 域；images / blog 域，支持时间过滤与地区/语言提示） |
 | `jina_search_arxiv` | `jina search --arxiv` | arXiv 预印本检索（CS / ML / 数学 / 物理等，返回 arxiv.org 官方论文直链） |
 | `jina_search_ssrn` | `jina search --ssrn` | SSRN 论文检索（经济 / 金融 / 法律 / 管理等社会科学，返回 papers.ssrn.com 直链） |
-| `jina_read` | `jina read` | 把网页读成干净的 markdown |
+| `jina_read` | `jina read` | 把网页读成干净的 markdown；支持 OCR（jina-ocr-v1）、正文选择器与噪声过滤（见下节） |
 | `jina_screenshot` | `jina screenshot` | 网页截图，返回托管图片 URL（支持整页截图） |
 | `jina_datetime` | `jina datetime` | 推测网页的发布/更新时间 |
 | `jina_expand` | `jina expand` | 把搜索词扩展成一组相关查询 |
@@ -31,6 +38,24 @@ DeepSeek Harness 的 [Jina AI](https://jina.ai/) 插件（bundle）：把 jina-c
 | `jina_classify` | `jina classify` | 文本分类 |
 | `jina_pdf` | `jina pdf` | 从 PDF 提取图表/公式（支持 arXiv ID） |
 | `jina_primer` | `jina primer` | 获取当前上下文：主机时钟（ISO 时间/unix/时区/UTC 偏移）、网络事实（公网 IP 与位置，尽力而为）与 Jina 账户状态（身份/余额） |
+
+## 阅读工具选项（`jina_read`）
+
+卡片里的「阅读工具选项」区块（也可直接改 `settings.yaml` 的 `jina-tools` 段）决定 `jina_read` 的默认行为；每个选项都能被同名调用参数**单次覆盖**。
+
+| 选项 | 字段 | 默认 | 作用与代价 |
+| --- | --- | --- | --- |
+| OCR 文档解析 | `useOcr` | 关 | 走 `X-Respond-With: jina-ocr-v1`：官方 3.4B 文档解析模型，一次过把扫描件 / 图片型 PDF / 复杂表格与公式转成 Markdown（表格出 HTML、公式出 LaTeX）。**约 40× token**，且**必须有 API key**——官方对匿名请求返回 401，本插件因此直接不发请求并给出提示。多页文档用调用参数 `page` 指定单页 |
+| 图片保留策略 | `imagePolicy` | `all` | `all` = 官方默认；`alt` = 只保留 alt 文本（省 token）；`none` = 不保留图片 |
+| 生成图片 alt 文本 | `autoAltText` | 关 | `X-With-Generated-Alt`：为缺说明的图片生成描述。**需 API key**（匿名 401），且**与 OCR 互斥**（指定 `X-Respond-With` 时该功能不生效）；又因为**带 key 的请求会计费**，默认关闭，需要时显式打开 |
+| 选择器组 | `useSelectors` | 开 | 默认发保守的 `X-Target-Selector`（只含 `article` / `main` / `[role="main"]` / `.markdown-body` 等正文容器）与 `X-Remove-Selector`（页眉页脚、导航、cookie 横幅、广告、侧栏、评论等）。命中不到时**自动回退整页重试**，不会返回空 |
+| 正文 / 排除选择器 | `targetSelector` / `removeSelector` | 空 = 内置列表 | 覆盖内置选择器（站点结构特殊、默认列表误伤时用） |
+
+每次 `jina_read` 还会固定发送三个零副作用参数：`X-Preset: agent`（官方为 AI agent 预调的预设；官方文档明确 preset **只填充调用方未显式设置的选项**，所以不会覆盖任何显式参数）、`X-Base: final`（用重定向后的最终 URL 解析相对链接）、`X-Timeout: 120`（与客户端自己的 120s 上限对齐——若发官方的上限 180，客户端会先超时并报自己的错误，多出来的耐心是浪费的；要改就两边一起改）。
+
+调用级参数：`ocr`、`page`、`targetSelector`、`waitForSelector`、`removeSelector`、`noCache`，以及原有的 `links` / `images` / `json` / `apiKey`。
+
+> 关于"为什么默认这样"：这三项是官方 Reader API 里**最坏情况不损失什么**的参数；而 OCR 与 alt 生成需要 key、会计费或与其它参数互斥，所以一律默认关闭。`X-Remove-Overlay` / `X-Detach-Invisibles` 这两个未在官方参数面板文档化的隐藏参数**没有**被默认启用（后者官方明确要求 browser 引擎且禁用缓存）。
 
 ## 效果实测（与内置 web_search 交叉对比）
 
@@ -127,19 +152,21 @@ dsh plugin --profile web remove dsh-jina
 jina-dsh-plugin/
 ├── package.json       # manifest: "dsh": { "bundle": {"patch": ...}, "client": {"platform": "web"} }; 浏览器半身经 exports["./client"] 指向 ui/client.js
 ├── cordis.patch.yml   # 组合层：单个双面孔行 dsh-jina（宿主工具 + 浏览器卡片；行名 = 精确包名是 client-modules 扫描的硬条件）
-├── index.js           # 主机插件：12 个工具（含 jina_search_arxiv / jina_search_ssrn 专用学术检索）+ 网络传输 + JINA_API_KEY 凭据解析 + jina-tools 代理设置
-├── proxy.js           # 纯函数模块：代理地址规范化 / 优先级 / 设置 schema（零依赖，可单测）
+├── index.js           # 主机插件：12 个工具（含 jina_search_arxiv / jina_search_ssrn 专用学术检索）+ 网络传输 + JINA_API_KEY 凭据解析 + jina-tools 代理与阅读策略
+├── proxy.js           # 纯函数模块：代理地址规范化 / 优先级 / 阅读策略默认值与设置 schema（零依赖，可单测）
 ├── primer.js          # 纯函数模块：jina_primer 的解析 / 格式化逻辑（零依赖，可单测）
 ├── test/
 │   ├── primer.test.js        # jina_primer 单元测试（node --test 自动发现）
 │   ├── proxy.test.js         # 代理策略单元测试
 │   ├── plugin-proxy.test.js  # mock 宿主的代理集成测试（含可选实时代理用例）
-│   ├── client-bundle.test.js # 浏览器 bundle 契约测试（语法 + 注册 id + settings 通道）
+│   ├── reader-headers.test.js# jina_read 请求头契约测试（解码 helper 的 stdin，断言真实发出的头）
+│   ├── client-bundle.test.js # 浏览器 bundle 契约测试（语法 + 注册 id + settings 通道 + 选项接线）
+│   ├── client-render.test.js # 在 VM 中真实渲染两种视图（抓作用域/绑定类缺陷）
 │   └── tools.test.js         # jina_web_search 模型可见契约测试（TDD）
 ├── ui/
 │   ├── package.json   # 子包 manifest（exports["./client"]；dsh.client 主声明已在根包，此处仅保持子包完整）
 │   ├── index.js       # 空主机半身（保留历史子包结构；组合层不再引用）
-│   └── client.js      # 预构建浏览器 bundle：设置 → 插件 → 配置 的 "Jina Tools" 卡片（API key + 本地代理）
+│   └── client.js      # 预构建浏览器 bundle：Plugins 页的 "Jina Tools" 卡片（API key + 本地代理 + 阅读选项）
 ├── change-log.md      # 完整版本历史（简体中文）
 ├── change-log.en.md   # 完整版本历史（English）
 ├── README.md          # 简体中文说明（本文件）
@@ -148,7 +175,7 @@ jina-dsh-plugin/
 
 ## 开发说明
 
-- 主机插件只依赖 Node 内置模块与 dsh 主机服务（`fs`、`subprocess`、`tools`、`credentials`、`settings`、`webServer`），无第三方 npm 依赖；凭据走 dsh 原生的 credential seam（引用 `JINA_API_KEY`），代理配置走插件自己的 `jina-tools` 设置命名空间（`proxyUrl` 字段，schema 是零依赖的 duck-type 节点，见 `proxy.js` 的 `createSettingsSchema`），任何 profile 组合都可以直接使用。
+- 主机插件只依赖 Node 内置模块与 dsh 主机服务（`fs`、`subprocess`、`tools`、`credentials`、`settings`、`webServer`），无第三方 npm 依赖；凭据走 dsh 原生的 credential seam（引用 `JINA_API_KEY`），配置走插件自己的 `jina-tools` 设置命名空间（`proxyUrl` 代理地址 + `useOcr` / `imagePolicy` / `autoAltText` / `useSelectors` / 三个选择器覆盖等阅读策略，schema 是零依赖的 duck-type 节点，见 `proxy.js` 的 `createSettingsSchema` 与 `toolSettingsOf`），任何 profile 组合都可以直接使用。
 - 客户端 bundle 直接提交（`ui/client.js`），无构建步骤，git 安装开箱即用。改 UI 后直接改该文件并重启即可。bundle 顶层 `window.__ModuleLoader__.load` 的注册 id **必须等于图行 id（精确包名 `dsh-jina`）**——模块系统只按图行 id 匹配注册（`/client` 后缀除外），注册在别的键上（如旧行名 `dsh-jina/ui`）会报 `loaded without registering "dsh-jina"` 并导致整页 `Failed to load plugins`。卡片注册进 Web 设置包声明的 `settings.plugin.item` 插槽（设置 → 插件 → 配置），这是第三方插件配置的标准位置。
 - **`remote.<ns>` 的注入铁律**：gateway `$mount` 时会把每个 Remote 命名空间注册成**独立 cordis 服务**，所以客户端插件读取 `remote.<ns>`（如 `remote.credentials`、`remote.settings`）之前，必须在自己的 `inject` 里声明该服务名——只声明 `'remote'` 是不够的，属性访问本身就会抛 `cannot get property "remote.settings" without inject`，而错误冒到 `settings.plugin.item` 的 slot 边界会让**整张卡片消失**（0.6.0 的回归，现已由 `test/client-bundle.test.js` 固化）。本插件的 `inject = ['slots','remote','remote.credentials','remote.settings']`。读取处仍然包一层 try/catch：服务缺失时降级为提示，不让 slot 崩溃。
 - key 通过凭据 Remote 命名空间管理（`credentials.describe/set/unset`，变更事件 `credentials/reference-updated` 由 `remote` 服务转发）；代理字段走 `settings` Remote 命名空间（`remote.settings.describe/mutate`，写入按读到的 `revision` 设栅；外部编辑由转发事件 `settings/document-updated` 触发热重读）。
@@ -163,6 +190,7 @@ npm test   # 等价于 node --test（自动发现 test/*.test.js）
 ```
 
 - `test/proxy.test.js`、`test/primer.test.js`、`test/tools.test.js`：纯函数与模型可见契约。
+- `test/reader-headers.test.js`：用假 Cordis 上下文驱动主机半身，**解码网络 helper 的 stdin**，逐条断言 `jina_read` 真实发出的 Reader 请求头——固定三项（`X-Preset: agent` / `X-Base: final` / `X-Timeout: 120`）、图片策略、选择器组与"空结果自动重试"、OCR 开关与 `X-Page`、无 key 时零请求、alt 生成的 opt-in / 需 key / 与 OCR 互斥、JSON 信封解包与 usage、不可解析响应原文兜底，以及设置 schema 的字段保留与默认值解析。
 - `test/plugin-proxy.test.js`：用假 Cordis 上下文驱动主机半身，断言设置命名空间注册、代理优先级、**网络 helper 实际收到的环境变量**、错误文案与 `/api/dsh-jina/primer` 负载。其中带 `JINA_LIVE_PROXY=1` 的用例会真实 spawn helper 打通一次 Jina 请求（干净环境 + 手填代理，用来证明是手填地址而非残留环境变量在起作用）：
 
   ```powershell
