@@ -8,6 +8,14 @@ DeepSeek Harness 的 [Jina AI](https://jina.ai/) 插件（bundle）：把 jina-c
 
 > 此处仅展示最新版本，完整版本历史见 [change-log.md](./change-log.md)。
 
+### 0.8.1（2026-09-23）
+
+- **fix** **修复新版 harness 上「阅读工具选项」与两个保存按钮全部变灰、无法修改**（用户实测截图）：dsh `601d6761e4` 删除了 `settings.register(ns, schema)`，设置命名空间改为 **Loader 组合条目 id**，插件须导出 schemastery 形态的 `Config`（字段节点带 `meta.volatile`）并接收 `apply(ctx, config)`。旧代码调用已不存在的 `sctx.settings.register`，异常被 try/catch 吞掉 → `jina-tools` 从未出现在 `settings.describe()` 里 → 卡片 `phase = 'unavailable'` → 所有控件 `disabled`。**不是 CSS / 权限 / 只读 profile 问题**，同一根因也让配置根本存不进去。
+- **fix** **保存即时生效**：字段是跨副本安全的 volatile 引用（`Symbol.for('cosmokit.volatile.write')`），保存时 harness 只改写引用，`fiber.config` 身份不变、不重挂载，插件每次操作重新读取——与 API key 同一条契约。
+- **fix** 逐字段 `meta.volatile`（**不能**整段 volatile，否则 `strip()` 会丢掉文档里未声明的键）；`validate` 同步返回纯对象且对 `undefined` / 脏值容错（`describe()` 是整个 Plugins 页共用的，抛错会波及所有卡片）；`toJSON()` 每次返回新节点（`plainSchema()` 会 `delete meta.volatile`）。
+- **change** 宿主半身不再 `inject(['settings'])`；`/api/dsh-jina/primer` 的 `settingsError` 改为 `settingsLive` 健康检查。
+- **test** 四个测试文件全部迁移到新 seam，新增「保存后下一次调用即生效」端到端回归；全套 104 例（103 通过 / 1 例按需跳过）。
+
 ### 0.8.0（2026-09-18）
 
 - **feat** **`jina_read` 新增 OCR 开关（jina-ocr-v1）**：`ocr: true` 或在卡片里设为默认后，改走官方 3.4B 文档解析模型，一次过把扫描件 / 图片型 PDF / 复杂表格与公式转成 Markdown（表格出 HTML、公式出 LaTeX），多页文档可用 `page` 指定单页。约 **40× token**，且**必须有 API key**（官方对匿名请求直接 401），因此没检测到 key 时**不发请求**、直接给可操作提示。
@@ -175,7 +183,8 @@ jina-dsh-plugin/
 
 ## 开发说明
 
-- 主机插件只依赖 Node 内置模块与 dsh 主机服务（`fs`、`subprocess`、`tools`、`credentials`、`settings`、`webServer`），无第三方 npm 依赖；凭据走 dsh 原生的 credential seam（引用 `JINA_API_KEY`），配置走插件自己的 `jina-tools` 设置命名空间（`proxyUrl` 代理地址 + `useOcr` / `imagePolicy` / `autoAltText` / `useSelectors` / 三个选择器覆盖等阅读策略，schema 是零依赖的 duck-type 节点，见 `proxy.js` 的 `createSettingsSchema` 与 `toolSettingsOf`），任何 profile 组合都可以直接使用。
+- 主机插件只依赖 Node 内置模块与 dsh 主机服务（`fs`、`subprocess`、`tools`、`credentials`、`webServer`），无第三方 npm 依赖；凭据走 dsh 原生的 credential seam（引用 `JINA_API_KEY`），配置走插件自己的 `jina-tools` 设置命名空间（`proxyUrl` 代理地址 + `useOcr` / `imagePolicy` / `autoAltText` / `useSelectors` / 三个选择器覆盖等阅读策略），任何 profile 组合都可以直接使用。
+- **设置通道的契约（dsh 0.1.4 起）**：`settings.register()` 已被删除，**设置命名空间就是 Loader/profile 组合条目的 id**——本插件在 `cordis.patch.yml` 里插入的行 id 正是 `jina-tools`，所以卡片里的 `NS` 与之一致。插件通过 `index.js` 的 `export const Config = createSettingsSchema()`（`proxy.js`，零依赖手写节点）声明可编辑字段：每个字段节点带 `meta.volatile: true`，`'~standard': { version: 1, vendor: 'schemastery', validate }` 是 harness 解析配置的唯一入口（`resolveConfig()` 要求**同步**返回纯对象；`vendor` 必须是 `'schemastery'`，否则每次保存都会退化成整插件重挂载）。`validate()` 为每个字段生成一个**跨副本安全的 volatile 引用**（`Symbol.for('cosmokit.volatile.write')`），harness 保存时只把新值写进这些引用，`apply(ctx, config)` 拿到的对象身份不变、插件不重挂载；插件在**每次操作**里用 `settingsSnapshot(config)` 重新读取（`toolSettingsOf()` 负责把"未设置"归一成默认值），因此保存与 API key 一样**立即生效、无需重启**。`/api/dsh-jina/primer` 的 `settingsLive` 就是这个契约的健康检查。
 - 客户端 bundle 直接提交（`ui/client.js`），无构建步骤，git 安装开箱即用。改 UI 后直接改该文件并重启即可。bundle 顶层 `window.__ModuleLoader__.load` 的注册 id **必须等于图行 id（精确包名 `dsh-jina`）**——模块系统只按图行 id 匹配注册（`/client` 后缀除外），注册在别的键上（如旧行名 `dsh-jina/ui`）会报 `loaded without registering "dsh-jina"` 并导致整页 `Failed to load plugins`。卡片注册进 Web 设置包声明的 `settings.plugin.item` 插槽（设置 → 插件 → 配置），这是第三方插件配置的标准位置。
 - **`remote.<ns>` 的注入铁律**：gateway `$mount` 时会把每个 Remote 命名空间注册成**独立 cordis 服务**，所以客户端插件读取 `remote.<ns>`（如 `remote.credentials`、`remote.settings`）之前，必须在自己的 `inject` 里声明该服务名——只声明 `'remote'` 是不够的，属性访问本身就会抛 `cannot get property "remote.settings" without inject`，而错误冒到 `settings.plugin.item` 的 slot 边界会让**整张卡片消失**（0.6.0 的回归，现已由 `test/client-bundle.test.js` 固化）。本插件的 `inject = ['slots','remote','remote.credentials','remote.settings']`。读取处仍然包一层 try/catch：服务缺失时降级为提示，不让 slot 崩溃。
 - key 通过凭据 Remote 命名空间管理（`credentials.describe/set/unset`，变更事件 `credentials/reference-updated` 由 `remote` 服务转发）；代理字段走 `settings` Remote 命名空间（`remote.settings.describe/mutate`，写入按读到的 `revision` 设栅；外部编辑由转发事件 `settings/document-updated` 触发热重读）。
@@ -190,8 +199,8 @@ npm test   # 等价于 node --test（自动发现 test/*.test.js）
 ```
 
 - `test/proxy.test.js`、`test/primer.test.js`、`test/tools.test.js`：纯函数与模型可见契约。
-- `test/reader-headers.test.js`：用假 Cordis 上下文驱动主机半身，**解码网络 helper 的 stdin**，逐条断言 `jina_read` 真实发出的 Reader 请求头——固定三项（`X-Preset: agent` / `X-Base: final` / `X-Timeout: 120`）、图片策略、选择器组与"空结果自动重试"、OCR 开关与 `X-Page`、无 key 时零请求、alt 生成的 opt-in / 需 key / 与 OCR 互斥、JSON 信封解包与 usage、不可解析响应原文兜底，以及设置 schema 的字段保留与默认值解析。
-- `test/plugin-proxy.test.js`：用假 Cordis 上下文驱动主机半身，断言设置命名空间注册、代理优先级、**网络 helper 实际收到的环境变量**、错误文案与 `/api/dsh-jina/primer` 负载。其中带 `JINA_LIVE_PROXY=1` 的用例会真实 spawn helper 打通一次 Jina 请求（干净环境 + 手填代理，用来证明是手填地址而非残留环境变量在起作用）：
+- `test/reader-headers.test.js`：用假 Cordis 上下文驱动主机半身，**解码网络 helper 的 stdin**，逐条断言 `jina_read` 真实发出的 Reader 请求头——固定三项（`X-Preset: agent` / `X-Base: final` / `X-Timeout: 120`）、图片策略、选择器组与"空结果自动重试"、OCR 开关与 `X-Page`、无 key 时零请求、alt 生成的 opt-in / 需 key / 与 OCR 互斥、JSON 信封解包与 usage、不可解析响应原文兜底，以及设置 schema 的字段声明（8 个字段都带 `meta.volatile`）、`validate` 的容错面与"保存后下一次调用即生效"。
+- `test/plugin-proxy.test.js`：用假 Cordis 上下文驱动主机半身，断言 `Config` 导出的 volatile 契约、代理优先级、**网络 helper 实际收到的环境变量**、错误文案与 `/api/dsh-jina/primer` 负载（含 `settingsLive`），以及"卡片保存的代理地址在下一次调用即生效、且不再探测注册表"。其中带 `JINA_LIVE_PROXY=1` 的用例会真实 spawn helper 打通一次 Jina 请求（干净环境 + 手填代理，用来证明是手填地址而非残留环境变量在起作用）：
 
   ```powershell
   $env:JINA_LIVE_PROXY='1'; $env:JINA_LIVE_PROXY_URL='http://127.0.0.1:7897'; npm test

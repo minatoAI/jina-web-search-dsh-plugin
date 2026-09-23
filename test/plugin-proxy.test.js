@@ -2,9 +2,14 @@
  * Integration tests for the host half's manual-proxy plumbing.
  *
  * The host plugin is driven through a fake Cordis context that mirrors the
- * contracts the real seams expose (`tools.register`, `inject(['settings'])` /
- * `inject(['webServer'])`, `subprocess.spawn` + `handle.done` +
- * `collected.stdout.readFrom`, `fs.resolve`/`readText`, `sandboxPolicy`).
+ * contracts the real seams expose (`tools.register`, `inject(['webServer'])`,
+ * `subprocess.spawn` + `handle.done` + `collected.stdout.readFrom`,
+ * `fs.resolve`/`readText`, `sandboxPolicy`).
+ *
+ * The settings seam is the `Config` export, not a registration call: the
+ * harness resolves one raw profile section through `Config['~standard']` and
+ * hands the result to `apply` as the second argument, so these tests do the
+ * same through `resolveSettings()` — the stored section is `{ proxyUrl }`.
  *
  * What is pinned here — the regression this feature exists for:
  *   A local proxy client that listens on a loopback port WITHOUT being the
@@ -26,7 +31,15 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
-import { apply } from '../index.js'
+import { Config, apply } from '../index.js'
+
+/**
+ * Resolve one raw stored settings section the way the Loader does before
+ * `apply(ctx, config)` — through the plugin's `Config` export.
+ */
+function resolveSettings(raw) {
+  return Config['~standard'].validate(raw === undefined ? {} : raw).value
+}
 
 /** Every environment name that can influence proxy selection. */
 const ENV_KEYS = [
@@ -118,11 +131,7 @@ function createHost(options = {}) {
   const helpers = []
   const routes = new Map()
   const tools = new Map()
-  const settingsState = {
-    namespace: undefined,
-    schema: undefined,
-    value: options.setting === undefined ? {} : { proxyUrl: options.setting },
-  }
+  const settingsValue = options.setting === undefined ? {} : { proxyUrl: options.setting }
   const queue = [...(options.helperResults || [])]
   const state = { spawnError: undefined }
 
@@ -132,17 +141,6 @@ function createHost(options = {}) {
       return undefined
     },
     inject(keys, callback) {
-      if (keys.includes('settings')) {
-        callback({
-          settings: {
-            register(ns, schema) {
-              settingsState.namespace = ns
-              settingsState.schema = schema
-              return { get: () => settingsState.value }
-            },
-          },
-        })
-      }
       if (keys.includes('webServer')) {
         callback({ webServer: { register(route) { routes.set(route.path, route) } } })
       }
@@ -179,7 +177,7 @@ function createHost(options = {}) {
     tools: { register(tool) { tools.set(tool.name, tool) } },
   }
 
-  return { ctx, execs, helpers, routes, tools, settingsState, state }
+  return { ctx, execs, helpers, routes, tools, settingsValue, state }
 }
 
 /** Invoke one registered tool the way the tool seam does. */
@@ -202,19 +200,27 @@ async function callPrimerRoute(host) {
   return JSON.parse(state.body)
 }
 
-test('the host half serves the jina-tools namespace with the proxyUrl field', async () => {
+test('the host half declares the jina-tools fields through the Config export', async () => {
   const host = createHost({ setting: 'http://127.0.0.1:7897' })
-  apply(host.ctx)
-  assert.equal(host.settingsState.namespace, 'jina-tools')
-  assert.deepEqual(host.settingsState.schema({ proxyUrl: 'http://127.0.0.1:7897' }), { proxyUrl: 'http://127.0.0.1:7897' })
-  assert.equal(host.settingsState.schema.toJSON().dict.proxyUrl.type, 'string')
+  apply(host.ctx, resolveSettings(host.settingsValue))
+  // The Loader's isSchemastery duck-type probe and the settings provider's
+  // `'toJSON' in schema` probe both have to hold, or the namespace is never
+  // published and every control on the card stays disabled.
+  assert.equal(Config['~standard'].vendor, 'schemastery')
+  assert.equal(Config['~standard'].version, 1)
+  assert.equal(typeof Config.toJSON, 'function')
+  assert.equal(Config.dict.proxyUrl.type, 'string')
+  assert.equal(Config.dict.proxyUrl.meta.volatile, true)
+  assert.equal(Config.toJSON().dict.proxyUrl.meta.volatile, true, 'toJSON must not strip volatility')
+  const resolved = resolveSettings({ proxyUrl: 'http://127.0.0.1:7897' })
+  assert.equal(resolved.proxyUrl.get(), 'http://127.0.0.1:7897')
   assert.ok(host.tools.has('jina_web_search'), 'the tool surface still registers')
 })
 
 test('a saved manual proxy reaches the spawned helper and skips WinINET discovery', async () => {
   await withEnv({}, async () => {
     const host = createHost({ setting: 'http://127.0.0.1:7897', regOutput: REG_SYSTEM_PROXY_OFF })
-    apply(host.ctx)
+    apply(host.ctx, resolveSettings(host.settingsValue))
     await callTool(host, 'jina_datetime', { url: 'https://example.com' })
     assert.equal(host.helpers.length, 1)
     assert.equal(host.execs.length, 1, 'no reg.exe probe while a manual address exists')
@@ -231,7 +237,7 @@ test('a saved manual proxy reaches the spawned helper and skips WinINET discover
 test('a bare host:port is normalized before it reaches the helper', async () => {
   await withEnv({}, async () => {
     const host = createHost({ setting: '127.0.0.1:7897' })
-    apply(host.ctx)
+    apply(host.ctx, resolveSettings(host.settingsValue))
     await callTool(host, 'jina_datetime', { url: 'https://example.com' })
     assert.equal(host.helpers[0].env.HTTPS_PROXY, 'http://127.0.0.1:7897')
   })
@@ -240,7 +246,7 @@ test('a bare host:port is normalized before it reaches the helper', async () => 
 test('the manual address outranks WinINET discovery, JINA_PROXY_URL and the inherited environment', async () => {
   await withEnv({ JINA_PROXY_URL: 'http://127.0.0.1:1080', HTTPS_PROXY: 'http://127.0.0.1:3128' }, async () => {
     const host = createHost({ setting: 'http://127.0.0.1:7897', regOutput: REG_SYSTEM_PROXY_ON })
-    apply(host.ctx)
+    apply(host.ctx, resolveSettings(host.settingsValue))
     await callTool(host, 'jina_datetime', { url: 'https://example.com' })
     assert.equal(host.helpers[0].env.HTTPS_PROXY, 'http://127.0.0.1:7897')
     assert.equal(host.execs.length, 1, 'discovery is not even consulted')
@@ -250,7 +256,7 @@ test('the manual address outranks WinINET discovery, JINA_PROXY_URL and the inhe
 test('JINA_PROXY_URL covers profiles without a settings provider', async () => {
   await withEnv({ JINA_PROXY_URL: 'http://127.0.0.1:1080' }, async () => {
     const host = createHost({ regOutput: REG_SYSTEM_PROXY_ON })
-    apply(host.ctx)
+    apply(host.ctx, resolveSettings(host.settingsValue))
     await callTool(host, 'jina_datetime', { url: 'https://example.com' })
     assert.equal(host.helpers[0].env.HTTPS_PROXY, 'http://127.0.0.1:1080')
   })
@@ -259,7 +265,7 @@ test('JINA_PROXY_URL covers profiles without a settings provider', async () => {
 test('without a manual address the WinINET system proxy still wins (0.5.3 behavior preserved)', async () => {
   await withEnv({ HTTPS_PROXY: 'http://127.0.0.1:3128' }, async () => {
     const host = createHost({ regOutput: REG_SYSTEM_PROXY_ON })
-    apply(host.ctx)
+    apply(host.ctx, resolveSettings(host.settingsValue))
     await callTool(host, 'jina_datetime', { url: 'https://example.com' })
     assert.equal(host.helpers[0].env.HTTPS_PROXY, 'http://127.0.0.1:7890')
     assert.equal(host.execs.length, 2, 'reg.exe was probed')
@@ -269,7 +275,7 @@ test('without a manual address the WinINET system proxy still wins (0.5.3 behavi
 test('with no proxy configured anywhere the helper inherits the harness environment untouched', async () => {
   await withEnv({}, async () => {
     const host = createHost({ regOutput: REG_SYSTEM_PROXY_OFF })
-    apply(host.ctx)
+    apply(host.ctx, resolveSettings(host.settingsValue))
     await callTool(host, 'jina_datetime', { url: 'https://example.com' })
     assert.equal(host.helpers[0].env, undefined, 'undefined env = the seam keeps its resolved base')
   })
@@ -278,7 +284,7 @@ test('with no proxy configured anywhere the helper inherits the harness environm
 test('a transport failure names the manually configured proxy', async () => {
   await withEnv({}, async () => {
     const host = createHost({ setting: 'http://127.0.0.1:7999', helperResults: [TRANSPORT_FAILURE, TRANSPORT_FAILURE] })
-    apply(host.ctx)
+    apply(host.ctx, resolveSettings(host.settingsValue))
     const text = await callTool(host, 'jina_datetime', { url: 'https://example.com' })
     assert.match(text, /http:\/\/127\.0\.0\.1:7999/)
     assert.match(text, /本地代理/)
@@ -293,7 +299,7 @@ test('an unusable saved address is reported and falls back to automatic detectio
       regOutput: REG_SYSTEM_PROXY_OFF,
       helperResults: [TRANSPORT_FAILURE, TRANSPORT_FAILURE],
     })
-    apply(host.ctx)
+    apply(host.ctx, resolveSettings(host.settingsValue))
     const text = await callTool(host, 'jina_datetime', { url: 'https://example.com' })
     assert.match(text, /socks5:\/\/127\.0\.0\.1:7897/)
     assert.match(text, /已回退到自动检测/)
@@ -304,10 +310,11 @@ test('an unusable saved address is reported and falls back to automatic detectio
 test('the primer route reports the proxy actually in play and what the card stored', async () => {
   await withEnv({}, async () => {
     const host = createHost({ setting: 'http://127.0.0.1:7897', helperResults: [OK_PRIMER] })
-    apply(host.ctx)
+    apply(host.ctx, resolveSettings(host.settingsValue))
     const payload = await callPrimerRoute(host)
     assert.equal(payload.ok, true)
     assert.equal(payload.proxyConfigured, 'http://127.0.0.1:7897')
+    assert.equal(payload.settingsLive, true, 'the card health check reports the settings seam is live')
     assert.equal(payload.proxy.source, 'setting')
     assert.equal(payload.proxy.url, 'http://127.0.0.1:7897')
     assert.equal(payload.authenticatedAs, 'acct-test')
@@ -318,9 +325,10 @@ test('the primer route reports the proxy actually in play and what the card stor
 test('the primer route reports the automatic source when nothing is saved', async () => {
   await withEnv({}, async () => {
     const host = createHost({ regOutput: REG_SYSTEM_PROXY_ON, helperResults: [OK_PRIMER] })
-    apply(host.ctx)
+    apply(host.ctx, resolveSettings(host.settingsValue))
     const payload = await callPrimerRoute(host)
     assert.equal(payload.proxyConfigured, '')
+    assert.equal(payload.settingsLive, true, 'a stored section with no proxyUrl still resolves to live refs')
     assert.equal(payload.proxy.source, 'system')
     assert.equal(payload.proxy.url, 'http://127.0.0.1:7890')
   })
@@ -329,11 +337,41 @@ test('the primer route reports the automatic source when nothing is saved', asyn
 test('the primer route stays honest when the probe fails', async () => {
   await withEnv({}, async () => {
     const host = createHost({ setting: 'http://127.0.0.1:7999', helperResults: [TRANSPORT_FAILURE, TRANSPORT_FAILURE] })
-    apply(host.ctx)
+    apply(host.ctx, resolveSettings(host.settingsValue))
     const payload = await callPrimerRoute(host)
     assert.equal(payload.ok, false)
     assert.equal(payload.proxy.source, 'setting')
     assert.match(payload.error, /7999/)
+  })
+})
+
+// ---- live settings writes --------------------------------------------------
+// The regression the volatile schema exists for: saving on the card must reach
+// the next operation without a restart. The settings provider writes a saved
+// field into the volatile reference the resolved config holds (the object
+// `apply` captured keeps its identity), so the plugin re-reads it per call.
+
+test('a proxy address saved on the card reaches the next call without a restart', async () => {
+  await withEnv({}, async () => {
+    const host = createHost({ regOutput: REG_SYSTEM_PROXY_OFF })
+    // Only the `reg.exe` probes: the helper spawn is not a discovery probe.
+    const probes = () => host.execs.filter((e) => e.argv[1] !== '-e').length
+    const config = resolveSettings(host.settingsValue)
+    apply(host.ctx, config)
+    await callTool(host, 'jina_datetime', { url: 'https://example.com' })
+    assert.equal(probes(), 1, 'nothing saved yet, so WinINET is probed')
+    assert.equal(host.helpers[0].env, undefined, 'and no proxy is layered on')
+
+    config.proxyUrl[Symbol.for('cosmokit.volatile.write')]('http://127.0.0.1:7897')
+
+    await callTool(host, 'jina_datetime', { url: 'https://example.com' })
+    assert.equal(host.helpers[1].env.HTTPS_PROXY, 'http://127.0.0.1:7897', 'the saved address must apply to the next call')
+    assert.equal(probes(), 1, 'and it is used without another discovery probe')
+
+    config.proxyUrl[Symbol.for('cosmokit.volatile.write')]('')
+    await callTool(host, 'jina_datetime', { url: 'https://example.com' })
+    assert.equal(host.helpers[2].env, undefined, 'clearing the card falls back to automatic detection')
+    assert.equal(probes(), 1, 'the discovery result is cached for a minute')
   })
 })
 
@@ -348,7 +386,7 @@ const liveProxy = process.env.JINA_LIVE_PROXY_URL || 'http://127.0.0.1:7897'
 test('live: the configured local proxy carries a real Jina request', { skip: live ? false : 'set JINA_LIVE_PROXY=1 to run' }, async (t) => {
   await withEnv({}, async () => {
     const host = createHost({ setting: liveProxy, live: true, regOutput: REG_SYSTEM_PROXY_OFF })
-    apply(host.ctx)
+    apply(host.ctx, resolveSettings(host.settingsValue))
     const text = await callTool(host, 'jina_datetime', { url: 'https://example.com', json: true })
     if (host.state.spawnError !== undefined) {
       t.skip('child processes cannot be spawned here: ' + String((host.state.spawnError && host.state.spawnError.message) || host.state.spawnError))

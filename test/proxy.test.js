@@ -7,7 +7,8 @@
  *   - envProxyValue(env)      : first non-empty HTTP(S)/ALL proxy variable
  *   - selectProxy(input)      : precedence request > setting > JINA_PROXY_URL >
  *                               system discovery > inherited environment
- *   - createSettingsSchema()  : the duck-typed schemastery node the host registers
+ *   - createSettingsSchema()  : the `Config` node the Loader resolves and hands
+ *                               to apply(), carrying one volatile ref per field
  *
  * The regression these tests guard: a local proxy that is NOT the Windows
  * system proxy is invisible to WinINET discovery, so the manually configured
@@ -151,14 +152,26 @@ test('selectProxy: an unusable setting with no fallback stays visibly rejected',
   assert.equal(plan.rejected[0].reason, 'invalid')
 })
 
-test('createSettingsSchema: resolves to a normalized section', () => {
+test('createSettingsSchema: the Standard Schema envelope the Loader resolves through', () => {
   const schema = createSettingsSchema()
-  assert.deepEqual(schema({ [PROXY_SETTING_FIELD]: LOCAL }), { [PROXY_SETTING_FIELD]: LOCAL })
-  assert.deepEqual(schema({}), {})
-  assert.deepEqual(schema(undefined), {})
-  assert.deepEqual(schema({ [PROXY_SETTING_FIELD]: '' }), {})
-  assert.deepEqual(schema({ [PROXY_SETTING_FIELD]: 7897 }), {})
-  assert.deepEqual(schema({ unrelated: true }), {})
+  assert.equal(typeof schema, 'function', 'the node itself is callable')
+  assert.equal(schema['~standard'].version, 1)
+  assert.equal(schema['~standard'].vendor, 'schemastery', "the Loader's isSchemastery probe reads this")
+  const resolved = schema['~standard'].validate({ [PROXY_SETTING_FIELD]: LOCAL }).value
+  assert.equal(resolved[PROXY_SETTING_FIELD].get(), LOCAL)
+  assert.equal(Object.getPrototypeOf(resolved), Object.prototype, 'volatileEntries only descends into plain objects')
+  // A saved field is written into the ref the resolved config holds.
+  resolved[PROXY_SETTING_FIELD][Symbol.for('cosmokit.volatile.write')]('http://127.0.0.1:9999')
+  assert.equal(resolved[PROXY_SETTING_FIELD].get(), 'http://127.0.0.1:9999')
+  // The entry may start with no config at all, and a hand-edited document must
+  // never throw inside the shared Plugins settings page.
+  for (const raw of [undefined, null, '', 7897, [], 'nonsense', { [PROXY_SETTING_FIELD]: 42 }]) {
+    const value = schema['~standard'].validate(raw).value
+    assert.equal(Object.getPrototypeOf(value), Object.prototype)
+    assert.equal(typeof value[PROXY_SETTING_FIELD].get, 'function')
+  }
+  assert.equal(schema['~standard'].validate({}).value[PROXY_SETTING_FIELD].get(), undefined,
+    'an unset field stays undefined so proxy.js owns the default')
 })
 
 test('createSettingsSchema: toJSON is a rehydratable schemastery envelope', () => {
@@ -170,6 +183,12 @@ test('createSettingsSchema: toJSON is a rehydratable schemastery envelope', () =
   // throws "Cannot read properties of undefined (reading 'loose')" once the
   // browser rehydrates the envelope with `new Schema(serialized)`.
   assert.equal(typeof entry.meta, 'object')
+  // `meta.volatile` is what makes the field editable without a remount, and
+  // `plainSchema()` deletes it off whatever `toJSON()` returns — so every call
+  // must hand out fresh nodes instead of the live dict.
+  assert.equal(entry.meta.volatile, true)
+  assert.notEqual(createSettingsSchema().toJSON().dict[PROXY_SETTING_FIELD], entry)
+  assert.equal(createSettingsSchema().toJSON().dict[PROXY_SETTING_FIELD].meta.volatile, true)
 })
 
 test('createSettingsSchema: carries the dict/meta surface the settings service walks', () => {
@@ -178,6 +197,8 @@ test('createSettingsSchema: carries the dict/meta surface the settings service w
   assert.equal(schema.type, 'object')
   assert.equal(schema.dict[PROXY_SETTING_FIELD].type, 'string')
   assert.equal(typeof schema.meta, 'object')
+  assert.equal(schema.dict[PROXY_SETTING_FIELD].meta.volatile, true)
   // A fresh node per plugin instance: two profiles must not share one node.
   assert.notEqual(createSettingsSchema(), createSettingsSchema())
+  assert.notEqual(createSettingsSchema().dict[PROXY_SETTING_FIELD], createSettingsSchema().dict[PROXY_SETTING_FIELD])
 })

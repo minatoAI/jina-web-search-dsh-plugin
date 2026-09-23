@@ -20,7 +20,12 @@
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { apply } from '../index.js'
+import { Config, apply } from '../index.js'
+
+/** Resolve one raw stored settings section the way the Loader does before apply(). */
+function resolveSettings(raw) {
+  return Config['~standard'].validate(raw === undefined ? {} : raw).value
+}
 
 /** One Jina search response, as the network helper hands it back. */
 function searchBody() {
@@ -51,7 +56,6 @@ function createHost() {
       return undefined
     },
     inject(keys, callback) {
-      if (keys.includes('settings')) callback({ settings: { register: () => ({ get: () => ({}) }) } })
       if (keys.includes('webServer')) callback({ webServer: { register() {} } })
     },
     fs: {
@@ -84,7 +88,7 @@ function callTool(host, name, args) {
 /** Mount the plugin, call `name` with `args`, and assert it was rejected. */
 async function rejected(name, args, pattern) {
   const host = createHost()
-  apply(host.ctx)
+  apply(host.ctx, resolveSettings({}))
   await assert.rejects(() => callTool(host, name, args), pattern)
   assert.equal(host.helpers.length, 0, 'a rejected call must not spend a request')
   return host
@@ -99,7 +103,7 @@ test('jina_web_search: the live failure — `queries` instead of `query` — is 
 
 test('jina_web_search: the rejection tells the model which key it actually sent', async () => {
   const host = createHost()
-  apply(host.ctx)
+  apply(host.ctx, resolveSettings({}))
   const err = await callTool(host, 'jina_web_search', { queries: ['a', 'b'], num: 6 }).then(
     () => assert.fail('a bare `queries` call must be rejected'),
     (e) => e,
@@ -119,7 +123,7 @@ test('jina_web_search: absent, blank and wrongly typed queries are all rejected'
 
 test('jina_web_search: a valid query still reaches the API unchanged', async () => {
   const host = createHost()
-  apply(host.ctx)
+  apply(host.ctx, resolveSettings({}))
   const out = await callTool(host, 'jina_web_search', { query: 'wake word detection', num: 6, apiKey: 'k' })
   assert.equal(host.helpers.length, 1)
   const body = JSON.parse(host.helpers[0].body)

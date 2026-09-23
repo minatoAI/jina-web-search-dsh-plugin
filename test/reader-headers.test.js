@@ -21,12 +21,20 @@
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { apply } from '../index.js'
+import { Config, apply } from '../index.js'
 import {
   DEFAULT_IMAGE_POLICY, DEFAULT_REMOVE_SELECTORS, DEFAULT_TARGET_SELECTORS,
   READER_BASE, READER_PRESET, READER_TIMEOUT_SECONDS,
-  createSettingsSchema, toolSettingsOf,
+  settingsAreLive, settingsSnapshot, toolSettingsOf,
 } from '../proxy.js'
+
+/**
+ * Resolve one raw stored settings section the way the Loader does before
+ * `apply(ctx, config)` — through the plugin's `Config` export.
+ */
+function resolveSettings(raw) {
+  return Config['~standard'].validate(raw === undefined ? {} : raw).value
+}
 
 /** One Reader JSON envelope, as the network helper hands it back. */
 function readerBody(content, title = 'Example') {
@@ -63,9 +71,6 @@ function createHost(options = {}) {
       return undefined
     },
     inject(keys, callback) {
-      if (keys.includes('settings')) {
-        callback({ settings: { register: () => ({ get: () => settingsValue }) } })
-      }
       if (keys.includes('webServer')) callback({ webServer: { register() {} } })
     },
     fs: {
@@ -85,7 +90,7 @@ function createHost(options = {}) {
     },
     tools: { register(tool) { tools.set(tool.name, tool) } },
   }
-  return { ctx, requests, tools }
+  return { ctx, requests, tools, settingsValue }
 }
 
 /** Invoke `jina_read` the way the tool seam does. */
@@ -98,7 +103,7 @@ function callRead(host, args) {
 /** Mount the plugin and return the host plus its first request's headers. */
 async function headersFor(args, setting) {
   const host = createHost({ setting })
-  apply(host.ctx)
+  apply(host.ctx, resolveSettings(host.settingsValue))
   await callRead(host, args)
   assert.equal(host.requests.length >= 1, true, 'a request must reach the helper')
   return { host, headers: host.requests[0].headers }
@@ -149,7 +154,7 @@ test('jina_read: ocr switches the pipeline and steers the page', async () => {
 
 test('jina_read: ocr without a key is refused before any request is spawned', async () => {
   const host = createHost()
-  apply(host.ctx)
+  apply(host.ctx, resolveSettings(host.settingsValue))
   const text = await callRead(host, { url: 'https://example.com/paper.pdf', ocr: true })
   assert.match(text, /requires a Jina API key/)
   assert.match(text, /Vision Language Model/)
@@ -179,11 +184,29 @@ test('jina_read: alt-text generation is opt-in, key-gated and never rides with o
   assert.equal(withOcr.headers['X-With-Generated-Alt'], undefined)
 })
 
+test('jina_read: a field saved on the card reaches the next read without a restart', async () => {
+  const host = createHost()
+  const config = resolveSettings(host.settingsValue)
+  apply(host.ctx, config)
+  await callRead(host, { url: 'https://example.com', apiKey: 'k' })
+  assert.equal(host.requests[0].headers['X-With-Generated-Alt'], undefined)
+
+  // What the settings provider does on save: write into the volatile reference
+  // the resolved config holds (the object `apply` captured keeps its identity).
+  config.autoAltText[Symbol.for('cosmokit.volatile.write')](true)
+  config.useSelectors[Symbol.for('cosmokit.volatile.write')](false)
+
+  await callRead(host, { url: 'https://example.com', apiKey: 'k' })
+  assert.equal(host.requests[1].headers['X-With-Generated-Alt'], 'true', 'the saved option must apply to the next call')
+  assert.equal(host.requests[1].headers['X-Target-Selector'], undefined, 'and so must turning the selector group off')
+  assert.equal(host.requests[1].headers['X-Remove-Selector'], undefined)
+})
+
 test('jina_read: a target selector that matches nothing is retried without the group', async () => {
   const host = createHost({
     responses: [readerBody('tiny'), readerBody('the full article body. '.repeat(30))],
   })
-  apply(host.ctx)
+  apply(host.ctx, resolveSettings(host.settingsValue))
   const text = await callRead(host, { url: 'https://example.com' })
   assert.equal(host.requests.length, 2, 'exactly one retry')
   assert.equal(host.requests[0].headers['X-Target-Selector'], DEFAULT_TARGET_SELECTORS)
@@ -195,14 +218,14 @@ test('jina_read: a target selector that matches nothing is retried without the g
 
 test('jina_read: a healthy first answer is not retried', async () => {
   const host = createHost()
-  apply(host.ctx)
+  apply(host.ctx, resolveSettings(host.settingsValue))
   await callRead(host, { url: 'https://example.com' })
   assert.equal(host.requests.length, 1)
 })
 
 test('jina_read: unwraps the JSON envelope into markdown with the title and usage', async () => {
   const host = createHost()
-  apply(host.ctx)
+  apply(host.ctx, resolveSettings(host.settingsValue))
   const text = await callRead(host, { url: 'https://example.com' })
   assert.match(text, /^Title: Example/)
   assert.match(text, /URL Source: https:\/\/example\.com/)
@@ -212,34 +235,68 @@ test('jina_read: unwraps the JSON envelope into markdown with the title and usag
 
 test('jina_read: an unparsable body is handed back verbatim, never dropped', async () => {
   const host = createHost({ responses: [JSON.stringify({ ok: true, status: 200, text: 'plain markdown, not json' })] })
-  apply(host.ctx)
+  apply(host.ctx, resolveSettings(host.settingsValue))
   const text = await callRead(host, { url: 'https://example.com' })
   assert.equal(text, 'plain markdown, not json')
 })
 
-test('settings schema: stores only deviations and keeps every reader field', () => {
-  const schema = createSettingsSchema()
-  assert.deepEqual(schema({}), {})
-  assert.deepEqual(schema({ unrelated: true }), {})
-  assert.deepEqual(schema({ proxyUrl: 'http://127.0.0.1:7897' }), { proxyUrl: 'http://127.0.0.1:7897' })
-  assert.deepEqual(schema({ useOcr: false, autoAltText: false, useSelectors: true }), {},
-    'fields left at their default are not materialized into the document')
-  assert.deepEqual(schema({ imagePolicy: 'bogus' }), {})
-  assert.deepEqual(
-    schema({
-      useOcr: true, imagePolicy: 'alt', autoAltText: true, useSelectors: false,
-      targetSelector: 'article', removeSelector: 'nav', waitForSelector: '#app',
-    }),
-    {
-      useOcr: true, imagePolicy: 'alt', autoAltText: true, useSelectors: false,
-      targetSelector: 'article', removeSelector: 'nav', waitForSelector: '#app',
-    },
-  )
-  const dict = createSettingsSchema().toJSON().dict
-  for (const field of ['useOcr', 'imagePolicy', 'autoAltText', 'useSelectors', 'targetSelector', 'removeSelector', 'waitForSelector']) {
-    assert.ok(dict[field] !== undefined, field + ' must be declared in the schema envelope')
+test('settings schema: every reader field is declared as a live (volatile) field', () => {
+  // The entry id `jina-tools` *is* the settings namespace; this export is what
+  // the settings provider serves. A field is editable without a restart only
+  // when its node carries `meta.volatile` — the provider derives the form from
+  // exactly that flag, and `write()` rejects any path that lacks it.
+  const fields = [
+    'proxyUrl', 'useOcr', 'imagePolicy', 'autoAltText', 'useSelectors',
+    'targetSelector', 'removeSelector', 'waitForSelector',
+  ]
+  const dict = Config.toJSON().dict
+  for (const field of fields) {
+    assert.ok(Config.dict[field] !== undefined, field + ' must be declared in the schema dict')
+    assert.equal(Config.dict[field].meta.volatile, true, field + ' must be volatile, or saving it would remount the plugin')
+    assert.ok(dict[field] !== undefined, field + ' must survive toJSON()')
+    assert.equal(dict[field].meta.volatile, true, field + ' must keep meta.volatile through toJSON()')
     assert.equal(typeof dict[field].meta, 'object', field + ' needs `meta` for schemastery rehydration')
+    assert.equal(dict[field].type, Config.dict[field].type)
   }
+  assert.equal(dict.proxyUrl.type, 'string')
+  assert.equal(dict.useOcr.type, 'boolean')
+  assert.equal(dict.imagePolicy.type, 'string')
+  // A fresh envelope per call: `plainSchema()` walks the result and deletes
+  // `meta.volatile`, so a shared dict would silently disable live editing for
+  // every later save.
+  assert.notEqual(Config.toJSON().dict.proxyUrl, Config.toJSON().dict.proxyUrl)
+  assert.equal(Config.toJSON().dict.proxyUrl.meta.volatile, true)
+})
+
+test('settings schema: resolve() hands back the volatile refs the harness writes into', () => {
+  const resolved = resolveSettings({ proxyUrl: 'http://127.0.0.1:7897', useOcr: true })
+  assert.equal(settingsAreLive(resolved), true)
+  // `settingsSnapshot` reads through the refs, so a write by the settings
+  // provider is visible to the very next operation — no restart.
+  assert.equal(settingsSnapshot(resolved).proxyUrl, 'http://127.0.0.1:7897')
+  assert.equal(settingsSnapshot(resolved).useOcr, true)
+  const write = Symbol.for('cosmokit.volatile.write')
+  resolved.useOcr[write](false)
+  assert.equal(settingsSnapshot(resolved).useOcr, false, 'a saved field must reach the running plugin in place')
+  // A malformed / absent stored section must not throw: the entry may start
+  // with no config at all.
+  assert.equal(settingsAreLive(resolveSettings(undefined)), true)
+  assert.equal(settingsSnapshot(resolveSettings('nonsense')).proxyUrl, undefined)
+  assert.equal(settingsSnapshot(undefined).proxyUrl, undefined)
+  assert.equal(settingsAreLive(undefined), false)
+})
+
+test('settings schema: unset fields mean "default", and toolSettingsOf owns the defaults', () => {
+  const section = settingsSnapshot(resolveSettings({}))
+  assert.equal(section.useOcr, undefined, 'an untouched field is not materialized')
+  assert.equal(section.imagePolicy, undefined)
+  assert.equal(section.useSelectors, undefined)
+  const defaults = toolSettingsOf(section)
+  assert.equal(defaults.useOcr, false)
+  assert.equal(defaults.imagePolicy, 'all')
+  assert.equal(defaults.autoAltText, false)
+  assert.equal(defaults.useSelectors, true, 'the selector group is on unless it is explicitly turned off')
+  assert.equal(defaults.proxyUrl, '')
 })
 
 test('toolSettingsOf: an absent or malformed section resolves to the documented defaults', () => {

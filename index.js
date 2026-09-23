@@ -9,13 +9,14 @@
  * under the reference `JINA_API_KEY` — the "Jina Tools" web settings page
  * writes it through `credentials.set`, and this plugin resolves it per
  * operation (the seam's contract: never cache across operations). The web
- * settings pairing: this host half serves the `jina-tools` settings
- * namespace — whose `proxyUrl` field carries a manually configured local
- * proxy address and whose remaining fields carry the reader policy
- * (`useOcr`, `imagePolicy`, `autoAltText`, `useSelectors` and the selector
- * overrides) — and the browser half registers its configuration form for
- * that namespace, so the Plugins page (the `dsh-jina` bundle card) renders the
- * form only when the two halves agree.
+ * settings pairing: the `jina-tools` Loader entry (contributed by this bundle's
+ * `cordis.patch.yml`) *is* the settings namespace, and this host half declares
+ * its live fields through the module-level `Config` export built by proxy.js —
+ * `proxyUrl` carries a manually configured local proxy address and the
+ * remaining fields carry the reader policy (`useOcr`, `imagePolicy`,
+ * `autoAltText`, `useSelectors` and the selector overrides). The browser half
+ * registers its configuration form for that namespace, so the Plugins page
+ * (the `dsh-jina` bundle card) renders the form only when the two halves agree.
  *
  * The API key is resolved per call in this order:
  *   1. the tool's own `apiKey` parameter,
@@ -46,14 +47,32 @@ import { buildPrimer, formatPrimer, parseIpInfo, parseJinaRoot } from './primer.
 import {
   DEFAULT_REMOVE_SELECTORS, DEFAULT_TARGET_SELECTORS, PROXY_ENV_VAR,
   READER_BASE, READER_PRESET, READER_TIMEOUT_SECONDS, SELECTOR_RETRY_MIN_CHARS,
-  SETTINGS_NAMESPACE,
-  createSettingsSchema, describeRejectReason, proxySettingOf, selectProxy, toolSettingsOf,
+  createSettingsSchema, describeRejectReason, proxySettingOf, selectProxy,
+  settingsAreLive, settingsSnapshot, toolSettingsOf,
 } from './proxy.js'
 import { WEB_SEARCH_TOOL } from './tool-contracts.js'
 
 export const name = 'dsh-jina'
 
 export const inject = ['fs', 'subprocess', 'tools']
+
+/**
+ * The `jina-tools` live-field declaration.
+ *
+ * The entry id *is* the settings namespace (`cordis.patch.yml` contributes
+ * `- id: jina-tools / name: dsh-jina`), and this export is what the settings
+ * provider serves to the browser half: the harness resolves it through
+ * `'~standard'.validate`, hands the result to `apply` as the second argument,
+ * and writes every saved field straight into the volatile references that
+ * result holds. That is what makes a save live: the card is editable only while
+ * a row for this namespace exists, and this plugin is the row's only source.
+ *
+ * proxy.js owns the field list, the defaults and the cross-copy volatile
+ * protocol; keeping the schema there is also what preserves the zero-dependency
+ * promise (an out-of-tree bundle at this location cannot resolve the harness's
+ * schemastery package).
+ */
+export const Config = createSettingsSchema()
 
 /**
  * The network helper: a self-contained CommonJS script run as
@@ -93,7 +112,7 @@ export const HTTP_HELPER_SCRIPT = [
   "})",
 ].join('\n')
 
-export function apply(ctx) {
+export function apply(ctx, config) {
   const READER = 'https://r.jina.ai/'
   const IPINFO = 'https://ipinfo.io/json'
   const SEARCH = 'https://svip.jina.ai/'
@@ -107,9 +126,16 @@ export function apply(ctx) {
   let keyDiag = ''
   let keyKind
   let proxyCache = { text: undefined, at: 0, done: false }
-  /** Owner scope of the `jina-tools` settings namespace; undefined without a provider. */
-  let settingsScope
-  let settingsDiag = ''
+  /**
+   * The resolved `jina-tools` config for this plugin instance (see the `Config`
+   * export above). The harness keeps this object's identity stable and writes a
+   * saved field into its volatile references in place, so reading through
+   * `settingsSnapshot()` at the start of an operation always sees the current
+   * values — the same "never cache across operations" contract the API key has.
+   * `undefined` on a harness that passes no config, which is why the readers
+   * below fall back to the proxy.js defaults.
+   */
+  const settingsConfig = config
   let currentCwd = undefined
 
   /** dsh home directory: $DSH_HOME, else ~/.dsh. */
@@ -283,22 +309,20 @@ export function apply(ctx) {
   /**
    * The manual proxy address stored by the settings card, re-read per operation
    * (same contract as the API key: a saved change reaches the next call without
-   * a restart). '' while unconfigured or while no settings provider is mounted.
+   * a restart). '' while unconfigured.
    */
   function settingProxy() {
-    if (settingsScope === undefined) return ''
-    try { return proxySettingOf(settingsScope.get()) } catch (err) { return '' }
+    try { return proxySettingOf(settingsSnapshot(settingsConfig)) } catch (err) { return '' }
   }
 
   /**
    * The reader policy stored by the settings card, re-read per operation (same
    * contract as the proxy address and the API key: a saved change reaches the
    * next call without a restart). proxy.js owns the normalization and the
-   * defaults, so a profile without a settings provider gets the defaults.
+   * defaults, so an unset (or entirely absent) config gets the defaults.
    */
   function toolSettings() {
-    if (settingsScope === undefined) return toolSettingsOf(undefined)
-    try { return toolSettingsOf(settingsScope.get()) } catch (err) { return toolSettingsOf(undefined) }
+    try { return toolSettingsOf(settingsSnapshot(settingsConfig)) } catch (err) { return toolSettingsOf(undefined) }
   }
 
   /**
@@ -1171,9 +1195,13 @@ export function apply(ctx) {
         })
         // What the probe ran through, plus what the card has stored, so the
         // page can show the effective address even when the probe failed.
+        // `settingsLive` is the health check for the settings seam itself: it is
+        // true only while the harness handed `apply` the resolved volatile
+        // references, the one state in which a saved field reaches the next call
+        // (and, on this harness generation, the card's controls are enabled).
         const proxy = out.proxy || null
         const configured = settingProxy()
-        const extra = { proxy, proxyConfigured: configured, ...(settingsDiag === '' ? {} : { settingsError: settingsDiag }) }
+        const extra = { proxy, proxyConfigured: configured, settingsLive: settingsAreLive(settingsConfig) }
         let payload
         if (out.ok) {
           try {
@@ -1201,40 +1229,15 @@ export function apply(ctx) {
   })
 
   // ---- web settings namespace ------------------------------------------------
-  // This registration makes the deployment's settings provider serve
-  // "jina-tools", the namespace the browser half's configuration form edits
-  // (through the Plugins page's bundle-configuration slot, or the older
-  // Settings → Plugins → Configure card). The namespace carries the manually
-  // configured local proxy address (`proxyUrl`) plus the reader policy
-  // (`useOcr`, `imagePolicy`, `autoAltText`, `useSelectors` and the three
-  // selector overrides); the API key stays in the credential seam and never
-  // rides the settings document.
+  // There is nothing to register at runtime: the `jina-tools` settings
+  // namespace *is* this Loader entry (the bundle's `cordis.patch.yml` contributes
+  // `- id: jina-tools / name: dsh-jina`), and the module-level `Config` export
+  // above is the live-field declaration the settings provider serves to the
+  // browser half's configuration form. `apply` receives the resolved config (see
+  // `settingsConfig`) and the loader writes a saved field straight into its
+  // volatile references, so a save reaches the next operation without a restart.
   //
-  // The stored document only ever holds what the user changed — defaults live
-  // in proxy.js (`toolSettingsOf`) so "unset" keeps meaning "default" and a
-  // later default change reaches users who never touched the field.
-  //
-  // Zero-dependency note: the settings service consumes a schemastery schema
-  // as a function (schema(value) → resolved value), serializes it through
-  // toJSON(), and walks type/dict/meta for secret redaction. The schema built
-  // by proxy.js is a plain object covering exactly that surface, so this plugin
-  // still imports nothing from the harness's package graph (an out-of-tree
-  // bundle at this location cannot resolve those imports). Profiles without a
-  // settings provider never mount the inject, and the plugin keeps working
-  // without the manual override — just with automatic proxy discovery only.
-  const settingsNamespace = (value) => {
-    if (!/^[a-z][a-z0-9-]*$/.test(String(value))) {
-      throw new TypeError('settings namespace "' + String(value) + '" must match ^[a-z][a-z0-9-]*$')
-    }
-    return value
-  }
-
-  ctx.inject(['settings'], (sctx) => {
-    try {
-      settingsScope = sctx.settings.register(settingsNamespace(SETTINGS_NAMESPACE), createSettingsSchema())
-    } catch (err) {
-      settingsDiag = String((err && err.message) || err)
-      settingsScope = undefined
-    }
-  })
+  // The stored document only ever holds what the user changed — defaults live in
+  // proxy.js (`toolSettingsOf`) so "unset" keeps meaning "default" and a later
+  // default change reaches users who never touched the field.
 }

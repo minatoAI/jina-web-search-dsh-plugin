@@ -217,29 +217,6 @@ export function selectProxy(input) {
 }
 
 /**
- * Build the `jina-tools` settings schema.
- *
- * The plugin runs out of tree and cannot import the harness's schemastery
- * package, so this is a duck-typed node covering exactly the surface the
- * runtime touches: the call form (`schema(value) -> resolved value`, used by
- * `settings.register`/`resolve`) and `toJSON()` (used by `settings.describe`
- * and rehydrated by the browser as `new Schema(serialized)`).
- *
- * The resolved value is normalized to a section carrying only the fields the
- * user actually set (a hand-edited `settings.yaml` cannot make registration
- * fail: whatever the stored section says, this returns a well-formed section,
- * and the transport reports an unusable address through its own diagnostics).
- * Defaults are NOT materialized into the stored document — they are applied at
- * read time by `toolSettingsOf`, so "unset" keeps meaning "default".
- *
- * Shape note (verified against vendored schemastery 3.18.2): a dict entry must
- * carry `meta`, otherwise the rehydrated `string` resolver dereferences
- * `meta.pattern` on undefined (`new Schema(serialized)` assigns the serialized
- * dict verbatim — plain objects are never converted into nodes).
- *
- * @returns a schemastery-compatible schema node for the `jina-tools` namespace.
- */
-/**
  * Resolve the `jina-tools` section into the reader policy the tools consume.
  *
  * Every field is optional in the document, so this is where "unset" becomes a
@@ -272,41 +249,149 @@ export function toolSettingsOf(section) {
   }
 }
 
-export function createSettingsSchema() {
-  const dict = {
-    [PROXY_SETTING_FIELD]: { type: 'string', meta: {} },
-    [OCR_SETTING_FIELD]: { type: 'boolean', meta: {} },
-    [IMAGE_POLICY_FIELD]: { type: 'string', meta: {} },
-    [AUTO_ALT_SETTING_FIELD]: { type: 'boolean', meta: {} },
-    [SELECTORS_SETTING_FIELD]: { type: 'boolean', meta: {} },
-    [TARGET_SELECTOR_FIELD]: { type: 'string', meta: {} },
-    [REMOVE_SELECTOR_FIELD]: { type: 'string', meta: {} },
-    [WAIT_FOR_SELECTOR_FIELD]: { type: 'string', meta: {} },
+/** cosmokit's cross-copy volatile protocol: `ref[VOLATILE_WRITE](next)`. */
+const VOLATILE_WRITE = Symbol.for('cosmokit.volatile.write')
+
+/** The live fields, in card order: `[key, schemastery type]`. */
+const SETTINGS_FIELDS = [
+  [PROXY_SETTING_FIELD, 'string'],
+  [OCR_SETTING_FIELD, 'boolean'],
+  [IMAGE_POLICY_FIELD, 'string'],
+  [AUTO_ALT_SETTING_FIELD, 'boolean'],
+  [SELECTORS_SETTING_FIELD, 'boolean'],
+  [TARGET_SELECTOR_FIELD, 'string'],
+  [REMOVE_SELECTOR_FIELD, 'string'],
+  [WAIT_FOR_SELECTOR_FIELD, 'string'],
+]
+
+/**
+ * One live config value: the object the loader mutates in place when the user
+ * saves this field.
+ *
+ * `get()` returns the raw stored value — `undefined` while the user never set
+ * the field — so the stored document stays minimal and every default stays in
+ * `toolSettingsOf` ("unset" keeps meaning "default"). Frozen like cosmokit's
+ * `createVolatile`: the write handle is a symbol-keyed closure, so freezing
+ * only prevents reassigning it.
+ *
+ * @param value - the raw stored value (`undefined` when unset).
+ * @returns `{ get() }` plus the cosmokit write handle.
+ */
+function volatileRef(value) {
+  let current = value
+  const ref = { get: () => current }
+  Object.defineProperty(ref, VOLATILE_WRITE, { value: (next) => { current = next } })
+  return Object.freeze(ref)
+}
+
+/**
+ * Read the current `jina-tools` section out of the resolved config `apply`
+ * receives, unwrapping the volatile references.
+ *
+ * Tolerates a plain (already unwrapped) section too: if a harness copy hands
+ * over the raw config, the manual proxy address and the reader policy still
+ * apply instead of silently collapsing to the defaults.
+ *
+ * @param config - the second argument of `apply` (any shape).
+ * @returns a section of plain values, `undefined` for every unset field.
+ */
+export function settingsSnapshot(config) {
+  const out = {}
+  if (config === null || typeof config !== 'object') return out
+  for (const [field] of SETTINGS_FIELDS) {
+    const value = config[field]
+    out[field] = value !== null && typeof value === 'object' && typeof value.get === 'function' ? value.get() : value
   }
-  const serialized = () => ({ type: 'object', dict })
-  const node = (value) => {
+  return out
+}
+
+/**
+ * Whether the config `apply` received carries live references — the health
+ * check for the settings seam itself. `false` means the harness never resolved
+ * this plugin's `Config` (or resolved it as raw data), which is exactly the
+ * state in which the settings card renders but every field is read-only.
+ *
+ * @param config - the second argument of `apply` (any shape).
+ * @returns whether `proxyUrl` is a cosmokit-compatible reference.
+ */
+export function settingsAreLive(config) {
+  const ref = config !== null && typeof config === 'object' ? config[PROXY_SETTING_FIELD] : undefined
+  return ref !== null && typeof ref === 'object' && typeof ref.get === 'function' && VOLATILE_WRITE in ref
+}
+
+/**
+ * Build the live-config schema for the `jina-tools` Loader entry.
+ *
+ * dsh 0.1.4 removed `settings.register`: a settings namespace *is* a Loader
+ * entry id (here `jina-tools`, contributed by this bundle's
+ * `cordis.patch.yml`), and a plugin declares its live fields by exporting a
+ * schemastery `Config`. The harness then
+ *   - resolves it through `runtime.Config['~standard'].validate(raw)` (Standard
+ *     Schema v1) and passes the result to `apply(ctx, config)`,
+ *   - serializes `toJSON()` into the `settings.describe()` row the browser card
+ *     reads, and
+ *   - treats a field as *live* when its node carries `meta.volatile`.
+ *
+ * Volatility is what makes a save reach the running plugin without a restart:
+ * the loader diffs the new raw config with `equalExceptVolatile` and, when only
+ * volatile fields moved, calls `updateVolatile(ref, next)` on the references the
+ * resolved config holds instead of remounting the plugin. Those references must
+ * speak cosmokit's cross-copy protocol (`Symbol.for`, so any ESM/CJS copy of the
+ * harness recognizes them), which is why this module builds them itself.
+ *
+ * The plugin runs out of tree and cannot import the harness's schemastery, so
+ * this is a duck-typed node covering exactly the surface the runtime touches:
+ * `type`/`dict`/`meta` (the loader's volatile diff and the settings form
+ * projection), `toJSON()` (rehydrated by the browser as `new Schema(json)`), and
+ * `'~standard'`. `~standard.vendor` reports `'schemastery'` because that is the
+ * duck-type the loader's volatile diff probes for — any other vendor demotes
+ * every save to a full plugin remount. The node stays callable as well, because
+ * an older harness copy resolves a config schema by calling it.
+ *
+ * Shape notes (verified against schemastery 3.18.3):
+ *   - a dict entry must carry `meta`, otherwise the rehydrated `string` resolver
+ *     dereferences `meta.pattern` on undefined (`new Schema(serialized)` assigns
+ *     the serialized dict verbatim — plain objects are never converted into
+ *     nodes);
+ *   - `toJSON()` hands out freshly built nodes: the settings provider rehydrates
+ *     the result and then deletes `meta.volatile` while walking it, so sharing
+ *     the live nodes here would let a single settings read strip this schema of
+ *     its volatility and turn every later save into a remount.
+ *
+ * @returns the `Config` schema this plugin exports as its live-field declaration.
+ */
+export function createSettingsSchema() {
+  // Each live field is its own volatile node: `volatileForm` keeps exactly the
+  // volatile children, and the write path then strips only those keys out of the
+  // stored document, so a hand-written config keeps its undeclared keys.
+  const fieldNode = (type) => ({
+    type,
+    meta: { volatile: true },
+    toJSON() { return { type, meta: { volatile: true } } },
+  })
+  const dict = Object.fromEntries(SETTINGS_FIELDS.map(([key, type]) => [key, fieldNode(type)]))
+  const resolve = (value) => {
     const section = value !== null && typeof value === 'object' ? value : {}
     const out = {}
-    const proxy = proxySettingOf(section)
-    if (proxy !== '') out[PROXY_SETTING_FIELD] = proxy
-    // Only deviations from the default are stored: `true` for opt-in flags,
-    // `false` for opt-out ones. That keeps the document minimal and makes a
-    // later default change reach every user who never touched the field.
-    if (section[OCR_SETTING_FIELD] === true) out[OCR_SETTING_FIELD] = true
-    if (IMAGE_POLICIES.includes(section[IMAGE_POLICY_FIELD])) out[IMAGE_POLICY_FIELD] = section[IMAGE_POLICY_FIELD]
-    if (section[AUTO_ALT_SETTING_FIELD] === true) out[AUTO_ALT_SETTING_FIELD] = true
-    if (section[SELECTORS_SETTING_FIELD] === false) out[SELECTORS_SETTING_FIELD] = false
-    for (const field of [TARGET_SELECTOR_FIELD, REMOVE_SELECTOR_FIELD, WAIT_FOR_SELECTOR_FIELD]) {
-      const raw = section[field]
-      if (typeof raw === 'string' && raw.trim() !== '') out[field] = raw.trim()
-    }
+    for (const [key] of SETTINGS_FIELDS) out[key] = volatileRef(section[key])
     return out
   }
-  return Object.assign(node, {
+  return Object.assign(resolve, {
     type: 'object',
     dict,
     meta: {},
     inner: undefined,
-    toJSON() { return serialized() },
+    toJSON() {
+      return {
+        type: 'object',
+        meta: {},
+        dict: Object.fromEntries(SETTINGS_FIELDS.map(([key, type]) => [key, { type, meta: { volatile: true } }])),
+      }
+    },
+    '~standard': {
+      version: 1,
+      vendor: 'schemastery',
+      validate(value) { return { value: resolve(value) } },
+    },
   })
 }
