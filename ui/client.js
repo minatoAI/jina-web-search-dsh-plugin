@@ -24,12 +24,21 @@
 // whichever declarer exists. Drop that arm once no supported harness declares
 // it.
 //
-// The card manages the `JINA_API_KEY` credential through the standard
-// credentials Remote namespace: `remote.credentials` (the generated `$mount`
-// installs it as its own `remote.credentials` cordis service — inject it, do
-// not reach through the `remote` object) with describe/set/unset. Values cross
-// the wire only on save, and the page shows configured state, never the
-// stored value. It refreshes when the Host reports the reference changed
+// The card manages the API key pool through the standard credentials Remote
+// namespace: `remote.credentials` (the generated `$mount` installs it as its
+// own `remote.credentials` cordis service — inject it, do not reach through the
+// `remote` object) with describe/set/unset. One key per credential reference,
+// because the seam stores one value per reference and its `describe` view
+// carries `configured`/`source`/`writable` only — a value is never read back.
+// The references are the pool KEY_REFS (index.js/keys.js must agree): slot 1 is
+// the reference the single-key card of 0.8.x wrote, the rest are the free slots
+// the card fills in order. The form is therefore ONE input plus an "add"
+// control that writes into the first free slot — no list, no per-key row and no
+// remove control: the host discards a key that is exhausted (401/402, or a
+// probe reporting no credits left) on its own, so the user only ever adds keys.
+// The card reports how many keys are usable, how many it holds, and the total
+// credits behind them; it never identifies an individual key. Values cross the
+// wire only on save. It refreshes when the Host reports a reference changed
 // (`credentials/reference-updated`, observed on the `remote` service itself).
 //
 // It also owns the plugin's `jina-tools` settings namespace through the
@@ -53,7 +62,15 @@ window.__ModuleLoader__.load({
   factory: function (require) {
     var React = require('react')
     var exports = {}
-    var CRED = 'JINA_API_KEY'
+    // The key pool, in slot order. MUST stay in lockstep with keys.js KEY_REFS:
+    // slot 1 (`JINA_API_KEY`) is the reference 0.8.x wrote, the rest are the
+    // free slots the "add" control fills in order. The credentials Remote
+    // namespace has no enumeration, so the card can only describe references it
+    // names itself.
+    var KEY_REFS = [
+      'JINA_API_KEY', 'JINA_API_KEY_2', 'JINA_API_KEY_3', 'JINA_API_KEY_4', 'JINA_API_KEY_5',
+      'JINA_API_KEY_6', 'JINA_API_KEY_7', 'JINA_API_KEY_8', 'JINA_API_KEY_9', 'JINA_API_KEY_10',
+    ]
     var NS = 'jina-tools'
     var PROXY_FIELD = 'proxyUrl'
     // Reader-policy fields of the same `jina-tools` namespace. The host owns
@@ -125,10 +142,15 @@ window.__ModuleLoader__.load({
       var remote = props.remote
       var credentials = props.credentials
       var [open, setOpen] = React.useState(false)
-      var [input, setInput] = React.useState('')
-      var [status, setStatus] = React.useState('')
-      var [statusKind, setStatusKind] = React.useState('info') // 'info' | 'ok' | 'bad'
-      var [view, setView] = React.useState(undefined) // {configured, writable} | undefined while loading
+      // ---- API key pool -----------------------------------------------------
+      // The page never sees a value: `keyViews` is the describe view of every
+      // slot, `keyDraft` is the one input the user is typing into (never seeded
+      // from the host), `keyStatus` is the feedback of the last add/remove.
+      // Slot 1 is the reference 0.8.x wrote; a new key goes into the first free
+      // slot.
+      var [keyViews, setKeyViews] = React.useState(undefined) // Record<ref, {configured, source, writable}> | undefined while loading
+      var [keyDraft, setKeyDraft] = React.useState('')
+      var [keyStatus, setKeyStatus] = React.useState({ kind: 'info', message: '' })
       var [primer, setPrimer] = React.useState({ phase: 'loading', data: undefined, error: undefined })
       // ---- manual local proxy ---------------------------------------------
       // `proxyView` mirrors the host's `jina-tools` namespace: phase 'ready'
@@ -167,10 +189,16 @@ window.__ModuleLoader__.load({
       }
 
       var refresh = function () {
-        if (credentials === undefined) return
-        credentials.describe([CRED]).then(function (response) {
+        if (credentials === undefined) {
+          // No credential plane at all (a profile without a credential
+          // provider): every slot reads as unconfigured and disabled instead of
+          // loading forever. The host still resolves the key file.
+          setKeyViews({})
+          return
+        }
+        credentials.describe(KEY_REFS).then(function (response) {
           if (!response || response.ok !== true) return
-          setView(response.value[CRED])
+          setKeyViews(response.value || {})
         }, function () { /* keep previous view */ })
       }
 
@@ -288,7 +316,9 @@ window.__ModuleLoader__.load({
         loadPrimer()
         var disposers = [
           remote.$on('credentials/reference-updated', function (ref) {
-            if (ref === CRED) {
+            // Any pool slot: a key saved in another tab, or cleared by a
+            // hand-edited .credentials.yaml, changes the rotation too.
+            if (ref === undefined || KEY_REFS.indexOf(ref) >= 0) {
               refresh()
               loadPrimer()
             }
@@ -304,70 +334,75 @@ window.__ModuleLoader__.load({
         }
       }, [remote])
 
-      function onInput(e) { setInput(e.target.value) }
+      /** Add/remove feedback for the one key form. */
+      function say(kind, message) {
+        setKeyStatus({ kind: kind, message: message })
+      }
 
-      function onSave() {
-        if (input.trim() === '') {
-          setStatusKind('bad')
-          setStatus('请输入 API key。')
+      function onKeyInput(e) {
+        setKeyDraft(e.target.value)
+      }
+
+      /** The first slot the user has not filled yet, or undefined when the pool is full. */
+      function firstFreeRef() {
+        for (var i = 0; i < KEY_REFS.length; i++) {
+          if (!keyViewOf(KEY_REFS[i]).configured) return KEY_REFS[i]
+        }
+        return undefined
+      }
+
+      function onAdd() {
+        var value = keyDraft.trim()
+        if (value === '') {
+          say('bad', '请输入 API key。')
           return
         }
         if (credentials === undefined) {
-          setStatusKind('bad')
-          setStatus('当前环境未挂载凭据控制面（credentials Remote），无法保存。')
+          say('bad', '当前环境未挂载凭据控制面（credentials Remote），无法保存。')
           return
         }
-        setStatusKind('info')
-        setStatus('保存中…')
-        credentials.set(CRED, input.trim()).then(function (response) {
+        var ref = firstFreeRef()
+        if (ref === undefined) {
+          say('bad', '槽位已满（最多 ' + KEY_REFS.length + ' 个 key）；失效或额度耗尽的 key 会被自动丢弃，之后即可继续添加。')
+          return
+        }
+        say('info', '保存中…')
+        credentials.set(ref, value).then(function (response) {
           if (response && response.ok === true) {
-            setStatusKind('ok')
-            setStatus('已保存。')
-            setInput('')
+            say('ok', '已保存。')
+            setKeyDraft('')
             refresh()
             loadPrimer()
           } else {
-            setStatusKind('bad')
-            setStatus('保存失败：' + String((response && response.error && response.error.message) || '未知错误'))
+            // A read-only source shadowing the reference (an environment
+            // variable) is the seam's own message and must be shown verbatim.
+            say('bad', '保存失败：' + String((response && response.error && response.error.message) || '未知错误'))
           }
         }, function () {
-          setStatusKind('bad')
-          setStatus('保存失败，请重试。')
+          say('bad', '保存失败，请重试。')
         })
       }
 
-      function onClear() {
-        if (credentials === undefined) {
-          setStatusKind('bad')
-          setStatus('当前环境未挂载凭据控制面（credentials Remote），无法清除。')
-          return
+      /** The describe view of one slot; the seam answers unknown refs as unwritable-free blanks. */
+      function keyViewOf(ref) {
+        var info = keyViews && keyViews[ref] ? keyViews[ref] : undefined
+        return {
+          configured: info ? info.configured === true : false,
+          source: info && typeof info.source === 'string' ? info.source : '',
+          writable: info ? info.writable === true : false,
         }
-        setStatusKind('info')
-        setStatus('清除中…')
-        credentials.unset(CRED).then(function (response) {
-          if (response && response.ok === true) {
-            setStatusKind('ok')
-            setStatus('已清除。')
-            refresh()
-            loadPrimer()
-          } else {
-            setStatusKind('bad')
-            setStatus('清除失败：' + String((response && response.error && response.error.message) || '未知错误'))
-          }
-        }, function () {
-          setStatusKind('bad')
-          setStatus('清除失败，请重试。')
-        })
       }
 
-      var configured = view ? view.configured === true : false
-      var writable = view ? view.writable === true : false
-      var shown = view === undefined
-        ? '正在读取设置…'
-        : configured
-          ? 'API key 已保存（来源：' + String(view.source || '本机存储') + '）。粘贴新 key 并保存即可覆盖。'
-          : '尚未保存 API key。'
-      var statusStyle = statusKind === 'ok' ? S.statusOk : (statusKind === 'bad' ? S.statusBad : S.status)
+      var keyCount = 0
+      for (var ki = 0; ki < KEY_REFS.length; ki++) if (keyViewOf(KEY_REFS[ki]).configured) keyCount++
+      var keysLoading = keyViews === undefined
+      var credentialsMissing = credentials === undefined
+      var keyFull = !keysLoading && firstFreeRef() === undefined
+      // The host's probe knows the whole pool, including keys that come from a
+      // jina-api-key.txt file and therefore have no slot on this card. Prefer it
+      // for "is anything configured at all", fall back to the slots.
+      var poolCount = primer.data && typeof primer.data.keyCount === 'number' ? primer.data.keyCount : keyCount
+      var keyStatusStyle = keyStatus.kind === 'ok' ? S.statusOk : (keyStatus.kind === 'bad' ? S.statusBad : S.status)
       var proxyStatusStyle = proxyStatusKind === 'ok' ? S.statusOk : (proxyStatusKind === 'bad' ? S.statusBad : S.status)
 
       // ---- manual proxy block -----------------------------------------------
@@ -544,6 +579,45 @@ window.__ModuleLoader__.load({
         optsStatus !== '' ? React.createElement('p', { style: optsStatusStyle }, optsStatus) : null,
         React.createElement('p', { style: S.note }, '每次 jina_read 都会固定发送三个零副作用的 Reader 参数：X-Preset: agent（官方 agent 预设，只填充未显式设置的项）、X-Base: final（用跳转后的 URL 解析相对链接）、X-Timeout: 120（与客户端 120s 上限对齐，慢页面兜底）。'))
 
+      // ---- key pool block ---------------------------------------------------
+      // ONE input and an add control, and nothing else: no list, no per-key row,
+      // no remove control. The host keeps the pool clean on its own (a key that
+      // is exhausted or revoked is discarded), so there is nothing for the user
+      // to manage here — paste a key, click 添加, done.
+      var keyBlock = React.createElement('div', { style: S.infoBox },
+        React.createElement('p', { style: S.infoLabel }, 'API key（可保存多个，额度耗尽自动丢弃）'),
+        React.createElement('p', { style: S.note }, '粘贴一个 key 后点「添加」，可以一直往里加。插件自动轮换：某个 key 失效（401）或额度耗尽（402 / 余额为 0）时会被自动丢弃，其余 key 继续服务，任务不会中途断掉；限流（429）只是临时跳过。'),
+        React.createElement('div', { style: S.row },
+          React.createElement('input', {
+            style: S.input,
+            type: 'password',
+            value: keyDraft,
+            placeholder: '粘贴 API key…',
+            onChange: onKeyInput,
+            autoComplete: 'off',
+            spellCheck: false,
+            disabled: credentialsMissing || keysLoading || keyFull,
+          }),
+          React.createElement('button', {
+            style: S.button,
+            onClick: onAdd,
+            disabled: credentialsMissing || keysLoading || keyFull,
+          }, '添加')),
+        keyStatus.message !== '' ? React.createElement('p', { style: keyStatusStyle }, keyStatus.message) : null,
+        !credentialsMissing && !keysLoading && poolCount === 0
+          ? React.createElement('p', { style: S.note }, '还没有 key（当前使用 Jina 匿名免费配额）。添加一个即可；建议再加一个备用 key。')
+          : null,
+        keyFull
+          ? React.createElement('p', { style: S.note }, '已填满 ' + KEY_REFS.length + ' 个槽位；不可用的 key 会被自动丢弃，之后即可继续添加。')
+          : null,
+        credentialsMissing
+          ? React.createElement('p', { style: S.statusBad }, '⚠️ 当前环境未挂载凭据控制面（credentials Remote），无法在此保存 key；可改用 jina-api-key.txt（每行一个 key）或同名环境变量。')
+          : null,
+        !credentialsMissing && keysLoading ? React.createElement('p', { style: S.note }, '正在读取已保存的 key…') : null,
+        !credentialsMissing && !keysLoading && poolCount > 0 && keyCount === 0
+          ? React.createElement('p', { style: S.note }, '轮换池里的 key 来自 jina-api-key.txt 文件（每行一个）；文件不会被自动改写，因此这些 key 失效时只是被跳过。')
+          : null)
+
       // ---- key health block -------------------------------------------------
       var primerLines
       if (primer.phase === 'loading') {
@@ -555,16 +629,22 @@ window.__ModuleLoader__.load({
         ]
       } else {
         var d = primer.data || {}
-        var balance = typeof d.balanceLeft === 'number' ? d.balanceLeft.toLocaleString('en-US') + ' credits' : '未知'
-        var kindLabel = d.keyFound === true
-          ? (d.keyKind === 'credential' ? '本页保存的 key' : 'key 文件（jina-api-key.txt）')
-          : '未检测到 key（Jina 匿名免费配额）'
+        // Everything the page says about keys: how many the pool holds and the
+        // credits behind them. Nothing per key, and no usable/total fraction —
+        // an unusable key is discarded by the host, so the count is the count.
+        var total = typeof d.keyCount === 'number' ? d.keyCount : 0
+        var totalBalance = typeof d.balanceTotal === 'number' ? d.balanceTotal.toLocaleString('en-US') + ' credits' : '未知'
         primerLines = [
           React.createElement('p', { key: 'ok', style: S.statusOk }, '✅ 连接正常，key 可用'),
-          React.createElement('p', { key: 'id', style: S.mono }, '身份：' + (d.authenticatedAs || '未知')),
-          React.createElement('p', { key: 'bal', style: S.mono }, '余额：' + balance),
-          React.createElement('p', { key: 'src', style: S.note }, '当前生效来源：' + kindLabel),
+          React.createElement('p', { key: 'total', style: S.mono }, 'Key 总数：' + total + ' 个'),
+          React.createElement('p', { key: 'bal', style: S.mono }, '总余额：' + totalBalance),
         ]
+        if (total === 0) {
+          primerLines.push(React.createElement('p', { key: 'none', style: S.note }, '尚未保存 key：添加一个即可；当前使用 Jina 匿名免费配额。'))
+        }
+        if (typeof d.discardedCount === 'number' && d.discardedCount > 0) {
+          primerLines.push(React.createElement('p', { key: 'discarded', style: S.note }, '本次检测自动丢弃了 ' + d.discardedCount + ' 个已失效或额度耗尽的 key。'))
+        }
       }
       // The probe reports which proxy it actually used — the one fact that
       // tells a working manual address apart from a lucky environment variable.
@@ -596,51 +676,32 @@ window.__ModuleLoader__.load({
        * The configuration form both surfaces render.
        *
        * Defined INSIDE the component on purpose: the form reads this
-       * component's own state and handlers (`input`, `onInput`, `onSave`,
-       * `onClear`, `configured`, `status`, `statusStyle`, `shown`,
-       * `proxyBlock`, `primerBlock`, `view`, `writable`). Hoisting it to
-       * factory scope — as 0.7.0 did — leaves every one of those bindings
-       * unresolved: the slot entry throws
-       * `ReferenceError: input is not defined`, the Plugins page swaps the
-       * whole configuration section for an error boundary, and the API key
+       * component's own state and handlers (`keyBlock`, `keyDraft`,
+       * `keyStatus`, `onAdd`, `keyCount`, `keysLoading`, `proxyBlock`,
+       * `optionsBlock`, `primerBlock`). Hoisting it to factory scope — as 0.7.0
+       * did — leaves every one of those bindings unresolved: the slot entry
+       * throws `ReferenceError: input is not defined`, the Plugins page swaps
+       * the whole configuration section for an error boundary, and the API key
        * plus local-proxy fields silently disappear from the UI.
        * `test/client-render.test.js` renders both views to keep it here.
        * @returns the form column.
        */
       function body() {
         return React.createElement('div', { style: S.body },
-            React.createElement('p', { style: S.note }, 'jina_web_search / jina_read 等工具会优先使用这里保存的 key。免费 key 可在 ', React.createElement('a', { style: S.link, href: 'https://jina.ai/?sui=apikey', target: '_blank', rel: 'noreferrer' }, 'jina.ai'), ' 获取。'),
-            React.createElement('div', { style: S.row },
-              React.createElement('input', {
-                style: S.input,
-                type: 'password',
-                value: input,
-                placeholder: '粘贴 API key…',
-                onChange: onInput,
-                autoComplete: 'off',
-                spellCheck: false,
-                disabled: view !== undefined && !writable,
-              }),
-              React.createElement('button', {
-                style: S.button,
-                onClick: onSave,
-                disabled: view !== undefined && !writable,
-              }, '保存'),
-              configured
-                ? React.createElement('button', { style: S.ghostButton, onClick: onClear, disabled: !writable }, '清除')
-                : null),
-            status !== '' ? React.createElement('p', { style: statusStyle }, status) : null,
-            React.createElement('p', { style: S.note }, shown),
+            React.createElement('p', { style: S.note }, 'jina_web_search / jina_read 等工具会优先使用这里保存的 key，某个 key 失效或额度耗尽时自动丢弃并切换到下一个。免费 key 可在 ', React.createElement('a', { style: S.link, href: 'https://jina.ai/?sui=apikey', target: '_blank', rel: 'noreferrer' }, 'jina.ai'), ' 获取。'),
+            keyBlock,
             proxyBlock,
             optionsBlock,
             primerBlock,
-            view !== undefined && !writable ? React.createElement('p', { style: S.note }, '当前环境只读：key 由环境变量等来源提供，无法在此修改。') : null,
-            React.createElement('p', { style: S.note }, 'key 解析顺序：1. 工具参数 apiKey；2. 本页保存的 key（credential 引用 ' + CRED + '，由 dsh 凭据存储持久化）；3. 会话工作区的 jina-api-key.txt；4. dsh 主目录下的 jina-api-key.txt。保存后立即生效。'),
+            !keysLoading && keyCount > 0
+              ? React.createElement('p', { style: S.note }, '提示：key 明文只在本机保存（dsh 凭据存储，如 ~/.dsh/.credentials.yaml），本页不会读回已保存的值；失效或额度耗尽的 key 由插件自动丢弃，不需要手动管理。')
+              : null,
+            React.createElement('p', { style: S.note }, 'key 解析顺序：1. 工具参数 apiKey（单个，不轮换）；2. 本页添加的 key（保存在 dsh 凭据存储里，按添加顺序轮换）；3. 会话工作区的 jina-api-key.txt（每行一个 key）；4. dsh 主目录下的 jina-api-key.txt。添加后立即生效。'),
             React.createElement('p', { style: S.note }, '代理优先级：1. 本页「本地代理」保存的地址；2. 环境变量 JINA_PROXY_URL；3. Windows 系统代理（自动发现，端口变化会自愈）；4. 继承启动环境的 HTTP_PROXY / HTTPS_PROXY。只有 http(s) 代理可用于网络 helper。中国大陆网络环境下调用 Jina 需要代理；本地代理只监听端口、未开启系统代理时，请填上面的「本地代理」。'))
       }
 
       var title = 'Jina Tools'
-      var description = 'Jina AI 搜索/阅读/嵌入等工具的 API key、本地代理与阅读选项。'
+      var description = 'Jina AI 搜索/阅读/嵌入等工具的多个 API key（自动轮换、失效自动丢弃）、本地代理与阅读选项。'
 
       // The Plugins page draws the card's title, icon, and crumb itself and
       // asks a configuration entry for one of two views: `summary` is the

@@ -2,18 +2,19 @@
 
 # dsh-jina
 
-A [Jina AI](https://jina.ai/) plugin (bundle) for DeepSeek Harness: it exposes the full jina-cli API surface to the model as tool calls, and adds a configuration form on the Web **Plugins** page (on the `dsh-jina` bundle card) for your API key and a **local proxy address**; on older harnesses the same card falls back to **Settings → Plugins → Configure**.
+A [Jina AI](https://jina.ai/) plugin (bundle) for DeepSeek Harness: it exposes the full jina-cli API surface to the model as tool calls, and adds a configuration form on the Web **Plugins** page (on the `dsh-jina` bundle card) for **several API keys (with automatic failover when one runs out of credits)** and a **local proxy address**; on older harnesses the same card falls back to **Settings → Plugins → Configure**.
 
 ## Changelog
 
 > Only the latest release is listed here; the full version history lives in [change-log.en.md](./change-log.en.md).
 
-### 0.8.2 (2026-09-23)
+### 0.9.0 (2026-09-24)
 
-- **fix** **Closed the last two inconsistencies in error propagation** (0.8.0 had recorded them as "not changed for now"): the URL check in `jina_read` / `jina_screenshot` / `jina_datetime` used to **return a string** (`invalid url: undefined ...`), measured as **`isError: false`**, so the model could read it as data. The root cause is that the line was a **local pre-check** before `callJina` that never sent a request, so it had nothing to do with an upstream status code. It now **throws** (`requireUrlArg()`): the message names the tool, `"url"`, the type and value actually received (e.g. `(number) 42`), and adds `did you mean "url" instead of "uri"?` for a likely typo; it also moved above any side effect and is still zero requests.
-- **fix** The **OCR-without-a-key** path in `jina_read` likewise changed from "return a string" to **throw** (wording unchanged). It is a pre-emptive refusal rather than an API response, and the "no key detected, no request sent" promise still holds.
-- **change** **Upstream errors are routed by status code**: `401` (invalid/missing key) and `422` (illegal arguments) **throw** — the model has to change its key or its arguments; `0` (network/proxy), `402` (quota), `429` (rate limit) and `5xx` **stay returned** — their hint exists to be relayed to the user or retried later. `jina_primer`'s "the tool never throws" contract is unaffected.
-- **test** `tool-args.test.js` gains 10 cases: the four rejection shapes for the three URL tools (each asserting zero requests), a positive case proving a valid URL is still sent verbatim, OCR without a key still sending nothing, and four routing regressions — 401 throws / 422 throws / 429 returns / `jina_primer` never throws. Full suite: 114 tests (113 pass, 1 opt-in skip).
+- **feat** **Multiple API keys with automatic rotation and automatic discard**: the card has **one key input** — paste a key and click 添加, and you can keep adding; no individual key ever needs managing. A tool call resolves the stored keys into a **rotation pool**, and when a key answers **401 (revoked) / 402 (quota exhausted)** the next key serves the call — the operation completes instead of being interrupted mid-task. A switch is reported as one `[已自动切换 API key: …]` line appended to the tool result (never to a `json: true` payload).
+- **feat** **A key that cannot be used is discarded automatically**: 401, 402, and a key the health check finds with a **balance of zero or less** are deleted from the credential store by the plugin, so the pool cleans itself — which is why the card has **no remove control and shows nothing per key** (no plaintext, no fingerprint, no "which one is in use"). A rate limit (429) only parks the key for one minute; network/argument/upstream faults neither rotate nor discard. The `apiKey` parameter stays the "use exactly this one, never rotate" escape hatch.
+- **feat** **The key file may hold several keys**: `jina-api-key.txt` is now one key per line (blank lines and `#` comments ignored, duplicates collapsed); the historical single-line file still works, and several lines pasted into one credential slot are split the same way. Source precedence is unchanged — credential slots, then the workspace key file, then the dsh-home key file — and the first source that yields a key is the pool. Keys from a file or from a read-only environment variable are never deleted, only skipped.
+- **feat** **The page reports the key count and one total**: `/api/dsh-jina/primer` probes every key in the pool in parallel and returns only **how many keys it holds** (`keyCount`), **the total balance** (`balanceTotal`, the credits behind the surviving keys) and how many were discarded by this check (`discardedCount`) — **nothing per key**, and no usable/total fraction (no `keys[]`, no `usableCount`, no fingerprint, no identity, no individual balance). The probe also cleans up dead keys and updates the rotation state, so **a rate-limited key returns after a Refresh** with no restart. When the whole pool is exhausted, the error names every key it tried and the status each one answered.
+- **test** New `test/keys.test.js` (9 cases of pure policy: reference grammar, key-file parsing, status mapping, cooldown folding, rotation order, pool signature, source labels) and `test/multi-key.test.js` (28 fake-host integration cases: a 402 handing over to a backup key **and deleting it from the credential store**, 401 doing the same, 429 only parking, read-only and file-sourced keys never deleted, sticky preference and cooldown skipping, a three-key walk, no rotation on 422/5xx/network failure, an explicit `apiKey` never rotating, per-key reporting when the pool is exhausted, the file fallback with several lines, duplicate-key collapsing, an added key reaching the next call, and a primer route that returns only counts and the total while discarding a zero-balance key). `client-render.test.js` / `client-bundle.test.js` gained "exactly one input plus add", "nothing per key is rendered and there is no remove control", "usable count + key total + total balance, with no fraction and no identity" and the "the client's key pool must equal `keys.js` KEY_REFS" contract. Full suite: **160 tests (159 pass, 1 opt-in skip, 0 fail)**.
 
 ## Features
 
@@ -97,22 +98,75 @@ dsh plugin --profile web add ./jina-dsh-plugin
 dsh --profile web
 ```
 
-Then open the Web UI → Settings → **Plugins** → **Configuration** tab → expand the **Jina Tools** card → paste your API key → Save. Get a free key at https://jina.ai/.
+Then open the Web UI → Settings → **Plugins** → **Configuration** tab → expand the **Jina Tools** card → paste your key into the **API key** section → click 添加. You can **keep adding**: every click stores one more key, and the card never shows or asks you to manage an individual key. Get a free key at https://jina.ai/. **Add at least two**: when any key is revoked or runs out of credits the plugin discards it and switches to the next one, so the task is not interrupted (see below).
+
+## Updating
+
+The plugin is a profile dependency, so an upgrade is **make the profile fetch the new code again, then restart dsh**. For the `web` profile:
+
+1. Pull the new version into the profile (any one of these):
+
+   ```sh
+   # A. Re-resolve the GitHub dependency (recommended)
+   cd "$DSH_HOME/profiles/web"        # Windows: C:\Users\<you>\.dsh\profiles\web
+   pnpm update dsh-jina
+
+   # B. Remove and re-add (equivalent — both fetch the branch head)
+   dsh plugin --profile web remove dsh-jina
+   dsh plugin --profile web add github:minatoAI/jina-web-search-dsh-plugin
+
+   # C. Web UI: sidebar → Plugins → remove dsh-jina → install the GitHub URL above
+   ```
+
+2. **Restart** dsh so the new code is loaded:
+
+   ```sh
+   dsh --profile web
+   ```
+
+3. Check that it worked:
+
+   ```sh
+   # The installed copy's version (this repo bumps package.json on every release)
+   Get-Content "$DSH_HOME/profiles/web/node_modules/dsh-jina/package.json" | Select-String '"version"'
+   ```
+
+   Then open the card and click **Refresh** once to confirm it works (the "Key 总数 / 总余额" lines).
+
+> **Why a plain `pnpm install` usually does not upgrade**: a GitHub dependency is pinned in `pnpm-lock.yaml` to the commit resolved at install time, and `pnpm install` honours the lockfile; only `pnpm update dsh-jina` (or remove + add) re-resolves the branch head. Pinning at install time (`...#<commit-sha>`) behaves the same way — upgrading means explicitly switching to the new SHA.
+>
+> A local-folder install (`add ./jina-dsh-plugin`) never touches the remote: `git pull` in that directory and restart dsh.
 
 The same card carries **Local proxy (optional)**: if your proxy client only listens on a loopback port (no system proxy, no `HTTP_PROXY` environment variable), type its address there — e.g. `http://127.0.0.1:7897` (the scheme is optional) → Save, and the next tool call uses it. When the proxy moves to another port, update this field; no dsh restart required.
 
-The card's **API key / connection check** section shows the current key's identity (Jina account) and balance (credits), marks the key's source (saved on this page / key file / anonymous quota), and reports **the proxy address the check actually ran through**; click **Refresh** to re-check (saving or clearing the key or the proxy also triggers an automatic re-check). This data is served by the host-side plugin through the `/api/dsh-jina/primer` route (the same endpoint the `jina_primer` tool uses); **the plaintext key never leaves the host**, while the proxy address is plaintext configuration and is displayed on the page.
+The card's **API key / connection check** section reports only two things: **how many keys it holds** and **the total balance** (the credits behind the surviving keys), plus the connection state and **the proxy address the check actually ran through**; click **Refresh** to re-check (adding a key or saving the proxy also triggers an automatic re-check). **Nothing per key is shown** — no plaintext, no fingerprint, no "which one is in use", and no manual removal. This data is served by the host-side plugin through the `/api/dsh-jina/primer` route (the same endpoint the `jina_primer` tool uses); **the plaintext key never leaves the host**, while the proxy address is plaintext configuration and is displayed on the page.
 
-## API key resolution order
+## API key resolution, rotation and automatic discard
 
-Each tool call looks up the key in the following order (first hit wins):
+Each tool call resolves keys in the following order; **the first source that yields a key is that call's rotation pool** (every key inside a source joins the rotation, and later sources are not consulted):
 
-1. The `apiKey` tool-call parameter
-2. The key saved on the settings page (credential reference `JINA_API_KEY`, persisted by dsh's credential store, e.g. `~/.dsh/.credentials.yaml`)
-3. `jina-api-key.txt` in the session workspace
-4. `jina-api-key.txt` in the dsh home directory (`$DSH_HOME`, default `~/.dsh`)
+1. The `apiKey` tool-call parameter (**a single key, never rotated** — the "use exactly this one" escape hatch)
+2. The keys added on the card, in the order they were added (persisted by dsh's credential store, e.g. `~/.dsh/.credentials.yaml`; the same names work as environment variables, so headless profiles are covered too)
+3. `jina-api-key.txt` in the session workspace (**one key per line**; blank lines and `#` comments ignored)
+4. `jina-api-key.txt` in the dsh home directory (`$DSH_HOME`, default `~/.dsh`) (likewise one key per line)
 
-A key saved on the settings page takes effect immediately (no restart needed; resolved on every call). On HTTP 401 the plugin re-reads the file and retries once. Credential values are only ever sent up through `credentials.set`; no read endpoint returns the plaintext. You can also clear the key with one click on the page.
+### Rotation and discard rules
+
+| Upstream status | Meaning | Behaviour |
+| --- | --- | --- |
+| `401` | key revoked / expired | switch to the next key, and **discard that key from the credential store** |
+| `402` | quota exhausted | switch to the next key, and **discard that key** |
+| balance ≤ 0 | the health check finds the credits gone | **discard that key** |
+| `429` | rate limited | switch to the next key but **never discard** (temporary); it returns to the rotation after a one-minute cooldown |
+| `0` / `422` / `5xx` | network, arguments, upstream fault | **neither rotate nor discard** (another key cannot fix it and would only waste the rest of the pool) |
+
+- **Self-managing**: a usable key stays, an unusable one is discarded automatically — which is why the card has no remove control and shows nothing per key. The user only ever adds.
+- **Sticky preference**: the key that served the last success is tried first again, so a healthy pool never spends a request on a failing key.
+- **The switch is visible**: a mid-call switch appends one line such as `[已自动切换 API key: #1 (credential JINA_API_KEY) quota exhausted (HTTP 402), 已自动移除; switched to #2 (credential JINA_API_KEY_2). 可在 Plugins → dsh-jina 卡片里添加新的 key。]`; a `json: true` payload is never touched.
+- **A fully exhausted pool** reports every key it tried, its source and its status (e.g. `#1 (credential JINA_API_KEY) quota exhausted (HTTP 402), 已自动移除; #2 (workspace jina-api-key.txt line 2) rate limited (HTTP 429)`) and points at adding a key or topping up.
+- Adding a key takes effect immediately (no restart; resolved on every call, and credential values are only ever sent up through `credentials.set` — no read endpoint returns the plaintext).
+- The same key appearing in several slots or in the file is requested only once.
+- **Key files and read-only sources are never deleted**: a key from `jina-api-key.txt` (the plugin will not rewrite a user's file) and a reference supplied read-only by the launching environment (the seam refuses the write) are only skipped, never removed from disk.
 
 ## Local proxy (a local proxy client)
 
@@ -146,21 +200,24 @@ dsh plugin --profile web remove dsh-jina
 jina-dsh-plugin/
 ├── package.json       # manifest: "dsh": { "bundle": {"patch": ...}, "client": {"platform": "web"} }; the browser half is exported via exports["./client"] → ui/client.js
 ├── cordis.patch.yml   # composition layer: one dual-face row dsh-jina (host tools + browser card; an exact-package-name row name is a hard requirement of the client-modules scan)
-├── index.js           # host plugin: 12 tools (incl. dedicated jina_search_arxiv / jina_search_ssrn academic search) + network transport + JINA_API_KEY credential resolution + the jina-tools proxy and reader policy
+├── index.js           # host plugin: 12 tools (incl. dedicated jina_search_arxiv / jina_search_ssrn academic search) + network transport + the multi-key rotation pool (JINA_API_KEY / _2 … _5 + key files) + the jina-tools proxy and reader policy
+├── keys.js            # pure module: key-pool policy (credential refs / key-file parsing / rotation order and cooldowns / status labels; zero deps, unit-testable)
 ├── proxy.js           # pure module: proxy address normalization / precedence / reader-policy defaults / settings schema (zero deps, unit-testable)
 ├── primer.js          # pure module: jina_primer parsing/formatting logic (zero deps, unit-testable)
 ├── test/
 │   ├── primer.test.js        # jina_primer unit tests (auto-discovered by node --test)
 │   ├── proxy.test.js         # proxy policy unit tests
+│   ├── keys.test.js          # key-pool policy unit tests (rotation / cooldowns / parsing / discard decision)
+│   ├── multi-key.test.js     # mock-host multi-key integration tests (asserts Authorization per request and the failover)
 │   ├── plugin-proxy.test.js  # mock-host proxy integration tests (incl. an opt-in live-proxy case)
 │   ├── reader-headers.test.js# jina_read header contract tests (decodes the helper's stdin, asserts the headers really sent)
-│   ├── client-bundle.test.js # browser-bundle contract tests (syntax + registration id + settings transport + option wiring)
+│   ├── client-bundle.test.js # browser-bundle contract tests (syntax + registration id + settings transport + option and key-pool wiring)
 │   ├── client-render.test.js # renders both views for real in a VM (catches scoping/binding defects)
 │   └── tools.test.js         # jina_web_search model-facing contract tests (TDD)
 ├── ui/
 │   ├── package.json   # subpackage manifest (exports["./client"]; the dsh.client declaration now lives in the root manifest)
 │   ├── index.js       # empty host half (kept for the historical subpackage shape; the composition no longer references it)
-│   └── client.js      # prebuilt browser bundle: the "Jina Tools" card (API key + local proxy + reader options)
+│   └── client.js      # prebuilt browser bundle: the "Jina Tools" card (single key input + local proxy + reader options)
 ├── change-log.md      # full changelog (Simplified Chinese)
 ├── change-log.en.md   # full changelog (English)
 ├── README.md          # Simplified Chinese README
@@ -169,11 +226,11 @@ jina-dsh-plugin/
 
 ## Development notes
 
-- The host plugin only depends on Node built-ins and dsh host services (`fs`, `subprocess`, `tools`, `credentials`, `webServer`) — no third-party npm dependencies; credentials go through dsh's native credential seam (referencing `JINA_API_KEY`) and the configuration through the plugin's own `jina-tools` settings namespace (`proxyUrl` plus the `useOcr` / `imagePolicy` / `autoAltText` / `useSelectors` / three selector overrides reader policies), so it works with any profile composition out of the box.
+- The host plugin only depends on Node built-ins and dsh host services (`fs`, `subprocess`, `tools`, `credentials`, `webServer`) — no third-party npm dependencies; credentials go through dsh's native credential seam (the key pool references `JINA_API_KEY` / `JINA_API_KEY_2` … `JINA_API_KEY_10`; the seam stores one value per reference and no read endpoint returns a value, so "several keys" means "several references", and any POSIX identifier is a legal reference name — no harness change is needed) and the configuration through the plugin's own `jina-tools` settings namespace (`proxyUrl` plus the `useOcr` / `imagePolicy` / `autoAltText` / `useSelectors` / three selector overrides reader policies), so it works with any profile composition out of the box.
 - **The settings-seam contract (dsh 0.1.4 onward)**: `settings.register()` is gone — **a settings namespace *is* the Loader/profile composition entry id**, and the row this plugin inserts in `cordis.patch.yml` is exactly `jina-tools` (which is why the card's `NS` matches). The plugin declares its editable fields through `export const Config = createSettingsSchema()` in `index.js` (`proxy.js`, a zero-dependency hand-written node): every field node carries `meta.volatile: true`, and `'~standard': { version: 1, vendor: 'schemastery', validate }` is the harness's only entry point for resolving config (`resolveConfig()` requires a **synchronous plain object**; `vendor` must be `'schemastery'` or every save degrades into a full plugin remount). `validate()` builds one **cross-copy-safe volatile reference** per field (`Symbol.for('cosmokit.volatile.write')`); on save the harness only writes the new value into those references, so the object `apply(ctx, config)` captured keeps its identity, the plugin is never remounted, and it re-reads `settingsSnapshot(config)` on **every operation** (`toolSettingsOf()` normalizes "unset" into the documented defaults). Saving therefore takes effect immediately, with no restart — the same contract as the API key. The primer payload's `settingsLive` field is the health check for exactly this.
 - The client bundle is committed directly (`ui/client.js`), no build step — git installs work as-is. To change the UI, edit that file and restart. The registration id in the bundle's top-level `window.__ModuleLoader__.load` MUST equal the graph row id (the exact package name `dsh-jina`) — the module system matches registrations only by row id (a trailing `/client` excepted); registering under any other key (e.g. the old row name `dsh-jina/ui`) fails the whole page with `loaded without registering "dsh-jina"` + `Failed to load plugins`. The card registers into the `settings.plugin.item` slot declared by the Web settings package (Settings → Plugins → Configuration), the standard place for third-party plugin configuration.
 - **The `remote.<ns>` injection rule**: the gateway's `$mount` registers every Remote namespace as its **own cordis service**, so a client plugin must declare `remote.<ns>` (e.g. `remote.credentials`, `remote.settings`) in its own `inject` before reading that property — declaring only `'remote'` is not enough, the property access itself throws `cannot get property "remote.settings" without inject`, and the error reaching the `settings.plugin.item` slot boundary makes the whole card disappear (the 0.6.0 regression, now pinned by `test/client-bundle.test.js`). This plugin declares `inject = ['slots','remote','remote.credentials','remote.settings']`, and the read sites keep a try/catch so a missing service degrades to a notice instead of crashing the slot.
-- The key is managed through the credentials Remote namespace (`credentials.describe/set/unset`, with `credentials/reference-updated` forwarded by `remote`); the proxy field rides the `settings` Remote namespace (`remote.settings.describe/mutate`, each write fenced by the `revision` the page read, with external edits arriving as the forwarded `settings/document-updated`).
+- The keys are managed through the credentials Remote namespace (`credentials.describe/set/unset`, with `credentials/reference-updated` forwarded by `remote`): the card describes all ten slots in one batch to learn "configured / source / writable" for each (**a value is never returned** — it crosses the wire only on save), and the form is therefore **one input** — 添加 writes into the first free slot, while the host half uses `credentials.unset` to **discard** a slot that answers 401/402 or reports no credits left (the card itself never calls `unset`, and shows nothing per key). The `KEY_REFS` table in `ui/client.js` must match `keys.js` exactly (the credentials namespace has no enumeration, so the card can only describe reference names it writes down), pinned by `test/client-bundle.test.js`. The rotation/cooldown policy lives in `keys.js` (pure functions) and the host half re-resolves the whole pool on every operation (the same "resolve per call" contract the single key always had); `/api/dsh-jina/primer` probes every key in parallel, cleans up dead keys, and returns just four numbers — usable count, key count, total balance, discarded count. The proxy field rides the `settings` Remote namespace (`remote.settings.describe/mutate`, each write fenced by the `revision` the page read, with external edits arriving as the forwarded `settings/document-updated`).
 - The composition layer follows dsh conventions: one dual-face row `dsh-jina` carries both the host half and the browser half. The browser half is declared by the ROOT manifest's `dsh.client` (platform: web, graph edge `@deepseek-ai/dsh-api-remotes`) plus `exports["./client"]`; the host's client-modules service locates the root manifest by the row name (an exact package name) and wires it into the Web boot graph. Note the client-modules scan accepts only exact-package-name rows: subpath rows (e.g. `dsh-jina/ui`) are never scanned as client rows — the browser half must be declared at the package root.
 
 ## Tests
@@ -185,7 +242,8 @@ built-in test runner with zero dependencies:
 npm test   # same as node --test (auto-discovers test/*.test.js)
 ```
 
-- `test/proxy.test.js`, `test/primer.test.js`, `test/tools.test.js`: pure functions and the model-facing contract.
+- `test/proxy.test.js`, `test/primer.test.js`, `test/keys.test.js`, `test/tools.test.js`: pure functions and the model-facing contract (`keys.test.js` covers the reference grammar, key-file parsing, status mapping, cooldown folding, rotation order, the pool signature and source labels).
+- `test/multi-key.test.js`: drives the host half through a fake Cordis context, decodes the network helper's stdin for every request and asserts the `Authorization` header — covering a 402 handing over to a backup key **and deleting it from the credential store**, 401 doing the same, 429 only parking, read-only and file-sourced keys never deleted, sticky preference and cooldown skipping, a three-key walk, no rotation on 422/5xx/network failure, an explicit `apiKey` never rotating, per-key reporting for an exhausted pool, the key-file fallback with several lines, duplicate-key collapsing, an added key reaching the next call, and a primer route that returns only counts and the total while discarding a zero-balance key.
 - `test/reader-headers.test.js`: drives the host half through a fake Cordis context and **decodes the network helper's stdin**, asserting the Reader headers `jina_read` really sends — the three fixed parameters (`X-Preset: agent` / `X-Base: final` / `X-Timeout: 120`), the image policy, the selector group and its "empty result" retry, the OCR switch with `X-Page`, zero requests when no key can be resolved, the three alt-text constraints (opt-in, key-gated, mutually exclusive with OCR), JSON-envelope unwrapping with usage, verbatim fallback for an unparsable body, the schema's field declarations (all eight fields carry `meta.volatile`), the validator's tolerant surface, and "a save reaches the next call".
 - `test/plugin-proxy.test.js`: drives the host half through a fake Cordis context and asserts the `Config` export's volatile contract, proxy precedence, **the environment the network helper actually receives**, the error text, and the `/api/dsh-jina/primer` payload (including `settingsLive`) — plus "a proxy address saved on the card reaches the next call without a restart and without another registry probe". Its `JINA_LIVE_PROXY=1` case really spawns the helper and completes one Jina request (clean environment + the manual address, proving the saved address — not a leftover environment variable — carried it):
 
@@ -194,7 +252,7 @@ npm test   # same as node --test (auto-discovers test/*.test.js)
   ```
 
   Where child processes cannot be spawned (a sandboxed runner) that case skips itself with the reason.
-- `test/client-bundle.test.js`: parses the prebuilt `ui/client.js` and pins the registration id, the `jina-tools` key, the settings transport, and revision fencing — the bundle has no build step, so a syntax error would otherwise surface only at runtime.
+- `test/client-bundle.test.js`: parses the prebuilt `ui/client.js` and pins the registration id, the `jina-tools` key, the settings transport, revision fencing, the **single-input key form** (one `keyDraft` string + `firstFreeRef` + add, and the card itself never calls `unset`) and its agreement with `keys.js` — the bundle has no build step, so a syntax error would otherwise surface only at runtime.
 
 Fixtures use real captured r.jina.ai / ipinfo.io response shapes; tests cover
 parse tolerance, time-fact derivation, text/JSON rendering and the

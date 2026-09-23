@@ -19,11 +19,23 @@
  * (the `dsh-jina` bundle card) renders the form only when the two halves agree.
  *
  * The API key is resolved per call in this order:
- *   1. the tool's own `apiKey` parameter,
- *   2. the `JINA_API_KEY` credential (set from the web settings page,
- *      persisted by the host credential provider, e.g. `.credentials.yaml`),
- *   3. `jina-api-key.txt` in the calling session's workspace,
+ *   1. the tool's own `apiKey` parameter (one key, never rotated),
+ *   2. the credential slots `JINA_API_KEY`, `JINA_API_KEY_2` …
+ *      `JINA_API_KEY_10` (set from the web settings page, persisted by the host
+ *      credential provider, e.g. `.credentials.yaml`) — every configured slot
+ *      joins the pool, in slot order,
+ *   3. `jina-api-key.txt` in the calling session's workspace (one key per line),
  *   4. `jina-api-key.txt` in the dsh home directory (`$DSH_HOME` or `~/.dsh`).
+ *
+ * A pool, not a key, is what an operation uses: the key that served the last
+ * success leads, and a key that answers 401 / 402 (quota exhausted) / 429 is
+ * parked for a cooldown and the next key is tried, so one overdrawn account no
+ * longer interrupts a running task. A key that is definitively unusable is
+ * discarded outright: 401, 402 and a probe reporting a balance of zero delete
+ * that credential, so the pool cleans itself and the user never manages a list.
+ * A switch made mid-call is reported in the result; a pool that is entirely
+ * exhausted names every key it tried and the status each one answered.
+ * `keys.js` owns the pure rotation policy.
  *
  * Network transport: the Jina endpoints are contacted through a small
  * `node -e` fetch helper spawned via the host `subprocess` service. The
@@ -43,6 +55,11 @@
  */
 
 import { homedir } from 'node:os'
+import {
+  KEY_FILE, KEY_REFS, clearKeyState, describeKeyStatus, isKeyFailoverStatus,
+  keyPoolSignature, keyRotationOrder, keySourceLabel, keyStateAfter, keyStatusOf,
+  parseKeyList,
+} from './keys.js'
 import { buildPrimer, formatPrimer, parseIpInfo, parseJinaRoot } from './primer.js'
 import {
   DEFAULT_REMOVE_SELECTORS, DEFAULT_TARGET_SELECTORS, PROXY_ENV_VAR,
@@ -117,14 +134,23 @@ export function apply(ctx, config) {
   const IPINFO = 'https://ipinfo.io/json'
   const SEARCH = 'https://svip.jina.ai/'
   const API = 'https://api.jina.ai'
-  const KEY_FILE = 'jina-api-key.txt'
-  const CRED_REF = 'JINA_API_KEY'
   const MAX_OUT = 1500000
 
   let nodePath
-  let fileKeyCache = { text: undefined, at: 0 }
+  /**
+   * The key-file fallback, cached 30s like the single-key version was: the
+   * parsed keys of the first non-empty candidate file, or `[]`. `undefined`
+   * means "not read yet". The 401 path clears it so a file edited mid-session
+   * is picked up without waiting the cache out.
+   */
+  let filePoolCache = { keys: undefined, at: 0 }
   let keyDiag = ''
-  let keyKind
+  /**
+   * Rotation state for the pool currently resolved: a signature (so saving or
+   * clearing a key resets it), one state per pool index, and the sticky
+   * preferred index. In-memory only — a restart starts from the first slot.
+   */
+  let keyPoolState = { signature: 0, states: [], active: 0 }
   let proxyCache = { text: undefined, at: 0, done: false }
   /**
    * The resolved `jina-tools` config for this plugin instance (see the `Config`
@@ -213,75 +239,176 @@ export function apply(ctx, config) {
   }
 
   /**
-   * Resolve the `JINA_API_KEY` credential. Per-operation by contract: the
-   * credential seam documents that consumers re-resolve at each operation so
-   * a changed credential reaches the next operation without a restart.
-   * @returns the credential value, or undefined while unconfigured/absent.
+   * Resolve the rotation pool for one operation.
+   *
+   * Per-operation by contract: the credential seam documents that consumers
+   * re-resolve at each operation so a changed credential reaches the next
+   * operation without a restart. Every configured slot is resolved (one value
+   * each — the seam stores one value per reference and never reads one back),
+   * and the first source that yields at least one key wins, exactly as the
+   * single-key lookup of 0.8.x did; the only change is that a source may now
+   * contribute several keys and that the file may hold one key per line.
+   *
+   * @returns the pool, as `{ value, source, ref?, line? }` entries in try order.
    */
-  async function credentialKey() {
-    try {
-      const svc = ctx.get('credentials')
-      if (svc === undefined) return undefined
-      const resolved = await svc.resolve(CRED_REF)
-      return resolved && resolved.value ? resolved.value : undefined
-    } catch (err) { return undefined }
-  }
-
-  /** API key: credential, then workspace file, then dsh-home file. */
-  async function loadKey() {
-    let value
-    let kind
-    const attempts = []
+  async function loadKeyPool() {
+    const keys = []
+    const seen = new Set()
+    const configured = []
+    let unset = 0
+    const notes = []
+    const push = (raw, entry) => {
+      const value = String(raw).trim()
+      if (value === '' || seen.has(value)) return
+      seen.add(value)
+      keys.push({ ...entry, value })
+    }
     try {
       const svc = ctx.get('credentials')
       if (svc === undefined) {
-        attempts.push('credential service absent')
+        notes.push('credential service absent')
       } else {
-        const resolved = await svc.resolve(CRED_REF)
-        if (resolved && resolved.value) {
-          value = resolved.value
-          kind = 'credential'
-          attempts.push('credential ' + CRED_REF + ': found (source ' + String(resolved.source) + ')')
-        } else {
-          attempts.push('credential ' + CRED_REF + ': not set')
+        for (const ref of KEY_REFS) {
+          try {
+            const resolved = await svc.resolve(ref)
+            if (resolved && resolved.value) {
+              // A slot may itself hold several keys (one per line) — a
+              // hand-edited `.credentials.yaml` block scalar, or a key pasted
+              // as a list. A real key never contains a newline, so splitting is
+              // free and the whole pool keeps one parsing rule.
+              const lines = parseKeyList(resolved.value)
+              for (const value of lines) push(value, { source: 'credential', ref })
+              configured.push(ref + '=' + String(resolved.source) + (lines.length > 1 ? '×' + lines.length : ''))
+            } else {
+              unset++
+            }
+          } catch (err) {
+            configured.push(ref + '=' + String((err && err.message) || err))
+          }
         }
       }
     } catch (err) {
-      attempts.push('credential ' + CRED_REF + ': ' + String((err && err.message) || err))
+      notes.push('credential lookup: ' + String((err && err.message) || err))
     }
-    if (value === undefined) {
+    if (keys.length === 0) {
       // File sources: cached 30s; the 401 path invalidates and re-reads.
-      if (fileKeyCache.text !== undefined && Date.now() - fileKeyCache.at < 30000) {
-        attempts.push('file cache: hit')
-        value = fileKeyCache.text
-        kind = 'file'
-      } else {
+      if (filePoolCache.keys === undefined || Date.now() - filePoolCache.at >= 30000) {
         const root = resolveRoot()
         const home = dshHome()
         const candidates = [
-          { kind: 'workspace abs', path: root + '\\' + KEY_FILE, opts: undefined },
-          { kind: 'workspace rel+cwd', path: KEY_FILE, opts: { cwd: root } },
-          { kind: 'workspace rel', path: KEY_FILE, opts: undefined },
-          { kind: 'home abs', path: home + '\\' + KEY_FILE, opts: undefined },
-          { kind: 'home rel+cwd', path: KEY_FILE, opts: { cwd: home } },
+          { source: 'workspace-file', path: root + '\\' + KEY_FILE, opts: undefined },
+          { source: 'workspace-file', path: KEY_FILE, opts: { cwd: root } },
+          { source: 'workspace-file', path: KEY_FILE, opts: undefined },
+          { source: 'home-file', path: home + '\\' + KEY_FILE, opts: undefined },
+          { source: 'home-file', path: KEY_FILE, opts: { cwd: home } },
         ]
+        let found
         for (const c of candidates) {
           try {
             const target = await ctx.fs.resolve(c.path, c.opts)
-            const raw = await ctx.fs.readText(target)
-            const trimmed = String(raw).trim()
-            if (trimmed !== '') { value = trimmed; kind = 'file'; attempts.push(c.kind + ': found'); break }
-            attempts.push(c.kind + ': empty file')
+            const lines = parseKeyList(await ctx.fs.readText(target))
+            if (lines.length > 0) { found = { ...c, lines }; break }
+            notes.push(c.source + ': empty file')
           } catch (err) {
-            attempts.push(c.kind + ': ' + String((err && err.message) || err))
+            notes.push(c.source + ': ' + String((err && err.message) || err))
           }
         }
-        fileKeyCache = { text: value, at: Date.now() }
+        filePoolCache = {
+          keys: found === undefined
+            ? []
+            : found.lines.map((value, i) => ({ value, source: found.source, line: i + 1 })),
+          at: Date.now(),
+        }
+        if (found !== undefined) notes.push(found.source + ': ' + found.lines.length + ' key(s)')
+      } else {
+        notes.push('file cache: hit (' + filePoolCache.keys.length + ' key(s))')
       }
+      for (const entry of filePoolCache.keys) push(entry.value, entry)
     }
-    keyDiag = 'credential ' + CRED_REF + ' | ' + attempts.join(' | ')
-    keyKind = kind
-    return value
+    // Compact on purpose: the diagnosis rides inside a user-facing error, and
+    // listing every one of the ten unset slots would drown the useful part.
+    keyDiag = 'credential slots: ' + (configured.length > 0
+      ? configured.join(', ') + ' (' + unset + ' unset)'
+      : 'none of ' + KEY_REFS.length + ' set')
+      + (notes.length > 0 ? ' | key file: ' + notes.join('; ') : '')
+    return keys
+  }
+
+  /** The first key of the pool — what a caller that only needs "a key exists" uses. */
+  async function loadKey() {
+    const keys = await loadKeyPool()
+    return keys.length > 0 ? keys[0].value : undefined
+  }
+
+  /**
+   * The rotation state for one resolved pool.
+   *
+   * A changed pool (a key added, discarded, replaced or cleared) resets the
+   * cursor to the first slot and the cooldowns: the signature is what proves
+   * the pool is the same one the states describe, a stale index would park the
+   * wrong key, and re-verifying from the front is the honest reading of "the
+   * pool changed, look again".
+   * @param pool - the resolved pool.
+   * @returns the live state object for that pool.
+   */
+  function keyStateFor(pool) {
+    const signature = keyPoolSignature(pool)
+    if (keyPoolState.signature !== signature || keyPoolState.states.length !== pool.length) {
+      keyPoolState = { signature, states: pool.map(() => clearKeyState()), active: 0 }
+    }
+    return keyPoolState
+  }
+
+  /**
+   * Discard one key that cannot serve a call any more.
+   *
+   * This is the whole "management" story of the pool: 401, 402 and a zero
+   * balance delete the credential, so the user only ever adds keys. Only a
+   * credential-sourced slot can be deleted — a key that came from a
+   * `jina-api-key.txt` file is left alone (the plugin will not rewrite a user's
+   * file) and a reference the launching environment supplies read-only is
+   * refused by the seam; both fall back to the cooldown machinery.
+   *
+   * @param entry - the pool entry to discard.
+   * @returns whether the credential was actually removed.
+   */
+  async function discardKey(entry) {
+    if (entry === null || typeof entry !== 'object' || entry.source !== 'credential' || typeof entry.ref !== 'string') return false
+    try {
+      const svc = ctx.get('credentials')
+      if (svc === undefined || typeof svc.unset !== 'function') return false
+      await svc.unset(entry.ref)
+      return true
+    } catch (err) {
+      return false
+    }
+  }
+
+  /** The user-facing account of one failed key, for an error or a switch note. */
+  function keyAttemptLabel(attempt) {
+    const index = typeof attempt.index === 'number' ? attempt.index + 1 : '?'
+    return '#' + index + '（' + keySourceLabel(attempt.entry) + '）' + describeKeyStatus(keyStatusOf(attempt.status), attempt.status)
+      + (attempt.discarded === true ? '，已自动移除' : '')
+  }
+
+  /** The one-line note a successful call carries after a mid-call key switch. */
+  function keySwitchNote(res) {
+    if (res === null || typeof res !== 'object' || res.keySwitch === undefined || res.keySwitch === null) return ''
+    const message = res.keySwitch.message
+    return typeof message === 'string' && message !== '' ? '\n\n[' + message + ']' : ''
+  }
+
+  /**
+   * Append the key-switch note to a formatted tool result. Raw JSON output
+   * (`json: true`) is never touched — a note appended to JSON would no longer
+   * parse, and the switch is a fact about the run, not part of the payload.
+   * @param text - the formatted result.
+   * @param res - the response the result came from.
+   * @param asJson - whether the caller asked for the raw payload.
+   * @returns the result, with the note when one applies.
+   */
+  function withKeyNote(text, res, asJson) {
+    return asJson === true ? text : text + keySwitchNote(res)
   }
 
   /** System proxy (the local VPN): read the user-level WinINET registry settings. */
@@ -435,27 +562,106 @@ export function apply(ctx, config) {
     return withProxy(parse(r), retryPlan)
   }
 
-  /** Full call: key handling + auth header + 401 key refresh. */
+  /**
+   * Walk one pool until a key serves the call.
+   *
+   * A failover status (401/402/429) parks that key for its cooldown and moves
+   * on; any other failure stops the walk, because rotating cannot help and
+   * would spend the rest of the pool on a non-key problem. `tried` dedupes by
+   * value, so a key that appears twice in one operation is never requested
+   * twice.
+   *
+   * @param pool - the resolved pool.
+   * @param state - the rotation state for that pool.
+   * @param attempts - collector for the failed attempts, for the diagnosis.
+   * @param tried - the key values already requested in this operation.
+   * @param mkRequest - builds one request for a key (the caller's own headers).
+   * @returns `{ res, index, fatal }` — the response that settled the walk, and
+   *   whether it was a non-failover failure (the walk must not continue).
+   */
+  async function walkKeyPool(pool, state, attempts, tried, mkRequest) {
+    let last
+    for (const index of keyRotationOrder(pool.length, state.active, state.states, Date.now())) {
+      const entry = pool[index]
+      if (tried.has(entry.value)) continue
+      tried.add(entry.value)
+      const res = await jinaRequest(mkRequest(entry.value))
+      if (res.ok) {
+        state.active = index
+        state.states[index] = clearKeyState()
+        return { res, index, fatal: false }
+      }
+      if (!isKeyFailoverStatus(res.status)) return { res, index, fatal: true }
+      // A revoked or overdrawn key is discarded, not parked: the user only ever
+      // adds keys, the plugin keeps the pool clean. 429 stays (temporary).
+      const discarded = res.status === 401 || res.status === 402 ? await discardKey(entry) : false
+      attempts.push({ index, status: res.status, entry, discarded })
+      state.states[index] = keyStateAfter(state.states[index], res.status, Date.now())
+      last = res
+    }
+    return { res: last, index: -1, fatal: false }
+  }
+
+  /**
+   * Full call: key pool + auth header + automatic failover.
+   *
+   * An explicit `apiKey` parameter is the caller's own choice: it is used
+   * alone, with no rotation (there is nothing to rotate to). Otherwise the
+   * resolved pool is walked, the last successful key leads the next call, and
+   * a switch made mid-call is reported on the result as `keySwitch` so the
+   * tools can tell the user that a key was overdrawn.
+   */
   async function callJina(opts) {
     const headers = {}
     for (const k of Object.keys(opts.headers || {})) headers[k] = opts.headers[k]
     const explicit = opts.apiKey !== undefined && opts.apiKey !== null && opts.apiKey !== ''
-    let key = explicit ? String(opts.apiKey) : await loadKey()
-    if (key) headers.Authorization = 'Bearer ' + key
-    if (opts.needsKey && !key) {
-      return { ok: false, status: 401, text: 'Jina API key required for this command. Set it in the DSH settings page (Jina Tools) or put it in ' + KEY_FILE + ' in the session workspace or the dsh home directory (one line). Get a free key at https://jina.ai/?sui=apikey' + (keyDiag ? ' [key lookup: ' + keyDiag + ']' : '') }
-    }
     const mk = () => ({ url: opts.url, method: opts.method || 'POST', headers, body: opts.body, timeoutMs: opts.timeoutMs, signal: opts.signal, ...(opts.proxy !== undefined ? { proxy: opts.proxy } : {}) })
-    let res = await jinaRequest(mk())
-    if (!res.ok && res.status === 401 && !explicit) {
-      fileKeyCache = { text: undefined, at: 0 }
-      const fresh = await loadKey()
-      if (fresh && fresh !== key) {
-        headers.Authorization = 'Bearer ' + fresh
-        res = await jinaRequest(mk())
+    if (explicit) {
+      headers.Authorization = 'Bearer ' + String(opts.apiKey)
+      return jinaRequest(mk())
+    }
+    const pool = await loadKeyPool()
+    if (pool.length === 0) {
+      if (opts.needsKey) {
+        return { ok: false, status: 401, text: 'Jina API key required for this command. Save one or more keys in the DSH settings page (Plugins → dsh-jina → API key), or put one key per line in ' + KEY_FILE + ' in the session workspace or the dsh home directory. Get a free key at https://jina.ai/?sui=apikey' + (keyDiag ? ' [key lookup: ' + keyDiag + ']' : '') }
+      }
+      return jinaRequest(mk())
+    }
+    // The walk reuses the caller's headers and one request shape; only the
+    // Authorization header changes between keys.
+    const mkKeyRequest = (key) => ({ ...mk(), headers: { ...headers, Authorization: 'Bearer ' + key } })
+    const state = keyStateFor(pool)
+    const attempts = []
+    const tried = new Set()
+    let outcome = await walkKeyPool(pool, state, attempts, tried, mkKeyRequest)
+    if (outcome.res !== undefined && outcome.res.ok) {
+      if (attempts.length > 0) outcome.res.keySwitch = keySwitchOf(pool, attempts, outcome.index)
+      return outcome.res
+    }
+    if (outcome.fatal) return attempts.length > 0 ? { ...outcome.res, keyAttempts: attempts } : outcome.res
+    // Every key answered a failover status. Re-read the sources once before
+    // giving up: the fix (a corrected credential or key file) may have landed
+    // while this call was running, which is the case the old 401 re-read served.
+    filePoolCache = { keys: undefined, at: 0 }
+    const refreshed = await loadKeyPool()
+    if (refreshed.length > 0 && refreshed.some((entry) => !tried.has(entry.value))) {
+      const freshState = keyStateFor(refreshed)
+      outcome = await walkKeyPool(refreshed, freshState, attempts, tried, mkKeyRequest)
+      if (outcome.res !== undefined && outcome.res.ok) {
+        if (attempts.length > 0) outcome.res.keySwitch = keySwitchOf(refreshed, attempts, outcome.index)
+        return outcome.res
       }
     }
-    return res
+    return outcome.res === undefined ? { ok: false, status: 0, text: 'no API key could be tried' } : { ...outcome.res, keyAttempts: attempts }
+  }
+
+  /** The note describing a switch: which keys failed, and which one took over. */
+  function keySwitchOf(pool, attempts, index) {
+    const failed = attempts.map(keyAttemptLabel).join('；')
+    return {
+      index,
+      message: '已自动切换 API key：' + failed + '，改用 #' + (index + 1) + '（' + keySourceLabel(pool[index]) + '）。可在 Plugins → dsh-jina 卡片里添加新的 key。',
+    }
   }
 
   function describeJinaError(res) {
@@ -476,6 +682,14 @@ export function apply(ctx, config) {
       if (hint !== '') msg += ' ' + hint
     }
     if (status >= 500) msg = 'Jina API server error (HTTP ' + status + '). Retry in a moment; status: https://status.jina.ai'
+    // The pool's own account of what it tried: a quota error on a single key
+    // reads very differently once the user can see every saved key was tried.
+    if (Array.isArray(res.keyAttempts) && res.keyAttempts.length > 0) {
+      const tried = res.keyAttempts.map(keyAttemptLabel).join('；')
+      msg += '\nAPI key 轮换：已依次尝试 ' + res.keyAttempts.length + ' 个 key —— ' + tried + '。'
+        + (res.keyAttempts.length > 1 ? '所有已保存的 key 都已尝试。' : '')
+        + '修复：在 Plugins → dsh-jina 卡片里添加可用的 key（https://jina.ai/?sui=apikey），或为已耗尽的账号充值（https://jina.ai/api-dashboard/billing）。'
+    }
     if (body) msg += '\nServer said: ' + body
     return msg
   }
@@ -775,7 +989,7 @@ export function apply(ctx, config) {
       body, timeoutMs: 60000, needsKey: true, apiKey: args.apiKey, signal,
     })
     if (!res.ok) return failJina(res)
-    return fmtSearch(res.text, args.json === true)
+    return withKeyNote(fmtSearch(res.text, args.json === true), res, args.json === true)
   }
 
   ctx.tools.register({
@@ -964,7 +1178,7 @@ export function apply(ctx, config) {
           + (payload.published !== '' ? '\nPublished Time: ' + payload.published : '')
           + '\n\nMarkdown Content:\n' + out
       }
-      return out + usageFooter(res.text)
+      return out + usageFooter(res.text) + keySwitchNote(res)
     },
   })
 
@@ -991,7 +1205,7 @@ export function apply(ctx, config) {
         body: { url: String(args.url) }, timeoutMs: 120000, needsKey: true, apiKey: args.apiKey, signal,
       })
       if (!res.ok) return failJina(res)
-      return fmtScreenshot(res.text)
+      return fmtScreenshot(res.text) + keySwitchNote(res)
     },
   })
 
@@ -1017,7 +1231,7 @@ export function apply(ctx, config) {
         body: { url: String(args.url) }, timeoutMs: 60000, needsKey: false, signal,
       })
       if (!res.ok) return failJina(res)
-      return fmtDatetime(res.text, args.json === true)
+      return withKeyNote(fmtDatetime(res.text, args.json === true), res, args.json === true)
     },
   })
 
@@ -1044,7 +1258,7 @@ export function apply(ctx, config) {
         body: { q: String(args.query), query_expansion: true }, timeoutMs: 60000, needsKey: true, apiKey: args.apiKey, signal,
       })
       if (!res.ok) return failJina(res)
-      return fmtExpand(res.text, args.json === true)
+      return withKeyNote(fmtExpand(res.text, args.json === true), res, args.json === true)
     },
   })
 
@@ -1076,7 +1290,7 @@ export function apply(ctx, config) {
         body, timeoutMs: 90000, needsKey: true, apiKey: args.apiKey, signal,
       })
       if (!res.ok) return failJina(res)
-      return fmtEmbed(res.text, args.json === true)
+      return withKeyNote(fmtEmbed(res.text, args.json === true), res, args.json === true)
     },
   })
 
@@ -1109,7 +1323,7 @@ export function apply(ctx, config) {
         body, timeoutMs: 90000, needsKey: true, apiKey: args.apiKey, signal,
       })
       if (!res.ok) return failJina(res)
-      return fmtRerank(res.text, args.documents, args.json === true)
+      return withKeyNote(fmtRerank(res.text, args.documents, args.json === true), res, args.json === true)
     },
   })
 
@@ -1140,7 +1354,7 @@ export function apply(ctx, config) {
         body, timeoutMs: 90000, needsKey: true, apiKey: args.apiKey, signal,
       })
       if (!res.ok) return failJina(res)
-      return fmtClassify(res.text, args.json === true)
+      return withKeyNote(fmtClassify(res.text, args.json === true), res, args.json === true)
     },
   })
 
@@ -1173,7 +1387,7 @@ export function apply(ctx, config) {
         body, timeoutMs: 120000, needsKey: true, apiKey: args.apiKey, signal,
       })
       if (!res.ok) return failJina(res)
-      return fmtPdf(res.text, args.json === true)
+      return withKeyNote(fmtPdf(res.text, args.json === true), res, args.json === true)
     },
   })
 
@@ -1211,10 +1425,49 @@ export function apply(ctx, config) {
   })
 
   // ---- web settings health-check endpoint -----------------------------------
-  // The Jina Tools card asks this route for the key's identity + balance
-  // (jina-cli `primer`) and for the proxy actually in effect. Registered when
-  // the deployment composes a web server (the web profile); profiles without
-  // one simply never get the route. The API key itself never leaves the host.
+  // The Jina Tools card asks this route how many keys it holds and how many can
+  // serve a call, plus the total credits behind them (jina-cli `primer`), and
+  // for the proxy actually in effect. Registered when the deployment composes a
+  // web server (the web profile); profiles without one simply never get the
+  // route. Nothing per key leaves the host: the payload carries counts and one
+  // total, never a key, its fingerprint, or its individual balance — and a key
+  // that answers 401/402 or reports no credits left is discarded here, so the
+  // page never has to offer the user a list to manage.
+
+  /**
+   * Probe one key against the Reader root — the same call jina-cli `primer`
+   * makes. One key, one request, no rotation: the card must learn what each
+   * key answers, so the pool walk would be exactly the wrong tool here.
+   * @param key - the key value, or undefined for the anonymous probe.
+   * @param signal - optional cancellation.
+   * @returns the transport result.
+   */
+  function probeKey(key, signal) {
+    const headers = { Accept: 'application/json' }
+    if (key !== undefined && key !== null && key !== '') headers.Authorization = 'Bearer ' + String(key)
+    return jinaRequest({ url: READER, method: 'GET', headers, body: undefined, timeoutMs: 30000, signal })
+  }
+
+  /**
+   * The identity and balance a primer response carries.
+   * @param text - the raw response body.
+   * @returns `{ parsed, authenticatedAs, balanceLeft }` — `parsed` is false
+   *   when the body was not the expected JSON shape.
+   */
+  function primerData(text) {
+    try {
+      const data = JSON.parse(text)
+      const d = (data && typeof data === 'object' && data.data && typeof data.data === 'object') ? data.data : data
+      return {
+        parsed: true,
+        authenticatedAs: d !== null && typeof d === 'object' && typeof d.authenticatedAs === 'string' ? d.authenticatedAs : '',
+        balanceLeft: d !== null && typeof d === 'object' && typeof d.balanceLeft === 'number' ? d.balanceLeft : null,
+      }
+    } catch (err) {
+      return { parsed: false, authenticatedAs: '', balanceLeft: null }
+    }
+  }
+
   ctx.inject(['webServer'], (rpcCtx) => {
     rpcCtx.webServer.register({
       kind: 'exact',
@@ -1225,38 +1478,70 @@ export function apply(ctx, config) {
           res.end()
           return
         }
-        const key = await loadKey()
-        const out = await callJina({
-          url: READER, method: 'GET',
-          headers: { Accept: 'application/json' },
-          body: undefined, timeoutMs: 30000, needsKey: false, apiKey: key,
-        })
-        // What the probe ran through, plus what the card has stored, so the
-        // page can show the effective address even when the probe failed.
-        // `settingsLive` is the health check for the settings seam itself: it is
-        // true only while the harness handed `apply` the resolved volatile
-        // references, the one state in which a saved field reaches the next call
-        // (and, on this harness generation, the card's controls are enabled).
-        const proxy = out.proxy || null
-        const configured = settingProxy()
-        const extra = { proxy, proxyConfigured: configured, settingsLive: settingsAreLive(settingsConfig) }
+        const pool = await loadKeyPool()
+        const state = keyStateFor(pool)
+        const activeIndex = pool.length === 0 ? -1 : Math.min(state.active, pool.length - 1)
+        // One probe per key, in parallel: this is where the pool is kept clean.
+        const probes = await Promise.all(pool.map((entry) => probeKey(entry.value)))
+        const discarded = []
+        const survived = []
+        const counts = { keyCount: 0, balanceTotal: null }
+        await Promise.all(pool.map(async (entry, index) => {
+          const probe = probes[index]
+          const ok = probe.ok === true
+          const data = ok ? primerData(probe.text) : { authenticatedAs: '', balanceLeft: null }
+          // A key that cannot serve a call is deleted, not listed: 401, 402, or
+          // a healthy-looking probe that reports no credits left. Anything else
+          // (a rate limit, a network failure) only parks it for a cooldown —
+          // discarding a working key over a transient failure would be wrong.
+          const exhausted = ok && typeof data.balanceLeft === 'number' && data.balanceLeft <= 0
+          const doomed = !ok ? (probe.status === 401 || probe.status === 402) : exhausted
+          if (doomed && await discardKey(entry)) discarded.push(entry)
+          survived[index] = !doomed
+          if (!doomed) counts.keyCount++
+          if (!doomed && typeof data.balanceLeft === 'number') {
+            counts.balanceTotal = (counts.balanceTotal === null ? 0 : counts.balanceTotal) + data.balanceLeft
+          }
+          // The card's refresh is also a health check: a key that answers here
+          // updates the same rotation state the failover walk uses, so topping
+          // an account up clears its cooldown without a restart.
+          state.states[index] = ok ? clearKeyState() : keyStateAfter(state.states[index], probe.status, Date.now())
+        }))
+        // The headline probe answers "can this profile reach Jina at all" and
+        // must describe a key that is still there: the first surviving key whose
+        // probe worked, else the first surviving key, else — nothing left — the
+        // anonymous probe.
+        const okIndex = probes.findIndex((probe, index) => survived[index] === true && probe.ok === true)
+        const outIndex = okIndex >= 0 ? okIndex : survived.indexOf(true)
+        const out = outIndex >= 0 ? probes[outIndex] : await probeKey(undefined)
+        const probed = outIndex < 0 ? undefined : pool[outIndex]
+        // The page shows the pool size and one total, never anything per key and
+        // never a usable/total fraction — the host discards what cannot serve a
+        // call, so the count it reports is the count that matters.
+        // `balanceTotal` is null when no key reported a balance, so the page can
+        // say "unknown" instead of "0".
+        const extra = {
+          proxy: out.proxy || null,
+          proxyConfigured: settingProxy(),
+          settingsLive: settingsAreLive(settingsConfig),
+          keyCount: counts.keyCount,
+          balanceTotal: counts.balanceTotal,
+          discardedCount: discarded.length,
+        }
         let payload
         if (out.ok) {
-          try {
-            const data = JSON.parse(out.text)
-            const d = (data && typeof data === 'object' && data.data && typeof data.data === 'object') ? data.data : data
-            payload = {
-              ok: true,
-              status: out.status,
-              authenticatedAs: typeof d.authenticatedAs === 'string' ? d.authenticatedAs : '',
-              balanceLeft: typeof d.balanceLeft === 'number' ? d.balanceLeft : null,
-              keyFound: key !== undefined,
-              keyKind: keyKind,
-              ...extra,
-            }
-          } catch (err) {
-            payload = { ok: false, status: out.status, error: 'unexpected primer response shape: ' + String((err && err.message) || err), ...extra }
-          }
+          const data = primerData(out.text)
+          payload = data.parsed
+            ? {
+                ok: true,
+                status: out.status,
+                authenticatedAs: data.authenticatedAs,
+                balanceLeft: data.balanceLeft,
+                keyFound: probed !== undefined,
+                keyKind: probed === undefined ? undefined : (probed.source === 'credential' ? 'credential' : 'file'),
+                ...extra,
+              }
+            : { ok: false, status: out.status, error: 'unexpected primer response shape', ...extra }
         } else {
           payload = { ok: false, status: out.status, error: describeJinaError(out), ...extra }
         }

@@ -24,6 +24,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { readFile } from 'node:fs/promises'
 import { Script } from 'node:vm'
+import { KEY_REFS } from '../keys.js'
 
 const SOURCE = await readFile(new URL('../ui/client.js', import.meta.url), 'utf8')
 
@@ -114,4 +115,48 @@ test('client bundle: the reader options ride the same namespace and write path',
   const mutations = SOURCE.match(/\.mutate\(/g) || []
   assert.equal(mutations.length, 1, 'exactly one settings write path')
   assert.match(SOURCE, /mutate\(NS,\s*ops,\s*proxyView\.revision\)/)
+})
+
+test('client bundle: the key pool is the same reference list the host resolves', () => {
+  // The credentials namespace has no enumeration, so the card must name the
+  // references itself — and a drift from keys.js would leave a slot the host
+  // never reads, or a key the card cannot save.
+  const declared = /var KEY_REFS = \[([^\]]*)\]/.exec(SOURCE)
+  assert.ok(declared, 'the bundle must declare the key pool')
+  const refs = declared[1].split(',').map((part) => part.trim().replace(/^'|'$/g, '')).filter((part) => part !== '')
+  assert.deepEqual(refs, KEY_REFS)
+  assert.match(SOURCE, /credentials\.describe\(KEY_REFS\)/, 'the card describes the whole pool in one batch')
+})
+
+test('client bundle: one input adds to the first free slot, and nothing is removable by hand', () => {
+  // The single-input form is the whole point: a regression here would bring back
+  // one input per slot, or a per-key list the user has to manage.
+  assert.match(SOURCE, /var \[keyDraft, setKeyDraft\] = React\.useState\(''\)/, 'one draft, not a map of drafts')
+  assert.match(SOURCE, /function firstFreeRef\(\)/)
+  assert.match(SOURCE, /credentials\.set\(ref, value\)/)
+  assert.match(SOURCE, /KEY_REFS\.indexOf\(ref\)/, 'a reference-updated event for any slot must refresh the card')
+  // The host discards a dead key; the page must never offer a remove control.
+  assert.equal(/credentials\.unset\(/.test(SOURCE), false, 'the card must not delete keys itself')
+  assert.equal(/移除/.test(SOURCE), false, 'no remove control anywhere')
+})
+
+test('client bundle: the health section reports the key count and one total, nothing per key', () => {
+  assert.match(SOURCE, /keyCount/)
+  assert.match(SOURCE, /balanceTotal/)
+  assert.match(SOURCE, /Key 总数：/)
+  assert.match(SOURCE, /总余额：/)
+  assert.match(SOURCE, /discardedCount/)
+  // No per-key detail, and no usable/total split, may be rendered or even read
+  // from the payload.
+  assert.equal(/usableCount/.test(SOURCE), false, 'the page shows only the pool size')
+  assert.equal(/\.keys\b/.test(SOURCE), false, 'the payload carries no per-key array to render')
+  assert.equal(/statusLabel/.test(SOURCE), false, 'no per-key status label')
+  assert.equal(/authenticatedAs/.test(SOURCE), false, 'no identity line')
+})
+
+test('client bundle: the pool copy names the failover and auto-discard contract', () => {
+  assert.match(SOURCE, /额度耗尽自动丢弃/)
+  assert.match(SOURCE, /401/)
+  assert.match(SOURCE, /402/)
+  assert.match(SOURCE, /429/)
 })

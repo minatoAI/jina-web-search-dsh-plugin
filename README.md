@@ -2,18 +2,19 @@
 
 # dsh-jina
 
-DeepSeek Harness 的 [Jina AI](https://jina.ai/) 插件（bundle）：把 jina-cli 的全部 API 能力以模型工具的形式装进 dsh，并在 Web 的 **Plugins** 侧边栏页（`dsh-jina` bundle 卡片）提供配置表单来设置 API key 与**本地代理地址**；旧版 harness 上则回落到 **设置 → 插件 → 配置** 的同名卡片。
+DeepSeek Harness 的 [Jina AI](https://jina.ai/) 插件（bundle）：把 jina-cli 的全部 API 能力以模型工具的形式装进 dsh，并在 Web 的 **Plugins** 侧边栏页（`dsh-jina` bundle 卡片）提供配置表单来设置**多个 API key（额度耗尽自动切换）**与**本地代理地址**；旧版 harness 上则回落到 **设置 → 插件 → 配置** 的同名卡片。
 
 ## 更新日志
 
 > 此处仅展示最新版本，完整版本历史见 [change-log.md](./change-log.md)。
 
-### 0.8.2（2026-09-23）
+### 0.9.0（2026-09-24）
 
-- **fix** **收口错误传播的最后两处不一致**（0.8.0 记为「暂未改动」）：`jina_read` / `jina_screenshot` / `jina_datetime` 的 URL 校验此前是**返回字符串**（`invalid url: undefined ...`），实测为 **`isError: false`**，模型可能把它当数据读；根因是这一行是**本地前置校验**、位于 `callJina` 之前、从未发出请求，与上游错误码无关。现改为**抛错**（`requireUrlArg()`）：文案点名工具、`"url"`、实际收到的类型与值（如 `(number) 42`），键名写错时给出 `did you mean "url" instead of "uri"?`，并上移到任何副作用之前，仍为零请求。
-- **fix** `jina_read` 的 **OCR 无 key** 路径同样由「返回字符串」改为**抛错**（文案一字不改）；它是前置拒绝而非 API 响应，「检测不到 key 就不发请求」的承诺不变。
-- **change** **上游错误按状态码分流**：`401`（key 无效/缺失）与 `422`（参数非法）**抛错**——模型必须改 key 或改参数；`0`（网络/代理）、`402`（额度）、`429`（限流）、`5xx` **保持返回**——它们的提示是给模型转述给用户或稍后重试的。`jina_primer` 的「the tool never throws」契约不受影响。
-- **test** `tool-args.test.js` 追加 10 例：三个 URL 工具的四种拒绝形态（均断言零请求）、合法 URL 仍照发请求的正向用例、OCR 无 key 仍零请求，以及 401/422 抛错 / 429 返回 / `jina_primer` 永不抛错四条分流回归线；全套 114 例（113 通过 / 1 例按需跳过）。
+- **feat** **多个 API key，自动轮换 + 失效自动丢弃**：卡片只有一个 key 输入框——**粘贴后点「添加」即可一直往里加**，不需要管理任何单个 key。工具调用把已保存的 key 组成**轮换池**：某个 key 返回 **401（失效）/ 402（额度耗尽）** 时自动改用下一个 key，调用照常完成，任务不再中途断掉；切换结果会以一行 `[已自动切换 API key：…]` 附在工具返回末尾（`json: true` 的原始负载不附加）。
+- **feat** **不能用的 key 自动丢弃**：401、402，以及卡片检测时发现**余额 ≤ 0** 的 key 会被插件直接从凭据存储里删除，池子自我清理——所以卡片**没有「移除」按钮，也不展示任何单个 key**（没有明文、没有指纹、不标识正在使用哪一个）。限流（429）只临时跳过（冷却 1 分钟），网络/参数/上游故障既不轮换也不丢弃。`apiKey` 调用参数仍然是「只用这一个、不轮换」的逃生口。
+- **feat** **key 文件支持多行**：`jina-api-key.txt` 现在每行一个 key（空行与 `#` 注释忽略，重复项自动去重），一行一个的旧用法不变；同一个凭据槽位里粘贴多行也会被拆成多个 key。来源优先级仍是「凭据槽位 → 会话工作区 key 文件 → dsh 主目录 key 文件」，命中即不再看后面的来源；文件与只读环境变量提供的 key 不会被删除，只会被跳过。
+- **feat** **页面只报 Key 总数与总额**：`/api/dsh-jina/primer` 并行探测轮换池里的每个 key，只返回 **Key 总数**（`keyCount`）、**总余额**（`balanceTotal`，存活 key 的 credits 之和）与本次自动丢弃的数量（`discardedCount`）——**没有任何单个 key 的信息**，也不显示「可用/总数」这种分数（无 `keys[]`、无 `usableCount`、无指纹、无身份、无逐 key 余额）。探测同时清理死 key 并更新轮换状态，所以**充值后点一次「刷新」就能让被限流的 key 回到轮换**，无需重启。轮换池全部耗尽时，错误信息会逐个列出尝试过的 key 与各自的状态。
+- **test** 新增 `test/keys.test.js`（9 例，纯策略：凭据引用语法、key 文件解析、状态归类、冷却折叠、轮换顺序、池签名、来源标签）与 `test/multi-key.test.js`（28 例，假宿主集成：402→备用 key 接管并**从凭据存储删除**该 key、401 同样丢弃、429 只跳过不丢弃、只读环境变量与 key 文件来源不被删除、粘性优先与冷却跳过、三 key 顺序轮换、422/5xx/网络失败不轮换、显式 `apiKey` 不轮换、全池耗尽的逐 key 报错、文件回退与多行、同 key 去重、添加 key 下一次调用即生效、primer 路由只返回数量与总额且余额为 0 的 key 被丢弃）；`client-render.test.js` / `client-bundle.test.js` 增加「只有一个输入框 + 添加」「不渲染任何单个 key / 没有移除」「可用数量 + Key 总数 + 总余额、无分数无身份」以及「客户端 key 池必须等于 `keys.js` 的 `KEY_REFS`」的契约断言。全套 **160 例：159 通过 / 1 例（`JINA_LIVE_PROXY`）按需跳过 / 0 失败**。
 
 ## 功能
 
@@ -98,22 +99,75 @@ dsh plugin --profile web add ./jina-dsh-plugin
 dsh --profile web
 ```
 
-然后打开 Web 界面 → 设置 → **插件** → **配置** 选项卡 → 展开 **Jina Tools** 卡片 → 粘贴 API key → 保存。免费 key 在 https://jina.ai/ 获取。
+然后打开 Web 界面 → 设置 → **插件** → **配置** 选项卡 → 展开 **Jina Tools** 卡片 → 在 **API key** 区块里粘贴 key → 点「添加」。可以**一直往里加**：每次点「添加」都会保存一个新 key，卡片不显示也不需要管理任何单个 key。免费 key 在 https://jina.ai/ 获取。**建议至少加两个**：任一 key 失效或额度耗尽时插件会自动丢弃它并切换到下一个，任务不会中途断掉（见下节）。
+
+## 更新
+
+插件是 profile 的一个依赖，升级 = **让 profile 重新拉取远端代码 + 重启 dsh**。以 `web` profile 为例：
+
+1. 让 profile 拿到新版本（三选一）：
+
+   ```sh
+   # A. 命令行：重新解析 GitHub 依赖（推荐）
+   cd "$DSH_HOME/profiles/web"        # Windows: C:\Users\<你>\.dsh\profiles\web
+   pnpm update dsh-jina
+
+   # B. 命令行：先卸载再安装（与 A 等效，会重新拉取分支最新 commit）
+   dsh plugin --profile web remove dsh-jina
+   dsh plugin --profile web add github:minatoAI/jina-web-search-dsh-plugin
+
+   # C. Web 界面：侧边栏「插件」页 → 卸载 dsh-jina → 用上面的 GitHub 地址重新安装
+   ```
+
+2. **重启** dsh 让新代码生效：
+
+   ```sh
+   dsh --profile web
+   ```
+
+3. 核对是否更新成功：
+
+   ```sh
+   # 已安装副本的版本号（本仓库每次发版都会在 package.json 里改版本）
+   Get-Content "$DSH_HOME/profiles/web/node_modules/dsh-jina/package.json" | Select-String '"version"'
+   ```
+
+   然后打开卡片点一次「刷新」确认功能正常（例如「Key 总数 / 总余额」这两行）。
+
+> **为什么只跑 `pnpm install` 通常不会升级**：GitHub 依赖会被 `pnpm-lock.yaml` 固定到安装当时的 commit，`pnpm install` 尊重锁文件；只有 `pnpm update dsh-jina`（或先 remove 再 add）才会重新解析到分支最新 commit。安装时按 commit 固定（`...#<commit-sha>`）也是同理——升级要显式改成新的 SHA。
+>
+> 本地文件夹安装（`add ./jina-dsh-plugin`）不经过远端：在该目录 `git pull` 之后重启 dsh 即可。
 
 同一张卡片里还有 **本地代理（可选）**：如果你的代理软件只监听本地端口（没有开启系统代理，也没有设置 `HTTP_PROXY` 环境变量），把它的地址填进去即可，例如 `http://127.0.0.1:7897`（可省略 `http://`）→ 保存，下一次工具调用立即生效。代理软件换端口时改这里即可，不需要重启 dsh。
 
-卡片中的 **API key / 连接检测** 区域会实时显示当前 key 的身份（Jina 账号）与余额（credits）、标注 key 的来源（本页保存 / key 文件 / 匿名配额），并显示**本次检测实际使用的代理地址与来源**；点击「刷新」重新检测（保存/清除 key 或代理后也会自动重检）。该数据由主机端插件通过 `/api/dsh-jina/primer` 路由提供（与 `jina_primer` 工具同一接口），**key 明文永不离开主机**；代理地址是明文配置，会显示在页面上。
+卡片中的 **API key / 连接检测** 区域只报告两件事：**Key 总数**与**总余额**（存活 key 的 credits 之和），另外显示连接状态与**本次检测实际使用的代理地址与来源**；点击「刷新」重新检测（添加 key 或代理后也会自动重检）。**不显示任何单个 key 的信息**——没有 key 明文、没有指纹、不标识正在使用哪一个、也没有手动移除。该数据由主机端插件通过 `/api/dsh-jina/primer` 路由提供（与 `jina_primer` 工具同一接口），**key 明文永不离开主机**；代理地址是明文配置，会显示在页面上。
 
-## API key 解析顺序
+## API key 解析顺序与自动轮换
 
-每次工具调用按以下顺序找 key（任一命中即用）：
+每次工具调用按以下顺序找 key；**第一个有 key 的来源就是本次的轮换池**（同一来源里的多个 key 全部进入轮换，命中即不再看后面的来源）：
 
-1. 工具调用参数 `apiKey`
-2. 设置页保存的 key（credential 引用 `JINA_API_KEY`，由 dsh 凭据存储持久化，如 `~/.dsh/.credentials.yaml`）
-3. 会话工作区的 `jina-api-key.txt`
-4. dsh 主目录（`$DSH_HOME`，默认 `~/.dsh`）下的 `jina-api-key.txt`
+1. 工具调用参数 `apiKey`（**单个，不参与轮换**——这是「只用这一个 key」的逃生口）
+2. 卡片里添加的 key，按添加顺序（保存在 dsh 凭据存储，如 `~/.dsh/.credentials.yaml`；也可用同名环境变量，headless profile 同样适用）
+3. 会话工作区的 `jina-api-key.txt`（**每行一个 key**，空行与 `#` 注释忽略）
+4. dsh 主目录（`$DSH_HOME`，默认 `~/.dsh`）下的 `jina-api-key.txt`（同样每行一个 key）
 
-设置页保存新 key 后立即生效（无需重启，每次调用即时解析）；HTTP 401 时也会自动重读文件并重试一次。凭据值只通过 `credentials.set` 上行，任何读取接口都不会回传明文。同时支持在页面上一键清除。
+### 轮换与自动丢弃规则
+
+| 上游状态 | 含义 | 行为 |
+| --- | --- | --- |
+| `401` | key 失效 / 被撤销 | 换下一个 key，并**从凭据存储里自动丢弃**该 key |
+| `402` | 额度耗尽 | 换下一个 key，并**自动丢弃**该 key |
+| 余额 ≤ 0 | 卡片检测时发现额度已空 | **自动丢弃**该 key |
+| `429` | 限流 | 换下一个 key，但**不丢弃**（临时状态），冷却 1 分钟后自动回到轮换 |
+| `0` / `422` / `5xx` | 网络、参数、上游故障 | **不轮换也不丢弃**（换 key 解决不了，只会浪费掉其余 key 的请求） |
+
+- **自动管理**：能用的 key 一直留着，不能用的自动丢弃——所以卡片里没有「移除」，也没有任何单个 key 的展示，用户只需要往里加。
+- **粘性优先**：上一次成功的 key 会被记住，下一次仍从它开始，健康的池不会为失败的 key 付请求。
+- **切换可见**：调用中途换过 key 时，返回末尾会附一行，形如 `[已自动切换 API key：#1（凭据 JINA_API_KEY）额度耗尽（HTTP 402），已自动移除；改用 #2（凭据 JINA_API_KEY_2）。可在 Plugins → dsh-jina 卡片里添加新的 key。]`；`json: true` 的原始负载不附加任何文字。
+- **全池耗尽**：错误信息逐个列出尝试过的 key、来源与各自状态（例如 `#1（凭据 JINA_API_KEY）额度耗尽（HTTP 402），已自动移除；#2（工作区 jina-api-key.txt 第 2 行）限流（HTTP 429）`），并提示添加 key 或充值。
+- 添加 key 后立即生效（无需重启，每次调用即时解析；凭据值只通过 `credentials.set` 上行，任何读取接口都不会回传明文）。
+- 同一个 key 在多个槽位或文件里重复出现时只请求一次。
+- **key 文件与只读来源不会被删除**：`jina-api-key.txt` 里的 key（插件不会改写用户的文件）和由启动环境变量只读提供的引用（seam 拒绝写入）只会被跳过冷却，不会从磁盘上消失。
 
 ## 本地代理（本地网络代理软件）
 
@@ -147,21 +201,24 @@ dsh plugin --profile web remove dsh-jina
 jina-dsh-plugin/
 ├── package.json       # manifest: "dsh": { "bundle": {"patch": ...}, "client": {"platform": "web"} }; 浏览器半身经 exports["./client"] 指向 ui/client.js
 ├── cordis.patch.yml   # 组合层：单个双面孔行 dsh-jina（宿主工具 + 浏览器卡片；行名 = 精确包名是 client-modules 扫描的硬条件）
-├── index.js           # 主机插件：12 个工具（含 jina_search_arxiv / jina_search_ssrn 专用学术检索）+ 网络传输 + JINA_API_KEY 凭据解析 + jina-tools 代理与阅读策略
+├── index.js           # 主机插件：12 个工具（含 jina_search_arxiv / jina_search_ssrn 专用学术检索）+ 网络传输 + 多 key 轮换池（JINA_API_KEY / _2 … _10 + key 文件）+ jina-tools 代理与阅读策略
+├── keys.js            # 纯函数模块：key 池策略（凭据引用 / key 文件解析 / 轮换顺序与冷却 / 状态标签，零依赖，可单测）
 ├── proxy.js           # 纯函数模块：代理地址规范化 / 优先级 / 阅读策略默认值与设置 schema（零依赖，可单测）
 ├── primer.js          # 纯函数模块：jina_primer 的解析 / 格式化逻辑（零依赖，可单测）
 ├── test/
 │   ├── primer.test.js        # jina_primer 单元测试（node --test 自动发现）
 │   ├── proxy.test.js         # 代理策略单元测试
+│   ├── keys.test.js          # key 池策略单元测试（轮换 / 冷却 / 解析 / 自动丢弃判定）
+│   ├── multi-key.test.js     # mock 宿主的多 key 集成测试（逐请求断言 Authorization 与 failover）
 │   ├── plugin-proxy.test.js  # mock 宿主的代理集成测试（含可选实时代理用例）
 │   ├── reader-headers.test.js# jina_read 请求头契约测试（解码 helper 的 stdin，断言真实发出的头）
-│   ├── client-bundle.test.js # 浏览器 bundle 契约测试（语法 + 注册 id + settings 通道 + 选项接线）
+│   ├── client-bundle.test.js # 浏览器 bundle 契约测试（语法 + 注册 id + settings 通道 + 单输入 key 表单接线）
 │   ├── client-render.test.js # 在 VM 中真实渲染两种视图（抓作用域/绑定类缺陷）
 │   └── tools.test.js         # jina_web_search 模型可见契约测试（TDD）
 ├── ui/
 │   ├── package.json   # 子包 manifest（exports["./client"]；dsh.client 主声明已在根包，此处仅保持子包完整）
 │   ├── index.js       # 空主机半身（保留历史子包结构；组合层不再引用）
-│   └── client.js      # 预构建浏览器 bundle：Plugins 页的 "Jina Tools" 卡片（API key + 本地代理 + 阅读选项）
+│   └── client.js      # 预构建浏览器 bundle：Plugins 页的 "Jina Tools" 卡片（单输入 key 表单 + 本地代理 + 阅读选项）
 ├── change-log.md      # 完整版本历史（简体中文）
 ├── change-log.en.md   # 完整版本历史（English）
 ├── README.md          # 简体中文说明（本文件）
@@ -170,11 +227,11 @@ jina-dsh-plugin/
 
 ## 开发说明
 
-- 主机插件只依赖 Node 内置模块与 dsh 主机服务（`fs`、`subprocess`、`tools`、`credentials`、`webServer`），无第三方 npm 依赖；凭据走 dsh 原生的 credential seam（引用 `JINA_API_KEY`），配置走插件自己的 `jina-tools` 设置命名空间（`proxyUrl` 代理地址 + `useOcr` / `imagePolicy` / `autoAltText` / `useSelectors` / 三个选择器覆盖等阅读策略），任何 profile 组合都可以直接使用。
+- 主机插件只依赖 Node 内置模块与 dsh 主机服务（`fs`、`subprocess`、`tools`、`credentials`、`webServer`），无第三方 npm 依赖；凭据走 dsh 原生的 credential seam（key 池引用 `JINA_API_KEY` / `JINA_API_KEY_2` … `JINA_API_KEY_10`，seam 一个引用存一个值、且任何读取接口都不回传值，所以「多个 key」=「多个引用」；引用名只要满足 POSIX 标识符语法即可，无需 harness 改动），配置走插件自己的 `jina-tools` 设置命名空间（`proxyUrl` 代理地址 + `useOcr` / `imagePolicy` / `autoAltText` / `useSelectors` / 三个选择器覆盖等阅读策略），任何 profile 组合都可以直接使用。
 - **设置通道的契约（dsh 0.1.4 起）**：`settings.register()` 已被删除，**设置命名空间就是 Loader/profile 组合条目的 id**——本插件在 `cordis.patch.yml` 里插入的行 id 正是 `jina-tools`，所以卡片里的 `NS` 与之一致。插件通过 `index.js` 的 `export const Config = createSettingsSchema()`（`proxy.js`，零依赖手写节点）声明可编辑字段：每个字段节点带 `meta.volatile: true`，`'~standard': { version: 1, vendor: 'schemastery', validate }` 是 harness 解析配置的唯一入口（`resolveConfig()` 要求**同步**返回纯对象；`vendor` 必须是 `'schemastery'`，否则每次保存都会退化成整插件重挂载）。`validate()` 为每个字段生成一个**跨副本安全的 volatile 引用**（`Symbol.for('cosmokit.volatile.write')`），harness 保存时只把新值写进这些引用，`apply(ctx, config)` 拿到的对象身份不变、插件不重挂载；插件在**每次操作**里用 `settingsSnapshot(config)` 重新读取（`toolSettingsOf()` 负责把"未设置"归一成默认值），因此保存与 API key 一样**立即生效、无需重启**。`/api/dsh-jina/primer` 的 `settingsLive` 就是这个契约的健康检查。
 - 客户端 bundle 直接提交（`ui/client.js`），无构建步骤，git 安装开箱即用。改 UI 后直接改该文件并重启即可。bundle 顶层 `window.__ModuleLoader__.load` 的注册 id **必须等于图行 id（精确包名 `dsh-jina`）**——模块系统只按图行 id 匹配注册（`/client` 后缀除外），注册在别的键上（如旧行名 `dsh-jina/ui`）会报 `loaded without registering "dsh-jina"` 并导致整页 `Failed to load plugins`。卡片注册进 Web 设置包声明的 `settings.plugin.item` 插槽（设置 → 插件 → 配置），这是第三方插件配置的标准位置。
 - **`remote.<ns>` 的注入铁律**：gateway `$mount` 时会把每个 Remote 命名空间注册成**独立 cordis 服务**，所以客户端插件读取 `remote.<ns>`（如 `remote.credentials`、`remote.settings`）之前，必须在自己的 `inject` 里声明该服务名——只声明 `'remote'` 是不够的，属性访问本身就会抛 `cannot get property "remote.settings" without inject`，而错误冒到 `settings.plugin.item` 的 slot 边界会让**整张卡片消失**（0.6.0 的回归，现已由 `test/client-bundle.test.js` 固化）。本插件的 `inject = ['slots','remote','remote.credentials','remote.settings']`。读取处仍然包一层 try/catch：服务缺失时降级为提示，不让 slot 崩溃。
-- key 通过凭据 Remote 命名空间管理（`credentials.describe/set/unset`，变更事件 `credentials/reference-updated` 由 `remote` 服务转发）；代理字段走 `settings` Remote 命名空间（`remote.settings.describe/mutate`，写入按读到的 `revision` 设栅；外部编辑由转发事件 `settings/document-updated` 触发热重读）。
+- key 通过凭据 Remote 命名空间管理（`credentials.describe/set/unset`，变更事件 `credentials/reference-updated` 由 `remote` 服务转发）：卡片一次性 `describe(KEY_REFS)` 拿全部槽位的「是否已配置 / 来源 / 是否可写」（**永远拿不到值**，值只在保存时单向上行），表单因此只有**一个输入框**——「添加」把 key 写进第一个空槽位；宿主半身在 401/402 或探测到余额为 0 时用 `credentials.unset` **自动删除**该槽位（卡片自身不调用 `unset`，也不展示任何单个 key）。`ui/client.js` 里的 `KEY_REFS` 必须与 `keys.js` 的 `KEY_REFS` 完全一致（凭据命名空间没有枚举接口，卡片只能描述自己写下的引用名），由 `test/client-bundle.test.js` 固化。轮换/冷却策略在 `keys.js`（纯函数），宿主半身每次操作重新解析整池（与 key 的「每次调用即时解析」契约一致），`/api/dsh-jina/primer` 并行探测每个 key 并清理死 key，只回传**可用数量 / Key 总数 / 总余额 / 本次丢弃数**四个数字。代理字段走 `settings` Remote 命名空间（`remote.settings.describe/mutate`，写入按读到的 `revision` 设栅；外部编辑由转发事件 `settings/document-updated` 触发热重读）。
 - 组合层遵循 dsh 约定：单个双面孔行 `dsh-jina` 同时携带宿主半身与浏览器半身。浏览器半身由**根 manifest** 的 `dsh.client`（platform: web，图边注入 `@deepseek-ai/dsh-api-remotes`）与 `exports["./client"]` 声明，host 的 client-modules 服务扫描时按行名（精确包名）定位根 manifest 并接入 Web boot graph。注意 client-modules 扫描只接受精确包名行：子路径行（如 `dsh-jina/ui`）永远不会被扫描为客户端行——浏览器半身必须声明在根包。
 
 ## 测试
@@ -185,7 +242,8 @@ jina-dsh-plugin/
 npm test   # 等价于 node --test（自动发现 test/*.test.js）
 ```
 
-- `test/proxy.test.js`、`test/primer.test.js`、`test/tools.test.js`：纯函数与模型可见契约。
+- `test/proxy.test.js`、`test/primer.test.js`、`test/keys.test.js`、`test/tools.test.js`：纯函数与模型可见契约（`keys.test.js` 覆盖凭据引用语法、key 文件解析、状态归类、冷却折叠、轮换顺序、池签名与来源标签）。
+- `test/multi-key.test.js`：用假 Cordis 上下文驱动主机半身，逐请求解码网络 helper 的 stdin 并断言 `Authorization`，覆盖 402→备用 key 接管并**从凭据存储删除**该 key、401 同样丢弃、429 只跳过、只读环境变量与 key 文件来源不被删除、粘性优先与冷却跳过、三 key 顺序轮换、422/5xx/网络失败不轮换、显式 `apiKey` 不轮换、全池耗尽的逐 key 报错、key 文件回退与多行解析、同 key 去重、添加 key 下一次调用即生效，以及 primer 路由只返回数量与总额且余额为 0 的 key 被丢弃。
 - `test/reader-headers.test.js`：用假 Cordis 上下文驱动主机半身，**解码网络 helper 的 stdin**，逐条断言 `jina_read` 真实发出的 Reader 请求头——固定三项（`X-Preset: agent` / `X-Base: final` / `X-Timeout: 120`）、图片策略、选择器组与"空结果自动重试"、OCR 开关与 `X-Page`、无 key 时零请求、alt 生成的 opt-in / 需 key / 与 OCR 互斥、JSON 信封解包与 usage、不可解析响应原文兜底，以及设置 schema 的字段声明（8 个字段都带 `meta.volatile`）、`validate` 的容错面与"保存后下一次调用即生效"。
 - `test/plugin-proxy.test.js`：用假 Cordis 上下文驱动主机半身，断言 `Config` 导出的 volatile 契约、代理优先级、**网络 helper 实际收到的环境变量**、错误文案与 `/api/dsh-jina/primer` 负载（含 `settingsLive`），以及"卡片保存的代理地址在下一次调用即生效、且不再探测注册表"。其中带 `JINA_LIVE_PROXY=1` 的用例会真实 spawn helper 打通一次 Jina 请求（干净环境 + 手填代理，用来证明是手填地址而非残留环境变量在起作用）：
 
@@ -194,4 +252,4 @@ npm test   # 等价于 node --test（自动发现 test/*.test.js）
   ```
 
   在无法 spawn 子进程的沙箱里该用例会自动跳过并说明原因。
-- `test/client-bundle.test.js`：解析预构建的 `ui/client.js` 并固化注册 id、`jina-tools` key、settings 通道与 revision 栅栏——bundle 没有构建步骤，语法错误只能在运行时暴露。
+- `test/client-bundle.test.js`：解析预构建的 `ui/client.js` 并固化注册 id、`jina-tools` key、settings 通道与 revision 栅栏、**单输入 key 表单**（一个 `keyDraft` 字符串 + `firstFreeRef` + 添加，且卡片自身不调用 `unset`）与 `keys.js` 的引用表一致性——bundle 没有构建步骤，语法错误只能在运行时暴露。

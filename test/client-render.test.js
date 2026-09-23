@@ -20,6 +20,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { readFile } from 'node:fs/promises'
 import { Script, createContext } from 'node:vm'
+import { KEY_REFS } from '../keys.js'
 
 const SOURCE = await readFile(new URL('../ui/client.js', import.meta.url), 'utf8')
 
@@ -39,7 +40,11 @@ function reactStub(stateOverrides = []) {
       // renders the legacy body without needing a real re-render.
       useState(initial) { return [stateOverrides[stateCall++] ?? initial, () => {}] },
       useRef(initial) { return { current: initial } },
-      useEffect() {},
+      // The card's only effect wires the initial loads and the Remote event
+      // subscriptions. Running it here is what makes `credentials.describe`
+      // observable without a real renderer; the state setters above are no-ops,
+      // so nothing re-renders.
+      useEffect(effect) { const cleanup = effect(); if (typeof cleanup === 'function') cleanup() },
     },
   }
 }
@@ -47,7 +52,12 @@ function reactStub(stateOverrides = []) {
 /** Execute the committed bundle and return its registration. */
 function loadBundle() {
   let registration
-  const sandbox = { window: { __ModuleLoader__: { load: (entry) => { registration = entry } } } }
+  const sandbox = {
+    window: { __ModuleLoader__: { load: (entry) => { registration = entry } } },
+    // The card's key-health probe fetches its own host route; the effect that
+    // starts it runs in this VM, so the global has to exist.
+    fetch: () => Promise.resolve({ json: () => Promise.resolve({ ok: false, error: 'stub' }) }),
+  }
   new Script(SOURCE, { filename: 'ui/client.js' }).runInContext(createContext(sandbox))
   assert.ok(registration !== undefined, 'the bundle must register through window.__ModuleLoader__.load')
   assert.equal(registration.id, 'dsh-jina')
@@ -57,8 +67,11 @@ function loadBundle() {
 /**
  * Mount the plugin against a fake host whose Remote namespaces answer the way
  * the harness does, and return the registrations plus the recorded elements.
+ * @param stateOverrides - overrides for the first useState calls.
+ * @param options - `{ configured }`: the pool slots the fake credential store
+ *   reports as configured (defaults to slot 1 only).
  */
-function mount(stateOverrides = []) {
+function mount(stateOverrides = [], options = {}) {
   const registration = loadBundle()
   const { React, elements } = reactStub(stateOverrides)
   const exported = registration.factory((specifier) => {
@@ -66,10 +79,23 @@ function mount(stateOverrides = []) {
     throw new Error(`unexpected require("${specifier}")`)
   })
 
+  const configured = options.configured === undefined ? [KEY_REFS[0]] : options.configured
+  const credentialCalls = []
   const credentials = {
-    describe: async () => ({ ok: true, value: { JINA_API_KEY: { configured: false, writable: true } } }),
-    set: async () => ({ ok: true }),
-    unset: async () => ({ ok: true }),
+    describe: async (refs) => {
+      credentialCalls.push({ method: 'describe', refs })
+      const value = {}
+      // The real controller answers one view per requested reference; an
+      // unknown reference comes back `{configured:false, writable:true}`.
+      for (const ref of refs || []) {
+        value[ref] = configured.includes(ref)
+          ? { configured: true, source: 'file', writable: true }
+          : { configured: false, writable: true }
+      }
+      return { ok: true, value }
+    },
+    set: async (ref, value) => { credentialCalls.push({ method: 'set', ref, value }); return { ok: true } },
+    unset: async (ref) => { credentialCalls.push({ method: 'unset', ref }); return { ok: true } },
   }
   const settings = {
     describe: async () => ({
@@ -86,11 +112,11 @@ function mount(stateOverrides = []) {
     register: (options, render) => { registrations.push({ options, render }); return () => {} },
     inject: (_name, callback) => { callback() },
   }
-  const services = { slots, remote, 'remote.credentials': credentials, 'remote.settings': settings }
+  const services = { slots, remote, 'remote.credentials': options.noCredentials === true ? undefined : credentials, 'remote.settings': settings }
   const ctx = { get: (name) => services[name], slots }
 
   exported.apply(ctx)
-  return { registrations, elements }
+  return { registrations, elements, credentialCalls }
 }
 
 /** The entry the Plugins page dispatches for the `dsh-jina` bundle. */
@@ -173,4 +199,97 @@ test('client bundle: the page view renders the reader option controls', () => {
   assert.equal(selects.length, 1, 'the image-policy select must render')
   assert.equal(selects[0].value, 'all', 'the select must default to the API image policy')
   assert.equal(selects[0].onChange !== undefined, true, 'the select must carry a handler')
+})
+
+test('client bundle: the page view renders ONE key input and describes exactly the pool refs', () => {
+  const { registrations, elements, credentialCalls } = mount()
+  const entry = bundleEntry(registrations)
+  renderView(entry, 'page')
+  const passwords = elements.filter(node => node.type === 'input' && node.props.type === 'password').map(node => node.props)
+  assert.equal(passwords.length, 1, 'one input the user keeps filling, not one per slot')
+  assert.equal(passwords[0].placeholder, '粘贴 API key…')
+  assert.equal(typeof passwords[0].onChange, 'function')
+  const add = elements.filter(node => node.type === 'button' && (node.props.children ?? []).includes('添加')).map(node => node.props)
+  assert.equal(add.length, 1, 'one add control')
+  assert.equal(typeof add[0].onClick, 'function')
+  // The credentials namespace has no enumeration, so the card must name the
+  // references it edits — and they must be the pool the host resolves.
+  const describes = credentialCalls.filter(call => call.method === 'describe')
+  assert.equal(describes.length, 1, 'one batched describe for the whole pool')
+  // `Array.from`: the bundle's array literal lives in the VM realm, and a
+  // cross-realm array fails deepStrictEqual on prototypes alone.
+  assert.deepEqual(Array.from(describes[0].refs), KEY_REFS)
+})
+
+test('client bundle: nothing per key is rendered — no list, no remove control, no identity', () => {
+  // The second `useState` is the describe view; seeding it is how this stub
+  // renders the post-load state (its useEffect is a no-op).
+  const views = {}
+  for (const ref of KEY_REFS) views[ref] = { configured: false, writable: true }
+  views[KEY_REFS[0]] = { configured: true, source: 'file', writable: true }
+  views[KEY_REFS[2]] = { configured: true, source: 'file', writable: true }
+  const { registrations, elements, credentialCalls } = mount([undefined, views])
+  renderView(bundleEntry(registrations), 'page')
+  const texts = elements.filter(node => node.type === 'p')
+    .map(node => (Array.isArray(node.props.children) ? node.props.children.join('') : node.props.children))
+    .filter(text => typeof text === 'string')
+  assert.equal(texts.some(text => text.includes('移除')), false, 'no remove control copy')
+  assert.equal(texts.some(text => text.includes('JINA_API_KEY')), false, 'no reference name is shown')
+  assert.equal(texts.some(text => text.startsWith('#')), false, 'no per-key row')
+  const labels = elements.filter(node => node.type === 'button').map(node => (node.props.children ?? []).join(''))
+  assert.equal(labels.includes('移除'), false, 'no remove button')
+  assert.equal(credentialCalls.filter(call => call.method === 'unset').length, 0, 'the card never unsets by hand')
+  const password = elements.filter(node => node.type === 'input' && node.props.type === 'password').map(node => node.props)[0]
+  assert.equal(password.disabled, false, 'a free slot keeps the input usable')
+})
+
+test('client bundle: the add control closes once every slot is filled', () => {
+  const views = {}
+  for (const ref of KEY_REFS) views[ref] = { configured: true, source: 'file', writable: true }
+  const { registrations, elements } = mount([undefined, views])
+  renderView(bundleEntry(registrations), 'page')
+  const add = elements.filter(node => node.type === 'button' && (node.props.children ?? []).includes('添加')).map(node => node.props)[0]
+  assert.equal(add.disabled, true, 'there is no free slot left')
+})
+
+test('client bundle: the health section shows counts and one total, nothing per key', () => {
+  const views = {}
+  for (const ref of KEY_REFS) views[ref] = { configured: false, writable: true }
+  views[KEY_REFS[0]] = { configured: true, source: 'file', writable: true }
+  // The fifth `useState` is the primer payload (open, keyViews, keyDraft,
+  // keyStatus, primer).
+  const primer = {
+    phase: 'ok',
+    data: {
+      ok: true, keyCount: 2, discardedCount: 1,
+      authenticatedAs: 'acct-2', balanceLeft: 900, balanceTotal: 1100,
+      proxy: { url: null, source: 'none', rejected: [] },
+    },
+    error: undefined,
+  }
+  const { registrations, elements } = mount([undefined, views, undefined, undefined, primer])
+  renderView(bundleEntry(registrations), 'page')
+  const texts = elements.filter(node => node.type === 'p')
+    .map(node => (Array.isArray(node.props.children) ? node.props.children.join('') : node.props.children))
+    .filter(text => typeof text === 'string')
+  assert.ok(texts.includes('Key 总数：2 个'), 'the page reports how many keys the pool holds')
+  assert.ok(texts.includes('总余额：1,100 credits'), 'and the credits behind them')
+  assert.equal(texts.some(text => text.includes('可用 Key')), false, 'no usable/total split')
+  assert.equal(texts.some(text => text.includes('2 / 2') || text.includes('1 / 2')), false, 'no fraction')
+  assert.equal(texts.some(text => text.includes('acct-2')), false, 'no identity line')
+  assert.equal(texts.some(text => text.includes('900 credits')), false, 'no per-key/current balance line')
+  assert.ok(texts.some(text => text.includes('自动丢弃了 1 个')), 'an automatic discard is reported')
+})
+
+test('client bundle: a profile without a credential plane degrades instead of loading forever', () => {
+  const { registrations, elements } = mount([], { noCredentials: true })
+  const entry = bundleEntry(registrations)
+  assert.doesNotThrow(() => renderView(entry, 'page'))
+  const texts = elements.filter(node => node.type === 'p')
+    .map(node => (Array.isArray(node.props.children) ? node.props.children.join('') : node.props.children))
+  assert.ok(texts.some(text => typeof text === 'string' && text.includes('未挂载凭据控制面')),
+    'the card must say why the key cannot be saved, not spin forever')
+  const passwords = elements.filter(node => node.type === 'input' && node.props.type === 'password').map(node => node.props)
+  assert.equal(passwords.length, 1)
+  assert.equal(passwords[0].disabled, true, 'the input cannot be used without a credential plane')
 })
