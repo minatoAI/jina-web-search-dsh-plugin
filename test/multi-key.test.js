@@ -16,7 +16,7 @@
  *   the operation completes and the switch is reported.
  *
  * The rotation policy itself is unit-tested in test/keys.test.js; this file
- * tests the wiring: source precedence, deduplication, the sticky preferred key,
+ * tests the wiring: source precedence, deduplication, the round-robin cursor,
  * cooldowns, the explicit-key escape hatch, and the per-key health the card's
  * `/api/dsh-jina/primer` route reports.
  */
@@ -258,7 +258,20 @@ test('a key that came from a file is skipped, never deleted', async () => {
   assert.doesNotMatch(out, /已自动移除/)
 })
 
-test('the key that served the call leads the next one, and the parked key is skipped', async () => {
+test('round-robin: consecutive calls use different keys', async () => {
+  const host = mount({
+    keys: { JINA_API_KEY: 'k1', JINA_API_KEY_2: 'k2' },
+    reply: perKey({ k1: 200, k2: 200 }),
+  })
+  await callTool(host, 'jina_web_search', { query: 'q' })
+  assert.equal(keyOf(host.requests[0]), 'k1', 'the first call starts at slot #1')
+  await callTool(host, 'jina_web_search', { query: 'q' })
+  assert.equal(keyOf(host.requests[1]), 'k2', 'the next call rotates on instead of pinning k1')
+  await callTool(host, 'jina_web_search', { query: 'q' })
+  assert.equal(keyOf(host.requests[2]), 'k1', 'and wraps around')
+})
+
+test('a parked key is skipped while a healthy one remains', async () => {
   const host = mount({
     keys: { JINA_API_KEY: 'k1', JINA_API_KEY_2: 'k2' },
     reply: perKey({ k1: 402, k2: 200 }),
@@ -267,7 +280,7 @@ test('the key that served the call leads the next one, and the parked key is ski
   assert.equal(host.requests.length, 2)
 
   const out = await callTool(host, 'jina_web_search', { query: 'q' })
-  assert.equal(host.requests.length, 3, 'the sticky key needs one request')
+  assert.equal(host.requests.length, 3, 'the parked key costs no request')
   assert.equal(keyOf(host.requests[2]), 'k2', 'the exhausted key is inside its cooldown')
   assert.doesNotMatch(out, /已自动切换/, 'no switch happened in this call, so no note')
 })
@@ -461,7 +474,7 @@ test('the OCR gate sees any pool slot, not just the primary one', async () => {
     keys: { JINA_API_KEY_2: 'k2' },
     reply: perKey({ k2: 200 }, { data: { title: 'Paper', url: 'https://example.com/p.pdf', content: 'body '.repeat(60) } }),
   })
-  const out = await callTool(host, 'jina_read', { url: 'https://example.com/p.pdf', ocr: true })
+  const out = await callTool(host, 'jina_read_pdf', { url: 'https://example.com/p.pdf', pages: '1' })
   assert.equal(host.requests.length, 1)
   assert.equal(keyOf(host.requests[0]), 'k2')
   assert.equal(host.requests[0].headers['X-Respond-With'], 'jina-ocr-v1')

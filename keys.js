@@ -23,14 +23,22 @@
  * identifiers, which is exactly the grammar the credentials seam and its Remote
  * controller both enforce, so no harness change is needed.
  *
- * Rotation is sticky: the key that served the last successful call is tried
- * first again, so a healthy pool never pays for a failing key. A key that just
- * failed with a failover status is skipped until its cooldown expires (401 is
- * effectively permanent until the pool changes, because the same stored value
- * cannot start working again; 402 may heal the moment the account is topped
- * up; 429 is transient). When every key is cooling down the rotation order is
- * used as-is rather than refusing to try: an honest failure is better than a
- * plugin that stops calling the API.
+ * Rotation is round-robin: consecutive calls start from the key *after* the one
+ * that served the previous call, so a pool of N keys sees roughly 1/N of the
+ * traffic each instead of pinning the same key until it runs dry. Jina's limits
+ * are per key (RPM and TPM), so spreading requests across the pool is what keeps
+ * a busy session under the limit rather than hammering one key into a 429. A key
+ * that just failed with a failover status is skipped until its cooldown expires
+ * (401 is effectively permanent until the pool changes, because the same stored
+ * value cannot start working again; 402 may heal the moment the account is
+ * topped up; 429 is transient). When every key is cooling down the rotation
+ * order is used as-is rather than refusing to try: an honest failure is better
+ * than a plugin that stops calling the API.
+ *
+ * Rotation and failover are different things and read differently to the user:
+ * the walk still moves to the next key when one answers a failover status, but
+ * only *that* switch is reported as a key switch. A planned round-robin step is
+ * normal operation and must never look like "your key ran out".
  *
  * A key that is *definitively* unusable is not merely skipped — index.js deletes
  * its credential (`credentials.unset`), so the pool stays clean without the user
@@ -223,24 +231,27 @@ export function keyStateAfter(state, status, now) {
 /**
  * The order the pool is walked for one call.
  *
- * Sticky first: the key that served the last success (or the first key when
- * nothing has been tried) leads, then the rest of the pool wraps around it.
- * Keys in cooldown are demoted to the back — skipped entirely while at least
- * one healthy key remains, but still tried (in rotation order) when the whole
- * pool is cooling down, so an exhausted pool fails honestly instead of the
- * plugin refusing to call the API at all.
+ * Round-robin: the walk starts at the key *after* the one that served the
+ * previous call, so consecutive calls spread across the pool instead of pinning
+ * one key. `lastUsedIndex` is `-1` before any call has run (the walk then starts
+ * at key #1); any other value is taken modulo the pool size. Keys in cooldown
+ * are demoted to the back — skipped entirely while at least one healthy key
+ * remains, but still tried (in rotation order) when the whole pool is cooling
+ * down, so an exhausted pool fails honestly instead of the plugin refusing to
+ * call the API at all.
  *
  * @param count - pool size.
- * @param activeIndex - the preferred index (clamped into range).
+ * @param lastUsedIndex - the index that served the previous call, or -1.
  * @param states - the per-index states, parallel to the pool.
  * @param now - the current epoch milliseconds.
  * @returns indices in the order to try.
  */
-export function keyRotationOrder(count, activeIndex, states, now) {
+export function keyRotationOrder(count, lastUsedIndex, states, now) {
   const size = Number.isFinite(count) && count > 0 ? Math.floor(count) : 0
   if (size === 0) return []
   const list = Array.isArray(states) ? states : []
-  const start = Number.isFinite(activeIndex) ? ((Math.floor(activeIndex) % size) + size) % size : 0
+  const cursor = Number.isFinite(lastUsedIndex) ? Math.floor(lastUsedIndex) : -1
+  const start = (((cursor + 1) % size) + size) % size
   const order = []
   for (let i = 0; i < size; i++) order.push((start + i) % size)
   const ready = order.filter((index) => !isKeyBlocked(list[index], now))

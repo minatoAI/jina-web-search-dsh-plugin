@@ -100,6 +100,13 @@ function callRead(host, args) {
   return tool.execute(args, { agent: { session: { header: { cwd: 'C:\\ws' } } } })
 }
 
+/** Invoke `jina_read_pdf` the way the tool seam does. */
+function callPdf(host, args) {
+  const tool = host.tools.get('jina_read_pdf')
+  assert.ok(tool !== undefined, 'jina_read_pdf must be registered')
+  return tool.execute(args, { agent: { session: { header: { cwd: 'C:\\ws' } } } })
+}
+
 /** Mount the plugin and return the host plus its first request's headers. */
 async function headersFor(args, setting) {
   const host = createHost({ setting })
@@ -144,35 +151,44 @@ test('jina_read: per-call selectors and noCache override the defaults', async ()
   assert.equal(headers['X-No-Cache'], 'true')
 })
 
-test('jina_read: ocr switches the pipeline and steers the page', async () => {
-  const { headers } = await headersFor({ url: 'https://example.com/paper.pdf', ocr: true, page: 3, apiKey: 'k' })
-  assert.equal(headers['X-Respond-With'], 'jina-ocr-v1')
-  assert.equal(headers['X-Page'], '3')
+test('jina_read: readerlm switches the pipeline to the HTML model', async () => {
+  const { headers } = await headersFor({ url: 'https://example.com', readerlm: true, apiKey: 'k' })
+  assert.equal(headers['X-Respond-With'], 'readerlm-v2')
   assert.equal(headers['X-With-Generated-Alt'], undefined,
     'alt generation does not work when X-Respond-With is set')
+  // Verified live: readerlm-v2 plus a selector that matches nothing answers
+  // 422 "No content available", so the group must not ride along.
+  assert.equal(headers['X-Target-Selector'], undefined)
+  assert.equal(headers['X-Remove-Selector'], undefined)
 })
 
-test('jina_read: ocr without a key is refused before any request is spawned', async () => {
+test('jina_read: readerlm is ignored for a PDF URL', async () => {
+  const { headers } = await headersFor({ url: 'https://example.com/paper.pdf', readerlm: true, apiKey: 'k' })
+  assert.equal(headers['X-Respond-With'], undefined,
+    'the plain extractor reads PDFs verbatim and ~40x cheaper than OCR')
+})
+
+test('jina_read: readerlm without a key is refused before any request is spawned', async () => {
   const host = createHost()
   apply(host.ctx, resolveSettings(host.settingsValue))
-  const err = await callRead(host, { url: 'https://example.com/paper.pdf', ocr: true }).then(
+  const err = await callRead(host, { url: 'https://example.com', readerlm: true }).then(
     () => assert.fail('a key-gated refusal must throw, not return a successful-looking string'),
     (e) => e,
   )
   assert.match(err.message, /requires a Jina API key/)
-  assert.match(err.message, /Vision Language Model/)
+  assert.match(err.message, /Language Model/)
   assert.equal(host.requests.length, 0, 'a key-gated feature must not spend a doomed request')
 })
 
-test('jina_read: the card default turns ocr on, and a per-call false overrides it', async () => {
-  const on = await headersFor({ url: 'https://example.com', apiKey: 'k' }, { useOcr: true })
-  assert.equal(on.headers['X-Respond-With'], 'jina-ocr-v1')
+test('jina_read: the card default turns readerlm on, and a per-call false overrides it', async () => {
+  const on = await headersFor({ url: 'https://example.com', apiKey: 'k' }, { useReaderLm: true })
+  assert.equal(on.headers['X-Respond-With'], 'readerlm-v2')
 
-  const off = await headersFor({ url: 'https://example.com', ocr: false, apiKey: 'k' }, { useOcr: true })
+  const off = await headersFor({ url: 'https://example.com', readerlm: false, apiKey: 'k' }, { useReaderLm: true })
   assert.equal(off.headers['X-Respond-With'], undefined)
 })
 
-test('jina_read: alt-text generation is opt-in, key-gated and never rides with ocr', async () => {
+test('jina_read: alt-text generation is opt-in, key-gated and never rides with readerlm', async () => {
   const byDefault = await headersFor({ url: 'https://example.com', apiKey: 'k' })
   assert.equal(byDefault.headers['X-With-Generated-Alt'], undefined,
     'defaulting this on would turn every free anonymous read into a billed one')
@@ -183,8 +199,8 @@ test('jina_read: alt-text generation is opt-in, key-gated and never rides with o
   const noKey = await headersFor({ url: 'https://example.com' }, { autoAltText: true })
   assert.equal(noKey.headers['X-With-Generated-Alt'], undefined, 'the feature is rejected for anonymous callers')
 
-  const withOcr = await headersFor({ url: 'https://example.com', ocr: true, apiKey: 'k' }, { autoAltText: true })
-  assert.equal(withOcr.headers['X-With-Generated-Alt'], undefined)
+  const withReaderLm = await headersFor({ url: 'https://example.com', readerlm: true, apiKey: 'k' }, { autoAltText: true })
+  assert.equal(withReaderLm.headers['X-With-Generated-Alt'], undefined)
 })
 
 test('jina_read: a field saved on the card reaches the next read without a restart', async () => {
@@ -243,13 +259,81 @@ test('jina_read: an unparsable body is handed back verbatim, never dropped', asy
   assert.equal(text, 'plain markdown, not json')
 })
 
+test('jina_read_pdf: OCR is always on and pages are requested one at a time', async () => {
+  const host = createHost({ responses: [readerBody('page one'), readerBody('page two')] })
+  apply(host.ctx, resolveSettings(host.settingsValue))
+  const text = await callPdf(host, { url: 'https://example.com/scan.pdf', pages: '1-2', apiKey: 'k' })
+  assert.equal(host.requests.length, 2, 'one request per page: the model transcribes a single page image')
+  assert.equal(host.requests[0].headers['X-Respond-With'], 'jina-ocr-v1')
+  assert.equal(host.requests[0].headers['X-Page'], '1')
+  assert.equal(host.requests[1].headers['X-Page'], '2')
+  assert.equal(host.requests[0].headers['X-Target-Selector'], undefined,
+    'a CSS selector cannot steer an image-based pipeline')
+  assert.match(text, /## Page 1/)
+  assert.match(text, /## Page 2/)
+  assert.match(text, /\[Reader pipeline: jina-ocr-v1/)
+})
+
+test('jina_read_pdf: a page that repeats page 1 ends the walk', async () => {
+  // Verified against the live API: an X-Page past the end of the document comes
+  // back as page 1 again instead of erroring, so a repeat is the stop signal —
+  // without it a page loop would run to maxPages forever.
+  const host = createHost({ responses: [readerBody('the only page'), readerBody('the only page')] })
+  apply(host.ctx, resolveSettings(host.settingsValue))
+  const text = await callPdf(host, { url: 'https://example.com/scan.pdf', pages: '1-5', apiKey: 'k' })
+  assert.equal(host.requests.length, 2, 'the walk must stop at the repeat, not keep asking')
+  assert.match(text, /stopped because page 2 repeated page 1/)
+  assert.ok(!/## Page 2/.test(text), 'the repeated page must not be appended twice')
+})
+
+test('jina_read_pdf: a non-PDF URL is refused before any request is spawned', async () => {
+  const host = createHost()
+  apply(host.ctx, resolveSettings(host.settingsValue))
+  const err = await callPdf(host, { url: 'https://example.com/article', apiKey: 'k' }).then(
+    () => assert.fail('a web page must not silently go through the document OCR model'),
+    (e) => e,
+  )
+  assert.match(err.message, /does not end in \.pdf/)
+  assert.match(err.message, /jina_read/)
+  assert.equal(host.requests.length, 0)
+})
+
+test('jina_read_pdf: allowNonPdf overrides the URL guard', async () => {
+  const host = createHost()
+  apply(host.ctx, resolveSettings(host.settingsValue))
+  await callPdf(host, { url: 'https://example.com/download?id=7', allowNonPdf: true, pages: '1', apiKey: 'k' })
+  assert.equal(host.requests.length, 1)
+  assert.equal(host.requests[0].headers['X-Respond-With'], 'jina-ocr-v1')
+})
+
+test('jina_read_pdf: without a key it is refused before any request is spawned', async () => {
+  const host = createHost()
+  apply(host.ctx, resolveSettings(host.settingsValue))
+  const err = await callPdf(host, { url: 'https://example.com/scan.pdf' }).then(
+    () => assert.fail('a key-gated refusal must throw, not return a successful-looking string'),
+    (e) => e,
+  )
+  assert.match(err.message, /requires a Jina API key/)
+  assert.equal(host.requests.length, 0)
+})
+
+test('jina_read_pdf: the default range is the first five pages', async () => {
+  const host = createHost()
+  apply(host.ctx, resolveSettings(host.settingsValue))
+  const text = await callPdf(host, { url: 'https://example.com/scan.pdf', apiKey: 'k' })
+  assert.equal(host.requests.length, 2, 'the fake answers repeat, so the walk stops at page 2')
+  assert.equal(host.requests[0].headers['X-Page'], '1')
+  assert.equal(host.requests[1].headers['X-Page'], '2')
+  assert.match(text, /jina_read_pdf: 1 page/)
+})
+
 test('settings schema: every reader field is declared as a live (volatile) field', () => {
   // The entry id `jina-tools` *is* the settings namespace; this export is what
   // the settings provider serves. A field is editable without a restart only
   // when its node carries `meta.volatile` — the provider derives the form from
   // exactly that flag, and `write()` rejects any path that lacks it.
   const fields = [
-    'proxyUrl', 'useOcr', 'imagePolicy', 'autoAltText', 'useSelectors',
+    'proxyUrl', 'useReaderLm', 'imagePolicy', 'autoAltText', 'useSelectors',
     'targetSelector', 'removeSelector', 'waitForSelector',
   ]
   const dict = Config.toJSON().dict
@@ -262,7 +346,7 @@ test('settings schema: every reader field is declared as a live (volatile) field
     assert.equal(dict[field].type, Config.dict[field].type)
   }
   assert.equal(dict.proxyUrl.type, 'string')
-  assert.equal(dict.useOcr.type, 'boolean')
+  assert.equal(dict.useReaderLm.type, 'boolean')
   assert.equal(dict.imagePolicy.type, 'string')
   // A fresh envelope per call: `plainSchema()` walks the result and deletes
   // `meta.volatile`, so a shared dict would silently disable live editing for
@@ -272,15 +356,15 @@ test('settings schema: every reader field is declared as a live (volatile) field
 })
 
 test('settings schema: resolve() hands back the volatile refs the harness writes into', () => {
-  const resolved = resolveSettings({ proxyUrl: 'http://127.0.0.1:7897', useOcr: true })
+  const resolved = resolveSettings({ proxyUrl: 'http://127.0.0.1:7897', useReaderLm: true })
   assert.equal(settingsAreLive(resolved), true)
   // `settingsSnapshot` reads through the refs, so a write by the settings
   // provider is visible to the very next operation — no restart.
   assert.equal(settingsSnapshot(resolved).proxyUrl, 'http://127.0.0.1:7897')
-  assert.equal(settingsSnapshot(resolved).useOcr, true)
+  assert.equal(settingsSnapshot(resolved).useReaderLm, true)
   const write = Symbol.for('cosmokit.volatile.write')
-  resolved.useOcr[write](false)
-  assert.equal(settingsSnapshot(resolved).useOcr, false, 'a saved field must reach the running plugin in place')
+  resolved.useReaderLm[write](false)
+  assert.equal(settingsSnapshot(resolved).useReaderLm, false, 'a saved field must reach the running plugin in place')
   // A malformed / absent stored section must not throw: the entry may start
   // with no config at all.
   assert.equal(settingsAreLive(resolveSettings(undefined)), true)
@@ -291,11 +375,11 @@ test('settings schema: resolve() hands back the volatile refs the harness writes
 
 test('settings schema: unset fields mean "default", and toolSettingsOf owns the defaults', () => {
   const section = settingsSnapshot(resolveSettings({}))
-  assert.equal(section.useOcr, undefined, 'an untouched field is not materialized')
+  assert.equal(section.useReaderLm, undefined, 'an untouched field is not materialized')
   assert.equal(section.imagePolicy, undefined)
   assert.equal(section.useSelectors, undefined)
   const defaults = toolSettingsOf(section)
-  assert.equal(defaults.useOcr, false)
+  assert.equal(defaults.useReaderLm, false)
   assert.equal(defaults.imagePolicy, 'all')
   assert.equal(defaults.autoAltText, false)
   assert.equal(defaults.useSelectors, true, 'the selector group is on unless it is explicitly turned off')
@@ -305,7 +389,7 @@ test('settings schema: unset fields mean "default", and toolSettingsOf owns the 
 test('toolSettingsOf: an absent or malformed section resolves to the documented defaults', () => {
   assert.deepEqual(toolSettingsOf(undefined), {
     proxyUrl: '',
-    useOcr: false,
+    useReaderLm: false,
     imagePolicy: 'all',
     autoAltText: false,
     useSelectors: true,

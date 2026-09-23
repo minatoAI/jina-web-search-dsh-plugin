@@ -2,6 +2,18 @@
 
 本文件记录 dsh-jina 的完整版本历史；[README.md](./README.md) 的「更新日志」一节只保留最新版本。
 
+### 0.10.0（2026-09-24）
+
+- **feat** **新增 `jina_read_pdf` 工具：专门用 `jina-ocr-v1` 读 PDF**。起因是一次实测事故：`jina-ocr-v1` 一次只吃**一张页面图**，而 Reader 会把整个网页渲染成**一张**图再交给模型，于是**长 HTML 页会被压进 1024×1024 的全局视图、文字糊到读不出来，模型就"续写"出一篇假论文**——同一篇 arXiv 论文，HTML 版返回了伪造的"遗传算法测试用例"论文，PDF 版逐页读则完全正确（`inputTokens=957, outputTokens=1367, measuredTokens=2324, scaledTokens=92960` 三次调用逐位一致）。所以 OCR 不再是一个全局开关，而是**只属于 PDF 的专用工具**：固定发送 `X-Respond-With: jina-ocr-v1`，**逐页**请求（`X-Page`，1 起），默认读前 5 页（`maxPages`，硬上限 50），`pages` 支持 `"3"` / `"1-5"` / `"2,4,7"`。
+- **feat** **自动识别文档结尾**：实测**超出页数的 `X-Page` 不报错，而是静默返回第 1 页**——所以"循环到空为止"会死循环。工具改为对每页内容做指纹去重：某页重复了之前的页 ⇒ 判定读到文档末尾并停止，并在结果里写明原因。
+- **feat** **结果自带来源标记**：模型管线（`jina-ocr-v1` / `readerlm-v2`）的输出**是生成的，不是抽取的**，所以结果末尾会追加 `[Reader pipeline: … — … verify anything load-bearing against the source.]`。这是最便宜的一道防线：读到的模型能据此选择"去核对"而不是"当事实引用"。
+- **feat** **`X-Respond-With` 的默认值从 OCR 换成 ReaderLM-v2**：卡片选项 `useOcr` → **`useReaderLm`**（「使用 ReaderLM-v2 解析 HTML」），走官方为**网页**指定的 `X-Respond-With: readerlm-v2`（实测同一页：OCR 返回伪造论文，ReaderLM-v2 返回**正确全文**，计费 **3×** 且有 4000 token 起步，而 OCR 是 40×）。旧设置里的 `useOcr` 键被忽略，不会报错。
+- **fix** **ReaderLM-v2 不再携带选择器组**：实测 `X-Respond-With: readerlm-v2` **叠加** `X-Target-Selector` 时，只要选择器命中不到（默认列表不适配的页面都会），Reader 直接返回 **422 `No content available`**；去掉选择器组即恢复正常。模型管线消费整页，选择器只属于 DOM 抽取路径，所以该模式下不再发送（也不再触发"空结果去选择器重试"）。
+- **fix** **`.pdf` URL 不会被 ReaderLM 接管**：`jina_read` 识别出 PDF 后保持普通抽取（逐字、且比 OCR 便宜约 40×），并在结果里说明"readerlm 未生效、要读扫描件请用 `jina_read_pdf`"。ReaderLM 是 HTML→Markdown 模型，PDF 不是它的输入。
+- **fix** **422 按报文分流**：422 不再笼统地当"参数非法"——`Screenshot of the page is not available` 是**渲染/截图失败**（正是 OCR 会伪造内容的那一步），`with target selector …` 是选择器命中不到，`No content available` 是抽不到内容；三者给不同的修复提示。同时 503 会补上官方说明：模型是 serverless，**冷启动返回 503，官方建议 30–60 秒后重试**。
+- **change** **API key 池改为均流（round-robin）轮换**：原先"粘性优先"（上次成功的 key 一直领跑），现在是**每次调用都从上一个用过的 key 的下一个开始**，N 个 key 各摊约 1/N 的流量——Jina 的限流（RPM/TPM）是按 key 计的，摊开才能少撞 429。冷却中的 key 依旧被跳过；**只有真正失败导致的换 key 才会显示 `[已自动切换 API key：…]`**，计划内的轮换不会冒充"你的 key 用完了"。
+- **test** 全套 **169 例：168 通过 / 1 例（`JINA_LIVE_PROXY`）按需跳过 / 0 失败**。新增/改写：`jina_read_pdf` 的逐页请求、去重停止、非 PDF 守卫、`allowNonPdf` 逃生口、无 key 前置拒绝、来源标记；`jina_read` 的 readerlm 头、PDF 不接管、选择器不随行；`keys.test.js` 的 round-robin 顺序；`multi-key.test.js` 的连续调用换 key。另做**真机端到端验证**（真实 API、真实 subprocess）：`jina_read_pdf` 对 1 页 PDF 请求 1–3 页 → 只读 1 页后以"page 2 repeated page 1"停止并标注来源；`jina_read` + readerlm 正常返回。
+
 ### 0.9.0（2026-09-24）
 
 - **feat** **多个 API key，自动轮换 + 失效自动丢弃**。Jina 账号的 credits 用完后上游返回 HTTP 402；在这个版本之前，这意味着**操作当场结束**——任务中途断掉，用户得先发现、充值、再重来。卡片现在**只有一个 key 输入框**：粘贴后点「添加」即可一直往里加，不需要管理任何单个 key。宿主把它们解析成**轮换池**：某个 key 返回 **401 / 402** 时先停用它、由下一个 key 继续服务，调用照常完成。凭据 seam 一个引用只存一个值、`describe` 视图只有 `configured`/`source`/`writable`（没有任何读取路径会回传值，所以卡片无法回读列表，「追加」只能实现为「写入第一个空槽位」），因此「多个 key」=「多个引用」；引用名只需满足 POSIX 标识符语法，已对照 harness 源码核实（`packages/credentials/credentials/src/index.ts:19` 的 `REF_PATTERN`，以及 Remote 控制器 `packages/api/settings-controller/src/credentials.ts:22-27`，单次 describe 上限 64 个引用），**无需任何 harness 改动**。

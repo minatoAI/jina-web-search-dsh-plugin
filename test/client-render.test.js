@@ -188,7 +188,7 @@ test('client bundle: the page view renders the reader option controls', () => {
   renderView(entry, 'page')
   const inputs = elements.filter(node => node.type === 'input').map(node => node.props)
   const checkboxes = inputs.filter(props => props.type === 'checkbox')
-  assert.equal(checkboxes.length, 3, 'the OCR, alt-text and selector toggles must render')
+  assert.equal(checkboxes.length, 3, 'the ReaderLM-v2, alt-text and selector toggles must render')
   assert.ok(checkboxes.every(props => typeof props.onChange === 'function'),
     'every toggle must carry a real handler, not a missing binding')
   assert.ok(inputs.some(props => props.placeholder === '正文选择器（留空使用内置列表）'),

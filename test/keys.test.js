@@ -103,26 +103,29 @@ test('keyStateAfter: a success clears the key, a failover status parks it', () =
   assert.equal(isKeyBlocked(undefined, now), false)
 })
 
-test('keyRotationOrder: sticky first, then the rest, blocked keys last', () => {
+test('keyRotationOrder: round-robin from the key after the last one used, blocked keys last', () => {
   const now = 1_000_000
   const blocked = keyStateAfter(clearKeyState(), 402, now)
   const healthy = clearKeyState()
 
-  // Nothing tried yet: slot order.
-  assert.deepEqual(keyRotationOrder(3, 0, [healthy, healthy, healthy], now), [0, 1, 2])
-  // Sticky: the key that served the last success leads, then wraps around.
-  assert.deepEqual(keyRotationOrder(3, 2, [healthy, healthy, healthy], now), [2, 0, 1])
+  // Nothing tried yet (-1): slot order, starting at key #1.
+  assert.deepEqual(keyRotationOrder(3, -1, [healthy, healthy, healthy], now), [0, 1, 2])
+  // Round-robin: the walk starts at the key AFTER the one that served the last
+  // call, so consecutive calls spread across the pool instead of pinning one key
+  // (Jina's rate limits are per key).
+  assert.deepEqual(keyRotationOrder(3, 0, [healthy, healthy, healthy], now), [1, 2, 0])
+  assert.deepEqual(keyRotationOrder(3, 2, [healthy, healthy, healthy], now), [0, 1, 2])
   // A parked key is demoted, not dropped.
-  assert.deepEqual(keyRotationOrder(3, 0, [blocked, healthy, healthy], now), [1, 2])
-  assert.deepEqual(keyRotationOrder(3, 1, [blocked, healthy, healthy], now), [1, 2])
+  assert.deepEqual(keyRotationOrder(3, -1, [blocked, healthy, healthy], now), [1, 2])
+  assert.deepEqual(keyRotationOrder(3, 1, [blocked, healthy, healthy], now), [2, 1])
   // A whole pool in cooldown is still tried, in rotation order: an exhausted
   // pool must fail honestly instead of the plugin refusing to call the API.
-  assert.deepEqual(keyRotationOrder(2, 1, [blocked, blocked], now), [1, 0])
-  // Defensive: an empty pool, a stale index, and a short state list.
+  assert.deepEqual(keyRotationOrder(2, 1, [blocked, blocked], now), [0, 1])
+  // Defensive: an empty pool, a stale cursor, and a short state list.
   assert.deepEqual(keyRotationOrder(0, 0, [], now), [])
-  assert.deepEqual(keyRotationOrder(2, 7, [healthy, healthy], now), [1, 0])
-  assert.deepEqual(keyRotationOrder(2, -1, [healthy, healthy], now), [1, 0])
-  assert.deepEqual(keyRotationOrder(2, 0, [], now), [0, 1])
+  assert.deepEqual(keyRotationOrder(2, 7, [healthy, healthy], now), [0, 1])
+  assert.deepEqual(keyRotationOrder(2, -1, [healthy, healthy], now), [0, 1])
+  assert.deepEqual(keyRotationOrder(2, 0, [], now), [1, 0])
 })
 
 test('keyPoolSignature: stable per pool, different when the pool changes', () => {

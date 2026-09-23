@@ -18,7 +18,8 @@
  *   - the valid path is untouched,
  *   - (0.8.2) a non-http(s) `url` throws too, instead of the old
  *     `invalid url: undefined` string the model could read as data,
- *   - (0.8.2) ocr without a key throws for the same reason,
+ *   - (0.8.2) a key-gated pipeline (readerlm-v2 / jina_read_pdf) without a key
+ *     throws for the same reason,
  *   - (0.8.2) an upstream 401/422 throws, while 0/402/429/5xx stay returned
  *     hints — and `jina_primer` keeps its "never throws" contract.
  */
@@ -213,8 +214,12 @@ test('jina_read: a valid url still reaches the Reader unchanged', async () => {
   assert.match(out, /Title: Example/, 'the markdown still comes back')
 })
 
-test('jina_read: ocr without a key throws instead of returning a refusal string', async () => {
-  await rejected('jina_read', { url: 'https://example.com/paper.pdf', ocr: true }, /ocr requires a Jina API key/)
+test('jina_read: readerlm without a key throws instead of returning a refusal string', async () => {
+  await rejected('jina_read', { url: 'https://example.com', readerlm: true }, /readerlm requires a Jina API key/)
+})
+
+test('jina_read_pdf: without a key throws instead of returning a refusal string', async () => {
+  await rejected('jina_read_pdf', { url: 'https://example.com/paper.pdf' }, /jina_read_pdf requires a Jina API key/)
 })
 
 test('an upstream 401 throws: a credential problem must not look like data', async () => {

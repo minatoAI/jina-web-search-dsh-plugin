@@ -13,7 +13,7 @@
  * `cordis.patch.yml`) *is* the settings namespace, and this host half declares
  * its live fields through the module-level `Config` export built by proxy.js —
  * `proxyUrl` carries a manually configured local proxy address and the
- * remaining fields carry the reader policy (`useOcr`, `imagePolicy`,
+ * remaining fields carry the reader policy (`useReaderLm`, `imagePolicy`,
  * `autoAltText`, `useSelectors` and the selector overrides). The browser half
  * registers its configuration form for that namespace, so the Plugins page
  * (the `dsh-jina` bundle card) renders the form only when the two halves agree.
@@ -147,10 +147,11 @@ export function apply(ctx, config) {
   let keyDiag = ''
   /**
    * Rotation state for the pool currently resolved: a signature (so saving or
-   * clearing a key resets it), one state per pool index, and the sticky
-   * preferred index. In-memory only — a restart starts from the first slot.
+   * clearing a key resets it), one state per pool index, and the round-robin
+   * cursor (`lastUsed`, -1 before any call). In-memory only — a restart starts
+   * from the first slot.
    */
-  let keyPoolState = { signature: 0, states: [], active: 0 }
+  let keyPoolState = { signature: 0, states: [], lastUsed: -1 }
   let proxyCache = { text: undefined, at: 0, done: false }
   /**
    * The resolved `jina-tools` config for this plugin instance (see the `Config`
@@ -354,7 +355,7 @@ export function apply(ctx, config) {
   function keyStateFor(pool) {
     const signature = keyPoolSignature(pool)
     if (keyPoolState.signature !== signature || keyPoolState.states.length !== pool.length) {
-      keyPoolState = { signature, states: pool.map(() => clearKeyState()), active: 0 }
+      keyPoolState = { signature, states: pool.map(() => clearKeyState()), lastUsed: -1 }
     }
     return keyPoolState
   }
@@ -581,13 +582,13 @@ export function apply(ctx, config) {
    */
   async function walkKeyPool(pool, state, attempts, tried, mkRequest) {
     let last
-    for (const index of keyRotationOrder(pool.length, state.active, state.states, Date.now())) {
+    for (const index of keyRotationOrder(pool.length, state.lastUsed, state.states, Date.now())) {
       const entry = pool[index]
       if (tried.has(entry.value)) continue
       tried.add(entry.value)
       const res = await jinaRequest(mkRequest(entry.value))
       if (res.ok) {
-        state.active = index
+        state.lastUsed = index
         state.states[index] = clearKeyState()
         return { res, index, fatal: false }
       }
@@ -667,11 +668,27 @@ export function apply(ctx, config) {
   function describeJinaError(res) {
     const status = res.status || 0
     const body = String(res.text || '').slice(0, 800)
+    // 422 is not one thing, so it is routed by the message the Reader sends:
+    //   - "with target selector …"  → the CSS selector matched nothing;
+    //   - "No content available"    → the page yielded nothing at all;
+    //   - "Screenshot of the page is not available" → the page could not be
+    //     RENDERED. That last one is the render step the OCR pipeline depends
+    //     on, and the same failure comes back as HTTP 200 with fabricated text
+    //     on other pages, so it must never be reported as "your arguments are
+    //     invalid" — the model would then "fix" perfectly good parameters.
+    let hint422 = 'Invalid request parameters.'
+    if (/screenshot of the page is not available/i.test(body)) {
+      hint422 = 'The Reader could not render this page (screenshot unavailable). Retrying later sometimes works; for a text page prefer the plain extractor over OCR.'
+    } else if (/with target selector/i.test(body)) {
+      hint422 = 'The target selector matched nothing on this page. Retry with targetSelector: "" to read the whole page.'
+    } else if (/no content available/i.test(body)) {
+      hint422 = 'The Reader extracted no content from this URL. If a target selector was sent, it may simply match nothing on this page (retry with targetSelector: "").'
+    }
     const hints = {
       0: 'No response from the Jina API (network/VPN problem). Check that the local VPN and its system proxy are enabled, then retry.',
       401: 'Invalid or expired API key. Fix: update it in the DSH settings page (Jina Tools) or the key file. Get a free key: https://jina.ai/?sui=apikey',
       402: 'API quota exhausted. Fix: top up credits at https://jina.ai/api-dashboard/billing',
-      422: 'Invalid request parameters.',
+      422: hint422,
       429: 'Rate limit hit. Wait a few seconds and retry, or add an API key for higher limits.',
     }
     let msg = 'Jina API error (HTTP ' + status + '). ' + (hints[status] || '')
@@ -681,7 +698,12 @@ export function apply(ctx, config) {
       const hint = proxyHint(res.proxy)
       if (hint !== '') msg += ' ' + hint
     }
-    if (status >= 500) msg = 'Jina API server error (HTTP ' + status + '). Retry in a moment; status: https://status.jina.ai'
+    if (status >= 500) {
+      msg = 'Jina API server error (HTTP ' + status + '). Retry in a moment; status: https://status.jina.ai'
+      // Official guidance for the model pipelines: they are serverless, a cold
+      // start answers 503, and the vendor says to retry after 30-60 seconds.
+      if (status === 503) msg += ' If this call used a model pipeline (X-Respond-With: jina-ocr-v1 / readerlm-v2), a cold start is the likely cause — the vendor\'s guidance is to retry after 30–60 seconds.'
+    }
     // The pool's own account of what it tried: a quota error on a single key
     // reads very differently once the user can see every saved key was tried.
     if (Array.isArray(res.keyAttempts) && res.keyAttempts.length > 0) {
@@ -1079,16 +1101,95 @@ export function apply(ctx, config) {
     return ''
   }
 
+  /** jina-ocr-v1's documented output cap (`max_new_tokens=4096`). */
+  const OCR_OUTPUT_CAP = 4096
+  /** Pages a bare `jina_read_pdf` call covers before the caller asks for more. */
+  const PDF_DEFAULT_PAGES = 5
+  /** Hard ceiling on `maxPages`: one call must not be able to drain an account. */
+  const PDF_MAX_PAGES = 50
+
+  /** Whether a URL looks like a PDF (path ends in `.pdf`, ignoring query/hash). */
+  function isPdfUrl(value) {
+    const raw = String(value === undefined || value === null ? '' : value).trim()
+    if (raw === '') return false
+    let path = raw
+    try { path = new URL(raw).pathname } catch (err) { path = raw.split(/[?#]/)[0] }
+    return /\.pdf$/i.test(path)
+  }
+
+  /** Whether a 422 body says the target selector matched nothing. */
+  function selectorMismatch(res) {
+    return /with target selector/i.test(String(res && res.text !== undefined ? res.text : ''))
+  }
+
+  /**
+   * The page numbers one `jina_read_pdf` call reads.
+   *
+   * `spec` is 1-indexed and accepts `3`, `1-5` or `2,4,7`. Anything unparsable
+   * falls back to the default range instead of throwing — a model that wrote
+   * "pages 1 to 3" should still get its pages.
+   */
+  function planPages(spec, maxPages) {
+    const wanted = Number(maxPages)
+    const cap = Number.isFinite(wanted) && wanted > 0 ? Math.min(Math.floor(wanted), PDF_MAX_PAGES) : PDF_DEFAULT_PAGES
+    const pages = []
+    const push = (n) => {
+      if (Number.isInteger(n) && n >= 1 && n <= PDF_MAX_PAGES && pages.indexOf(n) === -1) pages.push(n)
+    }
+    if (typeof spec === 'string' && spec.trim() !== '') {
+      for (const part of spec.split(',')) {
+        const piece = part.trim()
+        if (piece === '') continue
+        const range = piece.match(/^(\d+)\s*[-–~]\s*(\d+)$/)
+        if (range) {
+          for (let n = Number(range[1]); n <= Number(range[2]) && pages.length < PDF_MAX_PAGES; n++) push(n)
+          continue
+        }
+        push(Number(piece))
+      }
+    }
+    if (pages.length === 0) for (let n = 1; n <= cap; n++) push(n)
+    return pages.sort((a, b) => a - b)
+  }
+
+  /** The numeric `usage` object one Reader payload reports, or undefined. */
+  function readerUsage(text) {
+    try {
+      const parsed = JSON.parse(text)
+      const usage = (parsed && parsed.usage) || (parsed && parsed.data && parsed.data.usage)
+      if (usage !== null && typeof usage === 'object') return usage
+    } catch (err) { /* not JSON */ }
+    return undefined
+  }
+
+  /**
+   * The provenance marker a generative pipeline earns.
+   *
+   * Neither `jina-ocr-v1` nor `readerlm-v2` extracts text — both *produce* it,
+   * so their output can silently differ from the page (measured: the same
+   * arXiv paper came back correct as a PDF and wholly fabricated as HTML).
+   * Saying so inside the result is the cheapest guard there is: the model
+   * reading it can choose to verify instead of quoting it as fact.
+   */
+  function pipelineNote(pipeline) {
+    if (pipeline === 'jina-ocr-v1') {
+      return '\n\n[Reader pipeline: jina-ocr-v1 — a generative document model transcribed this page image. Numbers, names and tables can be misread or invented; verify anything load-bearing against the source.]'
+    }
+    if (pipeline === 'readerlm-v2') {
+      return '\n\n[Reader pipeline: readerlm-v2 — a generative HTML→Markdown model produced this text rather than extracting it verbatim; verify anything load-bearing against the source.]'
+    }
+    return ''
+  }
+
   ctx.tools.register({
     name: 'jina_read',
-    description: 'Read a web page as clean markdown via Jina Reader (r.jina.ai), mirroring the jina-cli \'read\' command. Uses the vendor\'s `agent` preset, resolves relative links against the post-redirect URL, and strips page chrome by default. Set ocr for scanned PDFs or image-heavy documents. Works without an API key (rate-limited) except for ocr.',
+    description: 'Read a web page as clean markdown via Jina Reader (r.jina.ai), mirroring the jina-cli \'read\' command. Uses the vendor\'s `agent` preset, resolves relative links against the post-redirect URL, and strips page chrome by default. Works without an API key (rate-limited) unless readerlm is on. For a scanned / image-only PDF use jina_read_pdf; for a PDF with a text layer this tool is the cheaper and verbatim path.',
     parameters: {
       type: 'object',
       additionalProperties: false,
       properties: {
         url: { type: 'string', description: 'Page URL, starting with http:// or https://.' },
-        ocr: { type: 'boolean', description: 'Read through jina-ocr-v1 (document OCR: scanned PDFs, image-heavy pages, complex tables and formulas). Costs roughly 40x the tokens and requires an API key.' },
-        page: { type: 'number', description: 'With ocr: transcribe one page of a multi-page document (1-indexed).' },
+        readerlm: { type: 'boolean', description: 'Read through ReaderLM-v2 (X-Respond-With: readerlm-v2), Jina\'s HTML→Markdown model, for pages the plain extractor mangles. Costs roughly 3x the tokens plus a 4000-token minimum and requires an API key. Ignored for .pdf URLs — use jina_read_pdf for those.' },
         targetSelector: { type: 'string', description: 'CSS selector(s) to keep instead of the whole page (overrides the configured default list).' },
         waitForSelector: { type: 'string', description: 'CSS selector to wait for before extracting (dynamically rendered pages).' },
         removeSelector: { type: 'string', description: 'CSS selector(s) to drop before extracting (overrides the configured default list).' },
@@ -1105,17 +1206,33 @@ export function apply(ctx, config) {
       requireUrlArg('jina_read', args, 'url', ['uri', 'link', 'href'])
       const signal = enterExec(exec)
       const defaults = toolSettings()
-      const useOcr = args.ocr === true || (args.ocr === undefined && defaults.useOcr === true)
+      // ReaderLM-v2 is the vendor's HTML → Markdown model, i.e. the documented
+      // tool for *web pages*. OCR deliberately lives in jina_read_pdf instead:
+      // jina-ocr-v1 reads ONE rendered page image per call, so a long HTML page
+      // is crushed into the global 1024x1024 view and the model invents what it
+      // cannot read (measured: the same arXiv paper fabricated as HTML, correct
+      // as PDF). A .pdf URL therefore never gets ReaderLM either — the plain
+      // extractor reads PDFs natively, verbatim and ~40x cheaper.
+      const pdfUrl = isPdfUrl(args.url)
+      const readerLmWanted = args.readerlm === true || (args.readerlm === undefined && defaults.useReaderLm === true)
+      const useReaderLm = readerLmWanted && !pdfUrl
       const key = args.apiKey || await loadKey()
-      if (useOcr && !key) {
-        throw new Error('ocr requires a Jina API key: the Reader rejects jina-ocr-v1 for anonymous callers (HTTP 401, '
-          + '"Authentication is required to use this feature (Vision Language Model / OCR)"). '
+      if (useReaderLm && !key) {
+        throw new Error('readerlm requires a Jina API key: the Reader rejects ReaderLM-v2 for anonymous callers (HTTP 401, '
+          + '"Authentication is required to use this feature (Language Model)"). '
           + 'Save a key in the Plugins → dsh-jina card, or pass apiKey.')
       }
       // Alt-text generation is key-gated AND mutually exclusive with
       // X-Respond-With, so it is only ever sent for the plain pipeline.
-      const useAltText = !useOcr && defaults.autoAltText === true && key !== undefined
-      const selectorsOn = defaults.useSelectors !== false
+      const useAltText = !useReaderLm && defaults.autoAltText === true && key !== undefined
+      // The selector group belongs to the DOM extractor. A model pipeline
+      // consumes the whole page instead, and — verified live — sending the
+      // group together with `X-Respond-With: readerlm-v2` makes the Reader
+      // answer 422 "No content available" as soon as the selector matches
+      // nothing (i.e. on every page the default list does not fit). So it is
+      // dropped here rather than retried: the group is a default, and a default
+      // must never be a trap.
+      const selectorsOn = defaults.useSelectors !== false && !useReaderLm
 
       /** Build one request's headers; the retry flips `withSelectors` off. */
       const buildHeaders = (withSelectors) => {
@@ -1130,9 +1247,8 @@ export function apply(ctx, config) {
         }
         if (args.links) headers['X-With-Links-Summary'] = 'all'
         if (args.images) headers['X-With-Images-Summary'] = 'true'
-        if (useOcr) {
-          headers['X-Respond-With'] = 'jina-ocr-v1'
-          if (args.page !== undefined) headers['X-Page'] = String(args.page)
+        if (useReaderLm) {
+          headers['X-Respond-With'] = 'readerlm-v2'
         } else if (useAltText) {
           headers['X-With-Generated-Alt'] = 'true'
         }
@@ -1151,7 +1267,7 @@ export function apply(ctx, config) {
       const request = (headers) => callJina({
         url: READER, method: 'POST', headers,
         body: { url: String(args.url) }, timeoutMs: 120000,
-        needsKey: useOcr || useAltText, apiKey: args.apiKey, signal,
+        needsKey: useReaderLm || useAltText, apiKey: args.apiKey, signal,
       })
 
       let res = await request(buildHeaders(selectorsOn))
@@ -1167,6 +1283,17 @@ export function apply(ctx, config) {
           content = retryContent
         }
       }
+      // The same "selector matched nothing" failure has a second shape: the
+      // Reader answers 422 with the selector in the message instead of coming
+      // back short. The group is a default, never a trap, so retry once without
+      // it instead of telling the model its arguments are invalid.
+      if (!res.ok && res.status === 422 && selectorsOn && selectorMismatch(res)) {
+        const retry = await request(buildHeaders(false))
+        if (retry.ok) {
+          res = retry
+          content = readPayload(retry.text).content
+        }
+      }
       if (!res.ok) return failJina(res)
       if (args.json) return res.text
       if (content === '') return res.text
@@ -1178,7 +1305,112 @@ export function apply(ctx, config) {
           + (payload.published !== '' ? '\nPublished Time: ' + payload.published : '')
           + '\n\nMarkdown Content:\n' + out
       }
-      return out + usageFooter(res.text) + keySwitchNote(res)
+      // ReaderLM was configured (or asked for) but this is a PDF: say so, so the
+      // caller never reads the plain extractor's output as a model's.
+      const pdfNote = readerLmWanted && pdfUrl
+        ? '\n\n[readerlm was not applied: this URL is a PDF, so the plain extractor read it (verbatim and ~40x cheaper than OCR). Use jina_read_pdf only when the PDF is a scan with no text layer.]'
+        : ''
+      return out + usageFooter(res.text) + pipelineNote(useReaderLm ? 'readerlm-v2' : '') + pdfNote + keySwitchNote(res)
+    },
+  })
+
+  ctx.tools.register({
+    name: 'jina_read_pdf',
+    description: 'Read a PDF as Markdown through jina-ocr-v1, Jina\'s 3.4B document-OCR model — the pipeline that works on scanned / image-only PDFs, where jina_read returns almost nothing. The Reader renders each page to an image and the model transcribes it, so pages are requested ONE AT A TIME (the API silently serves page 1 again when asked for a page past the end, which is how this tool detects the end). Try jina_read first: a PDF with a text layer is verbatim and ~40x cheaper there. Costs ~40x the plain extractor\'s tokens.',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        url: { type: 'string', description: 'PDF URL (https). Must look like a PDF unless allowNonPdf is set.' },
+        pages: { type: 'string', description: 'Pages to read, 1-indexed: "3", "1-5" or "2,4,7". Default: the first maxPages pages.' },
+        maxPages: { type: 'number', description: 'How many pages the default range covers. Default: 5. Hard cap: 50.' },
+        allowNonPdf: { type: 'boolean', description: 'Read a URL that does not look like a PDF anyway. OCR on ordinary web pages can fabricate content — prefer jina_read there.' },
+        apiKey: { type: 'string', description: 'Optional Jina API key override.' },
+      },
+      required: ['url'],
+    },
+    output: OUT,
+    async execute(args, exec) {
+      requireUrlArg('jina_read_pdf', args, 'url', ['uri', 'link', 'href'])
+      const signal = enterExec(exec)
+      const url = String(args.url)
+      if (!isPdfUrl(url) && args.allowNonPdf !== true) {
+        throw new Error('jina_read_pdf expects a PDF URL: "' + url + '" does not end in .pdf. '
+          + 'jina-ocr-v1 is a document model — it reads one rendered page image per call, and on ordinary web pages it is known to invent text it cannot read. '
+          + 'Use jina_read for web pages, or pass allowNonPdf: true if this URL really is a PDF.')
+      }
+      const key = args.apiKey || await loadKey()
+      if (!key) {
+        throw new Error('jina_read_pdf requires a Jina API key: the Reader rejects jina-ocr-v1 for anonymous callers (HTTP 401, '
+          + '"Authentication is required to use this feature (Vision Language Model / OCR)"). '
+          + 'Save a key in the Plugins → dsh-jina card, or pass apiKey.')
+      }
+      const defaults = toolSettings()
+      const pages = planPages(args.pages, args.maxPages)
+      const sections = []
+      const warnings = []
+      const seen = new Map()
+      let title = ''
+      let source = url
+      let stopped = ''
+      let scaled = 0
+      let switchNote = ''
+      for (const page of pages) {
+        const res = await callJina({
+          url: READER, method: 'POST',
+          headers: {
+            Accept: 'application/json',
+            'Content-Type': 'application/json',
+            'X-Md-Link-Style': 'discarded',
+            'X-Preset': READER_PRESET,
+            'X-Base': READER_BASE,
+            'X-Timeout': String(READER_TIMEOUT_SECONDS),
+            'X-Retain-Images': defaults.imagePolicy,
+            'X-Respond-With': 'jina-ocr-v1',
+            'X-Page': String(page),
+          },
+          body: { url }, timeoutMs: 120000, needsKey: true, apiKey: args.apiKey, signal,
+        })
+        if (!res.ok) {
+          // A first page that fails is the whole call failing; a later page that
+          // fails only truncates the result, so keep what was read and say so.
+          if (sections.length === 0) return failJina(res)
+          warnings.push('page ' + page + ': ' + describeJinaError(res).split('\n')[0])
+          stopped = 'page ' + page + ' failed'
+          break
+        }
+        switchNote = switchNote || keySwitchNote(res)
+        const payload = readPayload(res.text)
+        if (title === '' && payload.title !== '') title = payload.title
+        if (payload.url !== '') source = payload.url
+        const usage = readerUsage(res.text)
+        if (usage && typeof usage.scaledTokens === 'number') scaled += usage.scaledTokens
+        const text = payload.content.trim()
+        if (text === '' || text.toLowerCase() === 'null') {
+          stopped = 'page ' + page + ' came back empty'
+          break
+        }
+        const fingerprint = text.replace(/\s+/g, ' ').slice(0, 4000)
+        if (seen.has(fingerprint)) {
+          // Verified against the live API: an out-of-range X-Page silently
+          // returns page 1 again, so a repeat is the end-of-document signal.
+          stopped = 'page ' + page + ' repeated page ' + seen.get(fingerprint) + ' (past the end of the document)'
+          break
+        }
+        seen.set(fingerprint, page)
+        if (usage && usage.outputTokens === OCR_OUTPUT_CAP) {
+          warnings.push('page ' + page + ' hit the model output cap (' + OCR_OUTPUT_CAP + ' tokens): it may be truncated, or a degenerate repetition')
+        }
+        sections.push('## Page ' + page + '\n\n' + text)
+      }
+      if (sections.length === 0) return '(no page could be read)'
+      const head = (title !== '' ? 'Title: ' + title + '\n' : '') + 'URL Source: ' + source + '\n\n'
+      const meta = '[jina_read_pdf: ' + sections.length + ' page(s) via jina-ocr-v1'
+        + (scaled > 0 ? ', ' + scaled + ' tokens billed' : '')
+        + (stopped !== '' ? '; stopped because ' + stopped : '')
+        + ']'
+      const tail = warnings.length > 0 ? '\n\n[Warnings]\n' + warnings.map((w) => '- ' + w).join('\n') : ''
+      return head + meta + '\n\n' + sections.join('\n\n') + pipelineNote('jina-ocr-v1') + tail + switchNote
     },
   })
 
@@ -1480,7 +1712,6 @@ export function apply(ctx, config) {
         }
         const pool = await loadKeyPool()
         const state = keyStateFor(pool)
-        const activeIndex = pool.length === 0 ? -1 : Math.min(state.active, pool.length - 1)
         // One probe per key, in parallel: this is where the pool is kept clean.
         const probes = await Promise.all(pool.map((entry) => probeKey(entry.value)))
         const discarded = []
