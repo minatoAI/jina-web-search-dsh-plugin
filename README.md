@@ -10,14 +10,14 @@ DeepSeek Harness 的 [Jina AI](https://jina.ai/) 插件（bundle）：把 Jina R
 
 > 此处仅展示最新版本，完整版本历史见 [change-log.md](./change-log.md)。
 
-### 0.12.0（2026-09-24）
+### 0.12.1（2026-09-24）
 
-- **feat** **新增「接口域名」开关（国内 / 国际 / 自动），插件从此不需要代理**。`jina-tools` 命名空间新增 `endpoint` 字段，卡片上是一个三选一的下拉：`cn` = Jina 官方国内镜像 `r.jinaai.cn` / `s.jinaai.cn`；`global` = `r.jina.ai` / `s.jina.ai`；`auto`（默认）= **先用上次可用的那一侧，失败后自动改用另一侧**，进程内记住胜者。实测依据：国内镜像解析到 182.140.172.x / 220.167.110.x（`Server: ESA`，阿里云边缘），**不走任何代理**直连 200，返回内容与经代理访问 `r.jina.ai` **逐字节一致**（7521 字符、同一标题），稳定后 1.1–1.2s；`api.jina.ai` 的国内域名不存在（`api.jinaai.cn` → HTTP 525），且按 SNI 阻断，所以它随本次改动一起被移除（见下一条）。
-- **change** **移除 5 个工具**：`jina_embed` / `jina_rerank` / `jina_classify`（`api.jina.ai`，无国内域名）、`jina_expand`（`s.jina.ai` 不支持 `query_expansion`）、`jina_pdf`（`extract-pdf` 只在 `svip.jina.ai` 上存在，无国内镜像）。依据是真实使用量：近 21 天 557 个会话日志里，这 5 个工具合计只有 21 条调用记录（约 10 次调用），而 `jina_read` 2570 条、`jina_web_search` 1620 条。这些能力将迁到独立仓库维护。
-- **change** **删除整套代理机制**：`proxy.js`（代理地址规范化 / 优先级 / WinINET 自动发现）被 `settings.js`（设置与端点策略）取代，卡片上的「本地代理」输入框、`JINA_PROXY_URL` 环境变量、错误信息里的代理提示、`/api/dsh-jina/primer` 的 `proxy` 字段全部移除。国内域名的请求会通过 `NO_PROXY` **追加** `jinaai.cn`（不覆盖继承来的列表），确保即使启动环境里带着 `HTTP_PROXY` 也不会把国内 CDN 地址塞进 VPN。
-- **change** **搜索端点从 `svip.jina.ai` 迁到 `s.jina.ai`**（国内镜像 `s.jinaai.cn`）：这是官方文档化的端点，两侧返回同一形状 `{ code, status, data: [{ title, url, description, date }] }`，因此一个格式化函数覆盖两条路由（`fmtSearch` 已适配，同时仍容忍旧的 `{ results: [...] }` 形状）。`domain` 字段在 `s.jina.ai` 上**不生效**（实测返回了 distill.pub 的结果），所以 arxiv / ssrn 两个学术工具改用实测有效的 `site` 字段（`site: 'arxiv.org'` / `site: 'ssrn.com'`）。
-- **fix** **传输失败不再重试同一个 host**：旧行为是原地重试一次，配合 120s 超时最坏要等 **240s** 才报错。现在 `auto` 模式把失败当作路由事实——换到另一侧，每个 host 只试一次、每次调用最多两次尝试；`cn` / `global` 这种固定模式则一次失败即报错，并在错误里列出**实际尝试过的接口域名**。
-- **test** 全套 **150 例：149 通过 / 1 例按需跳过 / 0 失败**。新增 `test/settings.test.js`（端点策略纯函数：模式校验、路由顺序、`NO_PROXY` 合并）与 `test/plugin-endpoints.test.js`（假宿主集成：默认走国际侧、失败自动切国内侧并附加 `NO_PROXY`、固定模式不回落、胜者记忆、搜索用搜索域名对、`site` 字段、保存即时生效、primer 报告实际使用的域名），其中 `JINA_LIVE_CN=1` 的用例会真实 spawn helper 打通一次国内域名请求（实测通过，824ms）。
+- **fix** **`jina_read` 不再因为默认选择器组卡死**。`X-Target-Selector` 隐含服务端 `X-Wait-For-Selector`，选择器命不中时服务端会一直等到 `X-Timeout`——原来是 120s，与客户端自己的 120s 上限撞在一起，于是"默认选择器列表不适配这页"被报成**网络超时**（实测：某新闻页带选择器组的请求 >45s 无响应，而同一页不带选择器组 30s 就回来了；你在 36kr 那页遇到的就是这个）。现在带目标选择器的那次尝试把服务端耐心降到 **30s**、客户端上限降到 **45s**，服务端必定先应答（通常就是既有的 422），"整页重读"回退随即生效；并且新增**第三种回退形态**：选择器尝试直接超时（status 0）时也改用整页重读，而不是报网络错误。**实测**：163.com 那页 4.3s 成功、36kr 1.9s 成功，各两次尝试（选择器 → 整页）。
+- **fix** **`targetSelector: ""` 现在真的表示"读整页"**。此前空字符串会回落到内置列表，导致 422 提示里那句 `retry with targetSelector: ""` 是失效建议；现在只有**不传**该参数才回落到配置列表 / 内置列表，显式传空串则不发 `X-Target-Selector`（`X-Remove-Selector` 的噪声清理仍然保留）。
+- **fix** **`jina_primer` 的网络段恢复**。`ipinfo.io` 的请求此前被新的端点路由吞掉（打到 Reader 根、拿回 usage 文本），`network` 一直是 `null`。现在 `jinaRequest` 支持**显式绝对 URL 逃生口**，只有 Jina 主机才走端点表。实测恢复为真实公网 IP / 城市 / ASN。
+- **test** 全套 **155 例：154 通过 / 1 例按需跳过 / 0 失败**。新增 4 例：选择器尝试的耐心与客户端上限、显式空 `targetSelector` 读整页、选择器尝试超时→整页回退、无选择器组时传输失败只报域名不重试；以及 `jina_primer` 的 ipinfo 绝对 URL 回归。
+
+> 0.12.0（接口域名开关、移除 5 个工具与整套代理机制）的完整说明见 [change-log.md](./change-log.md)。
 
 ## 功能
 
@@ -45,7 +45,7 @@ DeepSeek Harness 的 [Jina AI](https://jina.ai/) 插件（bundle）：把 Jina R
 | 选择器组 | `useSelectors` | 开 | 默认发保守的 `X-Target-Selector`（只含 `article` / `main` / `[role="main"]` / `.markdown-body` 等正文容器）与 `X-Remove-Selector`（页眉页脚、导航、cookie 横幅、广告、侧栏、评论等）。命中不到时**自动回退整页重试**，不会返回空 |
 | 正文 / 排除选择器 | `targetSelector` / `removeSelector` | 空 = 内置列表 | 覆盖内置选择器（站点结构特殊、默认列表误伤时用） |
 
-每次 `jina_read` 还会固定发送三个零副作用参数：`X-Preset: agent`（官方为 AI agent 预调的预设；官方文档明确 preset **只填充调用方未显式设置的选项**，所以不会覆盖任何显式参数）、`X-Base: final`（用重定向后的最终 URL 解析相对链接）、`X-Timeout: 120`（与客户端自己的 120s 上限对齐——若发官方的上限 180，客户端会先超时并报自己的错误，多出来的耐心是浪费的；要改就两边一起改）。
+每次 `jina_read` 还会固定发送三个零副作用参数：`X-Preset: agent`（官方为 AI agent 预调的预设；官方文档明确 preset **只填充调用方未显式设置的选项**，所以不会覆盖任何显式参数）、`X-Base: final`（用重定向后的最终 URL 解析相对链接）、`X-Timeout: 120`（与客户端自己的 120s 上限对齐——若发官方的上限 180，客户端会先超时并报自己的错误，多出来的耐心是浪费的；要改就两边一起改）。**例外**：带目标选择器的那次尝试，服务端耐心压到 30s、客户端上限 45s——因为 `X-Target-Selector` 隐含 `X-Wait-For-Selector`，"命不中就一直等"会撞上客户端上限而被误报成网络超时（0.12.1）。
 
 调用级参数（`jina_read`）：`targetSelector`、`waitForSelector`、`removeSelector`、`noCache`，以及原有的 `links` / `images` / `json` / `apiKey`。
 调用级参数（`jina_read_pdf`）：`url`、`pages`、`maxPages`、`allowNonPdf`、`apiKey`。非 `.pdf` 的 URL 会被拒绝（`allowNonPdf: true` 可强制放行）——因为 `jina-ocr-v1` 在普通网页上会**编造内容**。
@@ -242,7 +242,7 @@ npm test   # 等价于 node --test（自动发现 test/*.test.js）
 
 - `test/settings.test.js`、`test/primer.test.js`、`test/keys.test.js`、`test/tools.test.js`：纯函数与模型可见契约（`keys.test.js` 覆盖凭据引用语法、key 文件解析、状态归类、冷却折叠、轮换顺序、池签名与来源标签；`settings.test.js` 覆盖端点模式校验、路由顺序、`NO_PROXY` 合并）。
 - `test/multi-key.test.js`：用假 Cordis 上下文驱动主机半身，逐请求解码网络 helper 的 stdin 并断言 `Authorization`，覆盖 402→备用 key 接管并**从凭据存储删除**该 key、401 同样丢弃、429 只跳过、只读环境变量与 key 文件来源不被删除、均流轮换与冷却跳过、三 key 顺序轮换、422/5xx/网络失败不轮换（传输失败只换端点域名，不轮换 key）、显式 `apiKey` 不轮换、全池耗尽的逐 key 报错、key 文件回退与多行解析、同 key 去重、添加 key 下一次调用即生效，以及 primer 路由只返回数量与总额且余额为 0 的 key 被丢弃。
-- `test/reader-headers.test.js`：用假 Cordis 上下文驱动主机半身，**解码网络 helper 的 stdin**，逐条断言 `jina_read` 真实发出的 Reader 请求头——固定三项（`X-Preset: agent` / `X-Base: final` / `X-Timeout: 120`）、图片策略、选择器组与"空结果自动重试"、OCR 开关与 `X-Page`、无 key 时零请求、alt 生成的 opt-in / 需 key / 与 OCR 互斥、JSON 信封解包与 usage、不可解析响应原文兜底，以及设置 schema 的字段声明（7 个字段都带 `meta.volatile`）、`validate` 的容错面与"保存后下一次调用即生效"。
+- `test/reader-headers.test.js`：用假 Cordis 上下文驱动主机半身，**解码网络 helper 的 stdin**，逐条断言 `jina_read` 真实发出的 Reader 请求头——固定参数（`X-Preset: agent` / `X-Base: final`）、`X-Timeout` 与客户端上限按"带不带目标选择器"分成 30s/45s 与 120s/120s 两档、图片策略、选择器组的三种回退（短正文 / 422 / 超时）与"显式空 `targetSelector` 读整页"、OCR 开关与 `X-Page`、无 key 时零请求、alt 生成的 opt-in / 需 key / 与 OCR 互斥、JSON 信封解包与 usage、不可解析响应原文兜底，以及设置 schema 的字段声明（7 个字段都带 `meta.volatile`）、`validate` 的容错面与"保存后下一次调用即生效"。
 - `test/plugin-endpoints.test.js`：用假 Cordis 上下文驱动主机半身，断言 `Config` 导出的 volatile 契约、**每次尝试真实请求的 URL**、**网络 helper 实际收到的环境变量**（国内域名附加 `NO_PROXY`、其他情况完整继承）、错误文案里实际尝试过的域名，以及 `/api/dsh-jina/primer` 负载（含 `settingsLive` 与本次使用的端点侧）。其中带 `JINA_LIVE_CN=1` 的用例会真实 spawn helper 打通一次国内域名请求：
 
   ```powershell

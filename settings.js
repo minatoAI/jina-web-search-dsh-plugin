@@ -164,6 +164,27 @@ export const READER_BASE = 'final'
 export const READER_TIMEOUT_SECONDS = 120
 
 /**
+ * The server-side patience of an attempt that carries a target selector.
+ *
+ * `X-Target-Selector` implies `X-Wait-For-Selector` with the same value, so a
+ * selector that never appears costs a *wait* — and with the full 120 s patience
+ * the Reader can outlive the client's own 120 s ceiling, which turns "the
+ * default selector list did not match this page" into a transport timeout.
+ * Measured on a news page whose container the list does not match: the Reader
+ * sat on the request for more than 45 s, while the same page without the
+ * selector group answered in 30 s. Capping this attempt's patience makes the
+ * server answer first (usually the 422 the fallback already handles), so
+ * index.js re-reads the whole page instead of reporting a network failure.
+ */
+export const SELECTOR_WAIT_TIMEOUT_SECONDS = 30
+
+/**
+ * The client ceiling for that attempt: above the server patience, so the answer
+ * arrives before the abort, and well below the 120 s a selector-less read gets.
+ */
+export const SELECTOR_ATTEMPT_TIMEOUT_MS = 45000
+
+/**
  * Conservative `X-Target-Selector` default: only containers that reliably mean
  * "this is the article". `X-Target-Selector` implies `X-Wait-For-Selector` with
  * the same value, so a selector that matches nothing costs a wait — which is

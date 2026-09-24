@@ -1,6 +1,6 @@
 {
   "name": "dsh-jina",
-  "version": "0.12.0",
+  "version": "0.12.1",
   "description": "Jina AI tools for DeepSeek Harness: search (incl. arxiv/ssrn academic domains), read (plain extraction, plus jina_read_pdf for jina-ocr-v1 document OCR), screenshot, datetime, primer — with a Plugins-page UI for several API keys (round-robin + automatic failover), the endpoint host pair (mainland mirrors / global / auto) and reader options.",
   "type": "module",
   "main": "index.js",

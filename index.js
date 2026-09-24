@@ -64,7 +64,8 @@ import {
 import { buildPrimer, formatPrimer, parseIpInfo, parseJinaRoot } from './primer.js'
 import {
   DEFAULT_REMOVE_SELECTORS, DEFAULT_TARGET_SELECTORS,
-  READER_BASE, READER_PRESET, READER_TIMEOUT_SECONDS, SELECTOR_RETRY_MIN_CHARS,
+  READER_BASE, READER_PRESET, READER_TIMEOUT_SECONDS, SELECTOR_ATTEMPT_TIMEOUT_MS,
+  SELECTOR_RETRY_MIN_CHARS, SELECTOR_WAIT_TIMEOUT_SECONDS,
   cnBypassEnv, createSettingsSchema, routePlan,
   settingsAreLive, settingsSnapshot, toolSettingsOf,
 } from './settings.js'
@@ -133,6 +134,12 @@ export const HTTP_HELPER_SCRIPT = [
 export function apply(ctx, config) {
   const IPINFO = 'https://ipinfo.io/json'
   const MAX_OUT = 1500000
+  /**
+   * The client ceiling for a read that carries no target selector, matched to
+   * the `X-Timeout: 120` every read sends. A read that *does* carry one runs on
+   * `SELECTOR_ATTEMPT_TIMEOUT_MS` instead (settings.js explains why).
+   */
+  const READ_TIMEOUT_MS = 120000
 
   let nodePath
   /**
@@ -458,7 +465,10 @@ export function apply(ctx, config) {
     const node = await resolveNode()
     if (!node) return { ok: false, status: 0, text: 'node executable not found on PATH; the helper needs Node.js to make the HTTP call' }
     const kind = spec.kind === 'search' ? 'search' : 'reader'
-    const plan = routePlan(endpointMode(), kind, preferredSide)
+    // An explicit absolute URL bypasses the endpoint table: only the Jina hosts
+    // live there, and `jina_primer` also fetches ipinfo.io.
+    const explicit = typeof spec.url === 'string' && spec.url !== ''
+    const plan = explicit ? [{ side: null, base: spec.url }] : routePlan(endpointMode(), kind, preferredSide)
     const parse = (r) => {
       // The helper's stdout is capped at MAX_OUT. A body past the cap comes back
       // flagged `lossy`, and JSON.parse on that truncated slice would report a
@@ -496,7 +506,9 @@ export function apply(ctx, config) {
       // reachable, so that side becomes the preferred one. Only a transport
       // failure (status 0) moves on to the next candidate.
       if (parsed.ok || parsed.status !== 0) {
-        preferredSide = attempt.side
+        // Only a Jina endpoint side is worth remembering; an explicit foreign
+        // URL (ipinfo.io) says nothing about which Jina host works.
+        if (attempt.side !== null) preferredSide = attempt.side
         return { ...parsed, endpoint: { side: attempt.side, base: attempt.base } }
       }
       last = parsed
@@ -1054,7 +1066,7 @@ export function apply(ctx, config) {
       const useAltText = defaults.autoAltText === true && key !== undefined
       const selectorsOn = defaults.useSelectors !== false
 
-      /** Build one request's headers; the retry flips `withSelectors` off. */
+      /** Build one request's headers; the fallback flips `withSelectors` off. */
       const buildHeaders = (withSelectors) => {
         const headers = {
           Accept: 'application/json',
@@ -1070,44 +1082,55 @@ export function apply(ctx, config) {
         if (useAltText) headers['X-With-Generated-Alt'] = 'true'
         if (args.noCache) headers['X-No-Cache'] = 'true'
         if (withSelectors) {
-          const target = args.targetSelector || defaults.targetSelector || DEFAULT_TARGET_SELECTORS
+          // An explicitly empty `targetSelector` means "read the whole page" —
+          // the advice the 422 hint gives. Only an *unset* argument falls back
+          // to the configured list and then to the built-in one.
+          const target = args.targetSelector === undefined
+            ? (defaults.targetSelector || DEFAULT_TARGET_SELECTORS)
+            : String(args.targetSelector).trim()
           const wait = args.waitForSelector || defaults.waitForSelector
           const remove = args.removeSelector || defaults.removeSelector || DEFAULT_REMOVE_SELECTORS
-          if (target !== '') headers['X-Target-Selector'] = target
+          if (target !== '') {
+            headers['X-Target-Selector'] = target
+            // The implied `X-Wait-For-Selector` must not outlive the client
+            // ceiling, or a selector that never appears turns into a transport
+            // timeout (see settings.js).
+            headers['X-Timeout'] = String(SELECTOR_WAIT_TIMEOUT_SECONDS)
+          }
           if (wait !== '') headers['X-Wait-For-Selector'] = wait
           if (remove !== '') headers['X-Remove-Selector'] = remove
         }
         return headers
       }
 
-      const request = (headers) => callJina({
+      const request = (headers, timeoutMs) => callJina({
         method: 'POST', headers,
-        body: { url: String(args.url) }, timeoutMs: 120000,
+        body: { url: String(args.url) }, timeoutMs,
         needsKey: useAltText, apiKey: args.apiKey, signal,
       })
 
-      let res = await request(buildHeaders(selectorsOn))
+      // The selector attempt runs on the short patience/ceiling pair; a read of
+      // the whole page keeps the full budget for heavy pages.
+      const firstHeaders = buildHeaders(selectorsOn)
+      const withTarget = firstHeaders['X-Target-Selector'] !== undefined
+      let res = await request(firstHeaders, withTarget ? SELECTOR_ATTEMPT_TIMEOUT_MS : READ_TIMEOUT_MS)
       let content = res.ok ? readPayload(res.text).content : ''
-      // A target selector that matches nothing returns an empty (or near-empty)
-      // page. Retry once without the selector group and keep the longer body:
-      // the group is a default, never a trap.
-      if (selectorsOn && res.ok && content.length < SELECTOR_RETRY_MIN_CHARS) {
-        const retry = await request(buildHeaders(false))
+
+      // The target-selector group is a default, never a trap. Three shapes of
+      // "it did not match" all fall back to the whole page:
+      //   - a short body (it matched a tiny container),
+      //   - 422 with the selector named in the message,
+      //   - no answer at all (the implied wait outlived the client ceiling).
+      const selectorFallback = withTarget && (!res.ok
+        ? res.status === 0 || (res.status === 422 && selectorMismatch(res))
+        : content.length < SELECTOR_RETRY_MIN_CHARS)
+      if (selectorFallback) {
+        const retry = await request(buildHeaders(false), READ_TIMEOUT_MS)
         const retryContent = retry.ok ? readPayload(retry.text).content : ''
-        if (retry.ok && retryContent.length > content.length) {
+        // A failure is replaced by any success; a short body only by a longer one.
+        if (retry.ok && (res.ok === false || retryContent.length > content.length)) {
           res = retry
           content = retryContent
-        }
-      }
-      // The same "selector matched nothing" failure has a second shape: the
-      // Reader answers 422 with the selector in the message instead of coming
-      // back short. The group is a default, never a trap, so retry once without
-      // it instead of telling the model its arguments are invalid.
-      if (!res.ok && res.status === 422 && selectorsOn && selectorMismatch(res)) {
-        const retry = await request(buildHeaders(false))
-        if (retry.ok) {
-          res = retry
-          content = readPayload(retry.text).content
         }
       }
       if (!res.ok) return failJina(res)

@@ -140,6 +140,7 @@ function createHost(options = {}) {
         const request = JSON.parse(stdin)
         helpers.push({ url: request.url, env: spec.env, request, spec })
         if (options.live === true) return realHandle(spec)
+        if (typeof options.reply === 'function') return fakeHandle(options.reply(request))
         return fakeHandle(queue.length > 0 ? queue.shift() : OK_DATETIME)
       },
     },
@@ -258,6 +259,30 @@ test('a transport failure reports both hosts and never repeats one', async () =>
   assert.equal(host.helpers.length, 2)
   assert.equal(new Set(host.helpers.map((h) => h.url)).size, 2)
   assert.match(out, /已尝试的接口域名：https:\/\/r\.jina\.ai\/、https:\/\/r\.jinaai\.cn\//)
+})
+
+test('jina_primer fetches ipinfo.io by absolute URL, not through the endpoint table', async () => {
+  // Regression: the endpoint table only knows Jina hosts, so a call that needs a
+  // foreign URL must keep an explicit-URL escape hatch — otherwise the network
+  // section silently degrades to `null`, because the request lands on the Reader
+  // root and comes back as the usage text.
+  const JINA_ROOT = JSON.stringify({ ok: true, status: 200, text: '{"data":{"authenticatedAs":"acct","balanceLeft":42}}' })
+  const IPINFO = JSON.stringify({
+    ok: true,
+    status: 200,
+    text: '{"ip":"1.2.3.4","city":"Shanghai","region":"Shanghai","country":"CN","org":"AS4134","timezone":"Asia/Shanghai","loc":"31.2,121.4"}',
+  })
+  const host = mount({
+    settings: { endpoint: 'cn' },
+    reply: (request) => (request.url === 'https://ipinfo.io/json' ? IPINFO : JINA_ROOT),
+  })
+  const out = await callTool(host, 'jina_primer', { json: true })
+  assert.deepEqual(host.helpers.map((h) => h.url).sort(), ['https://ipinfo.io/json', 'https://r.jinaai.cn/'])
+  const ipinfo = host.helpers.find((h) => h.url === 'https://ipinfo.io/json')
+  assert.equal(ipinfo.env, undefined, 'a foreign URL inherits the environment untouched')
+  const payload = JSON.parse(out)
+  assert.equal(payload.network.city, 'Shanghai')
+  assert.equal(payload.jina.balanceLeft, 42)
 })
 
 test('the search tools use the search host pair, not the reader one', async () => {

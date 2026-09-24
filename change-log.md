@@ -2,6 +2,13 @@
 
 本文件记录 dsh-jina 的完整版本历史；[README.md](./README.md) 的「更新日志」一节只保留最新版本。
 
+### 0.12.1（2026-09-24）
+
+- **fix** **`jina_read` 不再因为默认选择器组卡死**。`X-Target-Selector` 隐含服务端 `X-Wait-For-Selector`（同一个值），选择器命不中时服务端会一直等到 `X-Timeout`——原来是 120s，而客户端上限也是 120s，于是"默认选择器列表不适配这一页"被报成**网络超时**。实测证据：`POST r.jinaai.cn` 对某新闻页带选择器组时 >45s 无响应，同一页不带选择器组 30s 返回 23625 字符；而 36kr 那页带选择器组 1s 返回 422。修复：带目标选择器的那次尝试把服务端耐心降到 **`SELECTOR_WAIT_TIMEOUT_SECONDS` = 30**、客户端上限降到 **`SELECTOR_ATTEMPT_TIMEOUT_MS` = 45s**（服务端必定先应答，且通常就是既有的 422），既有的"整页重读"回退随即生效；不带选择器的读仍保持 `X-Timeout: 120` + 客户端 120s。同时把三种回退形态统一到一处：短正文（命中到很小的容器）、422（报文里点名选择器）、以及**新增的 status 0（等待超过客户端上限）**——三者都改为整页重读，而不是把后者报成网络故障。**真机验证**（假宿主 + 真实 helper、清空代理变量、`endpoint: cn`）：163.com 那页 4.3s 成功、36kr 1.9s 成功，各两次尝试（选择器 → 整页）。
+- **fix** **`targetSelector: ""` 现在真的表示"读整页"**。此前 `args.targetSelector || defaults.targetSelector || DEFAULT_TARGET_SELECTORS` 让空字符串回落到内置列表，于是 422 提示里那句 `retry with targetSelector: ""` 是**失效建议**。现在只有**不传**该参数才回落到配置列表 / 内置列表，显式传空串则不发 `X-Target-Selector`（`X-Remove-Selector` 的噪声清理保留）。
+- **fix** **`jina_primer` 的网络段恢复（0.12.0 的回归）**。0.12.0 把 `jinaRequest` 改成只认端点表，于是 `ipinfo.io` 那次调用被打到 Reader 根、拿回 usage 文本，`parseIpInfo` 失败，`network` 一直是 `null`（工具按设计"永不抛错"，所以是静默降级）。修复：`jinaRequest` 重新支持**显式绝对 URL 逃生口**——只有 Jina 主机走端点表，显式 URL 单次尝试、环境完整继承，且不会污染 `preferredSide`（一个非 Jina 主机说明不了哪一侧 Jina 端点可用）。**真机验证**：`network` 恢复为真实公网 IP / 城市 / ASN。
+- **test** 全套 **155 例：154 通过 / 1 例（`JINA_LIVE_CN`）按需跳过 / 0 失败**。新增：选择器尝试的 `X-Timeout`/客户端上限与整页读的对照、显式空 `targetSelector` 读整页（含"只发一个请求"）、选择器尝试 status 0 → 整页回退、无选择器组时传输失败只报域名不重试；以及 `jina_primer` 的 ipinfo 绝对 URL 回归（断言 helper 收到的是 `https://ipinfo.io/json` 且环境未被改写）。
+
 ### 0.12.0（2026-09-24）
 
 - **feat** **新增「接口域名」开关：国内 / 国际 / 自动，插件从此不需要代理**。`jina-tools` 命名空间新增 `endpoint` 字段（`settings.js` 的 `ENDPOINT_FIELD`），卡片上是一个三选一下拉，**选中即保存**、下一次调用立即生效：`cn` = Jina 官方国内镜像 `r.jinaai.cn` / `s.jinaai.cn`；`global` = `r.jina.ai` / `s.jina.ai`；`auto`（默认）= **先用上次可用的那一侧，失败后自动改用另一侧**，胜者在进程内记住（`preferredSide`），所以只有第一次调用可能多花一次探测时间。路由计划由 `settings.js` 的 `routePlan(mode, kind, preferred)` 生成——固定模式只给一个候选（失败即报错，不用另一侧掩盖），`auto` 给两个且**永不重复同一个 host**。

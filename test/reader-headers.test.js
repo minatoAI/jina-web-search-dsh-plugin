@@ -25,6 +25,7 @@ import { Config, apply } from '../index.js'
 import {
   DEFAULT_IMAGE_POLICY, DEFAULT_REMOVE_SELECTORS, DEFAULT_TARGET_SELECTORS,
   READER_BASE, READER_PRESET, READER_TIMEOUT_SECONDS,
+  SELECTOR_ATTEMPT_TIMEOUT_MS, SELECTOR_WAIT_TIMEOUT_SECONDS,
   settingsAreLive, settingsSnapshot, toolSettingsOf,
 } from '../settings.js'
 
@@ -118,12 +119,40 @@ async function headersFor(args, setting) {
   return { host, headers: host.requests[0].headers }
 }
 
-test('jina_read: every read sends the agent preset, the final-URL base and the max timeout', async () => {
+test('jina_read: every read sends the agent preset and the final-URL base', async () => {
   const { headers } = await headersFor({ url: 'https://example.com' })
   assert.equal(headers['X-Preset'], READER_PRESET)
   assert.equal(headers['X-Base'], READER_BASE)
-  assert.equal(headers['X-Timeout'], String(READER_TIMEOUT_SECONDS))
   assert.equal(headers.Accept, 'application/json')
+})
+
+test('jina_read: a selector attempt gets the short patience, a whole-page read the full one', async () => {
+  // `X-Target-Selector` implies `X-Wait-For-Selector`, so a selector that never
+  // appears costs a wait. With the full 120 s patience the Reader outlived the
+  // client's own 120 s ceiling and a non-matching default list turned into a
+  // transport timeout (measured: >45 s on a news page). The selector attempt is
+  // therefore capped so the server answers first and the fallback can run.
+  const withGroup = await headersFor({ url: 'https://example.com' })
+  assert.equal(withGroup.headers['X-Target-Selector'], DEFAULT_TARGET_SELECTORS)
+  assert.equal(withGroup.headers['X-Timeout'], String(SELECTOR_WAIT_TIMEOUT_SECONDS))
+  assert.equal(withGroup.host.requests[0].timeoutMs, SELECTOR_ATTEMPT_TIMEOUT_MS)
+
+  const wholePage = await headersFor({ url: 'https://example.com' }, { useSelectors: false })
+  assert.equal(wholePage.headers['X-Target-Selector'], undefined)
+  assert.equal(wholePage.headers['X-Timeout'], String(READER_TIMEOUT_SECONDS))
+  assert.equal(wholePage.host.requests[0].timeoutMs, 120000)
+})
+
+test('jina_read: an explicitly empty targetSelector reads the whole page', async () => {
+  // The 422 hint tells the caller to retry with `targetSelector: ""`. That has
+  // to actually mean "no selector group" — an unset argument is what falls back
+  // to the configured list, an empty one must not.
+  const { host, headers } = await headersFor({ url: 'https://example.com', targetSelector: '' })
+  assert.equal(headers['X-Target-Selector'], undefined)
+  assert.equal(headers['X-Wait-For-Selector'], undefined)
+  assert.equal(headers['X-Timeout'], String(READER_TIMEOUT_SECONDS))
+  assert.equal(headers['X-Remove-Selector'], DEFAULT_REMOVE_SELECTORS, 'chrome stripping still applies')
+  assert.equal(host.requests.length, 1, 'no selector attempt means no fallback request')
 })
 
 test('jina_read: keeps images by default instead of the old hardcoded none', async () => {
@@ -217,6 +246,40 @@ test('jina_read: a healthy first answer is not retried', async () => {
   apply(host.ctx, resolveSettings(host.settingsValue))
   await callRead(host, { url: 'https://example.com' })
   assert.equal(host.requests.length, 1)
+})
+
+test('jina_read: a selector attempt that never answers falls back to the whole page', async () => {
+  // The third shape of "the selector did not match": the implied wait outlives
+  // the client ceiling, so the attempt comes back as a transport failure rather
+  // than a 422. The group is a default, never a trap — the read must still
+  // succeed, and the fallback gets the full budget.
+  const host = createHost({
+    setting: { endpoint: 'cn' },
+    responses: [
+      JSON.stringify({ ok: false, status: 0, text: 'timeout after 45000ms' }),
+      readerBody('the full article body. '.repeat(30)),
+    ],
+  })
+  apply(host.ctx, resolveSettings(host.settingsValue))
+  const text = await callRead(host, { url: 'https://example.com' })
+  assert.equal(host.requests.length, 2)
+  assert.equal(host.requests[0].headers['X-Target-Selector'], DEFAULT_TARGET_SELECTORS)
+  assert.equal(host.requests[1].headers['X-Target-Selector'], undefined)
+  assert.equal(host.requests[1].timeoutMs, 120000, 'the whole-page read keeps the full budget')
+  assert.match(text, /the full article body/)
+})
+
+test('jina_read: a transport failure without a selector group is reported, not retried', async () => {
+  // Nothing to fall back from: with the group off (or pinned out) a dead route
+  // is a routing fact, and the error must name the domain that was tried.
+  const host = createHost({
+    setting: { endpoint: 'cn', useSelectors: false },
+    responses: [JSON.stringify({ ok: false, status: 0, text: 'timeout after 120000ms' })],
+  })
+  apply(host.ctx, resolveSettings(host.settingsValue))
+  const text = await callRead(host, { url: 'https://example.com' })
+  assert.equal(host.requests.length, 1)
+  assert.match(text, /已尝试的接口域名：https:\/\/r\.jinaai\.cn\//)
 })
 
 test('jina_read: unwraps the JSON envelope into markdown with the title and usage', async () => {
