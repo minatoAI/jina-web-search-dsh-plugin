@@ -8,17 +8,14 @@ DeepSeek Harness 的 [Jina AI](https://jina.ai/) 插件（bundle）：把 jina-c
 
 > 此处仅展示最新版本，完整版本历史见 [change-log.md](./change-log.md)。
 
-### 0.10.0（2026-09-24）
+### 0.11.0（2026-09-24）
 
-- **feat** **新增 `jina_read_pdf`：`jina-ocr-v1` 只归 PDF 专用工具**。起因是一次实测事故：`jina-ocr-v1` 一次只吃**一张页面图**，而 Reader 会把整个网页渲染成**一张**图再交给模型——长 HTML 页被压进 1024×1024 的全局视图后文字糊到读不出来，模型就"续写"出**假论文**（同一篇 arXiv 论文：HTML 版返回伪造的"遗传算法测试用例"论文，PDF 版逐页读完全正确）。所以 OCR 不再是一个全局开关，而是**只属于 PDF 的专用工具**：固定 `X-Respond-With: jina-ocr-v1`、**逐页**请求（`X-Page`）、默认前 5 页（`maxPages`，硬上限 50）、`pages` 支持 `"3"` / `"1-5"` / `"2,4,7"`。
-- **feat** **自动识别文档结尾**：实测**超出页数的 `X-Page` 不报错，而是静默返回第 1 页**（"循环到空为止"会死循环）。工具改为逐页指纹去重：某页重复了之前的页 ⇒ 判定读到末尾并停止，结果里写明原因。
-- **feat** **结果自带来源标记**：模型管线（`jina-ocr-v1` / `readerlm-v2`）的输出**是生成的，不是抽取的**，结果末尾会追加 `[Reader pipeline: … verify anything load-bearing against the source.]`——最便宜的一道防线。
-- **feat** **默认管线从 OCR 换成 ReaderLM-v2**：卡片选项 `useOcr` → **`useReaderLm`**（「使用 ReaderLM-v2 解析 HTML」），走官方为**网页**指定的 `X-Respond-With: readerlm-v2`（实测同一页：OCR 返回伪造论文，ReaderLM-v2 返回**正确全文**，计费 **3×** 且有 4000 token 起步，OCR 是 40×）。旧设置里的 `useOcr` 被忽略。
-- **fix** **ReaderLM-v2 不再携带选择器组**：实测 `readerlm-v2` **叠加** `X-Target-Selector` 时，只要选择器命中不到就返回 **422 `No content available`**；去掉即恢复。模型管线消费整页，选择器只属于 DOM 抽取路径。
-- **fix** **`.pdf` 不会被 ReaderLM 接管**：`jina_read` 识别出 PDF 后保持普通抽取（逐字、比 OCR 便宜约 40×），并在结果里提示"要读扫描件请用 `jina_read_pdf`"。
-- **fix** **422 按报文分流**：`Screenshot of the page is not available` = **渲染失败**（正是 OCR 会伪造内容的那一步）、`with target selector …` = 选择器命中不到、`No content available` = 抽不到内容，三者给不同修复提示；503 补上官方说明——模型是 serverless，**冷启动返回 503，建议 30–60 秒后重试**。
-- **change** **API key 池改为均流（round-robin）轮换**：原先"粘性优先"（上次成功的 key 一直领跑），现在**每次调用都从上一个用过的 key 的下一个开始**，N 个 key 各摊约 1/N 流量——Jina 限流按 key 计，摊开才少撞 429。冷却中的 key 依旧跳过；**只有真正失败导致的换 key 才显示 `[已自动切换 API key：…]`**，计划内轮换不冒充"key 用完了"。
-- **test** 全套 **169 例：168 通过 / 1 例（`JINA_LIVE_PROXY`）按需跳过 / 0 失败**；并做**真机端到端验证**（真实 API + 真实 subprocess）：`jina_read_pdf` 对 1 页 PDF 请求 1–3 页 → 只读 1 页后以"page 2 repeated page 1"停止并标注来源；`jina_read` + readerlm 正常返回。
+- **feat** **`jina_pdf` 现在把提取到的图表当作图片返回**。实测原始负载：`extract-pdf` 对每个检出的"浮动对象"（LaTeX 术语 floats = 图/表/公式）只返回 `type / number / page / caption / image(base64 PNG) / width / height`——**没有任何文本字段**，caption 还是固定占位符 `"Table (detected)"`。**图片就是它的全部产出**，而旧版只打印清单、把 1.2MB 图片全丢了，工具等于废的。现在：base64 → `Uint8Array` → `ctx.attachments.saveImage()` → 以 `{ type: 'image', attachment }` 内容块返回（与内置 `read_image` 同一契约），**模型可以直接看图**。`maxImages` 控制附上几张（默认 5）；任何一张被存储拒绝都只记进 `[Notes]`，不会丢掉整次提取。**真机验证**：arXiv `2601.21337` 提取 11 张表，前 2 张解码后前 8 字节是 `137,80,78,71,13,10,26,10`（PNG 魔数）。
+- **change** **删除 ReaderLM-v2 功能**（卡片选项 `useReaderLm`、`readerlm` 参数及相关代码/测试/文档）。实测结论：① 普通页面上与普通抽取**打平**，没有优势证据；② **不能带选择器组**（一带就 422），只能拿整页、噪声全带上；③ 官方定位是"已拿到 HTML → 转 markdown/JSON"，而唯一不可替代的 HTML→JSON 用不上；④ 在官方宣称最强的**长公式页**上反而失败——输出里是**原始 HTML**（疑似回显输入），冲破 1.5MB 传输上限。附带发现官方文档一处已过期：模型卡写的 `x-engine: readerlm-v2` **实测不生效**，只有 `X-Respond-With` 才真走模型。
+- **fix** **传输上限截断不再被误报**：响应超过 1.5MB 时直接报"超过传输上限并已截断"并给出 spill 路径；旧版会把它报成 `helper output not parseable` 外加一段乱码。
+- **test** 全套 **169 例：168 通过 / 1 例按需跳过 / 0 失败**；新增 `jina_pdf` 四例（图片块/附件名/字节、无 attachments 服务的降级、`maxImages` 上限、单张被拒不影响整次提取）。
+
+### 0.10.0（2026-09-24）
 
 ## 功能
 
@@ -29,7 +26,7 @@ DeepSeek Harness 的 [Jina AI](https://jina.ai/) 插件（bundle）：把 jina-c
 | `jina_web_search` | `jina search` | 通用网页搜索（默认 web 域；images / blog 域，支持时间过滤与地区/语言提示） |
 | `jina_search_arxiv` | `jina search --arxiv` | arXiv 预印本检索（CS / ML / 数学 / 物理等，返回 arxiv.org 官方论文直链） |
 | `jina_search_ssrn` | `jina search --ssrn` | SSRN 论文检索（经济 / 金融 / 法律 / 管理等社会科学，返回 papers.ssrn.com 直链） |
-| `jina_read` | `jina read` | 把网页读成干净的 markdown；可选 `readerlm` 走 ReaderLM-v2（官方为网页指定的 HTML→Markdown 模型），支持正文选择器与噪声过滤（见下节）。**PDF 一律走普通抽取**——逐字，且比 OCR 便宜约 40× |
+| `jina_read` | `jina read` | 把网页读成干净的 markdown；支持正文选择器与噪声过滤（见下节）。**PDF 一律走普通抽取**——逐字，且比 OCR 便宜约 40× |
 | `jina_read_pdf` | `jina read` + `X-Respond-With: jina-ocr-v1` | **专门用 `jina-ocr-v1` 逐页读 PDF**：扫描件 / 图片型 PDF 唯一可用的路径。`pages` 选页（`"3"` / `"1-5"` / `"2,4,7"`），默认前 5 页（`maxPages`，上限 50）。**一次一页**（API 对超出页数的 `X-Page` 会静默返回第 1 页，工具据此判定文档结尾）；结果自带来源标记 |
 | `jina_screenshot` | `jina screenshot` | 网页截图，返回托管图片 URL（支持整页截图） |
 | `jina_datetime` | `jina datetime` | 推测网页的发布/更新时间 |
@@ -37,7 +34,7 @@ DeepSeek Harness 的 [Jina AI](https://jina.ai/) 插件（bundle）：把 jina-c
 | `jina_embed` | `jina embed` | 文本向量化（默认 jina-embeddings-v5-text-small） |
 | `jina_rerank` | `jina rerank` | 按相关性重排文档（默认 jina-reranker-v3.5） |
 | `jina_classify` | `jina classify` | 文本分类 |
-| `jina_pdf` | `jina pdf` | 从 PDF 提取图表/公式（支持 arXiv ID） |
+| `jina_pdf` | `jina pdf` | 从 PDF 提取**图表/公式**（支持 arXiv ID）并**把每张裁图作为图片附在结果里**（模型可直接看图）。注意：这是**视觉**抽取器，不返回正文/表格内容/公式 LaTeX，caption 是占位符——要正文请用 `jina_read_pdf`。且**只接受白名单来源**（arXiv 可以，多数主机返回 400） |
 | `jina_primer` | `jina primer` | 获取当前上下文：主机时钟（ISO 时间/unix/时区/UTC 偏移）、网络事实（公网 IP 与位置，尽力而为）与 Jina 账户状态（身份/余额） |
 
 ## 阅读工具选项（`jina_read`）
@@ -46,7 +43,6 @@ DeepSeek Harness 的 [Jina AI](https://jina.ai/) 插件（bundle）：把 jina-c
 
 | 选项 | 字段 | 默认 | 作用与代价 |
 | --- | --- | --- | --- |
-| ReaderLM-v2 解析 HTML | `useReaderLm` | 关 | 走 `X-Respond-With: readerlm-v2`：官方为**网页**指定的 HTML→Markdown 模型，适合普通抽取器处理不好的页面。**约 3× token** 且有 **4000 token 起步**，**必须有 API key**——官方对匿名请求返回 401，本插件因此直接不发请求并给出提示。**`.pdf` 会自动跳过它**（PDF 交给普通抽取，扫描件交给 `jina_read_pdf`） |
 | 图片保留策略 | `imagePolicy` | `all` | `all` = 官方默认；`alt` = 只保留 alt 文本（省 token）；`none` = 不保留图片 |
 | 生成图片 alt 文本 | `autoAltText` | 关 | `X-With-Generated-Alt`：为缺说明的图片生成描述。**需 API key**（匿名 401），且**与 OCR 互斥**（指定 `X-Respond-With` 时该功能不生效）；又因为**带 key 的请求会计费**，默认关闭，需要时显式打开 |
 | 选择器组 | `useSelectors` | 开 | 默认发保守的 `X-Target-Selector`（只含 `article` / `main` / `[role="main"]` / `.markdown-body` 等正文容器）与 `X-Remove-Selector`（页眉页脚、导航、cookie 横幅、广告、侧栏、评论等）。命中不到时**自动回退整页重试**，不会返回空 |
@@ -54,10 +50,11 @@ DeepSeek Harness 的 [Jina AI](https://jina.ai/) 插件（bundle）：把 jina-c
 
 每次 `jina_read` 还会固定发送三个零副作用参数：`X-Preset: agent`（官方为 AI agent 预调的预设；官方文档明确 preset **只填充调用方未显式设置的选项**，所以不会覆盖任何显式参数）、`X-Base: final`（用重定向后的最终 URL 解析相对链接）、`X-Timeout: 120`（与客户端自己的 120s 上限对齐——若发官方的上限 180，客户端会先超时并报自己的错误，多出来的耐心是浪费的；要改就两边一起改）。
 
-调用级参数（`jina_read`）：`readerlm`、`targetSelector`、`waitForSelector`、`removeSelector`、`noCache`，以及原有的 `links` / `images` / `json` / `apiKey`。
+调用级参数（`jina_read`）：`targetSelector`、`waitForSelector`、`removeSelector`、`noCache`，以及原有的 `links` / `images` / `json` / `apiKey`。
 调用级参数（`jina_read_pdf`）：`url`、`pages`、`maxPages`、`allowNonPdf`、`apiKey`。非 `.pdf` 的 URL 会被拒绝（`allowNonPdf: true` 可强制放行）——因为 `jina-ocr-v1` 在普通网页上会**编造内容**。
+调用级参数（`jina_pdf`）：`url` / `arxivId`、`extractType`、`maxEdge`、`maxImages`、`json`、`apiKey`。
 
-> 关于"为什么默认这样"：这三项是官方 Reader API 里**最坏情况不损失什么**的参数；而 ReaderLM-v2 与 alt 生成需要 key、会计费或与其它参数互斥，所以一律默认关闭。`X-Remove-Overlay` / `X-Detach-Invisibles` 这两个未在官方参数面板文档化的隐藏参数**没有**被默认启用（后者官方明确要求 browser 引擎且禁用缓存）。
+> 关于"为什么默认这样"：这三项是官方 Reader API 里**最坏情况不损失什么**的参数；而 alt 生成需要 key 且会计费，所以默认关闭。`X-Remove-Overlay` / `X-Detach-Invisibles` 这两个未在官方参数面板文档化的隐藏参数**没有**被默认启用（后者官方明确要求 browser 引擎且禁用缓存）。
 
 ## 效果实测（与内置 web_search 交叉对比）
 
@@ -233,7 +230,7 @@ jina-dsh-plugin/
 
 ## 开发说明
 
-- 主机插件只依赖 Node 内置模块与 dsh 主机服务（`fs`、`subprocess`、`tools`、`credentials`、`webServer`），无第三方 npm 依赖；凭据走 dsh 原生的 credential seam（key 池引用 `JINA_API_KEY` / `JINA_API_KEY_2` … `JINA_API_KEY_10`，seam 一个引用存一个值、且任何读取接口都不回传值，所以「多个 key」=「多个引用」；引用名只要满足 POSIX 标识符语法即可，无需 harness 改动），配置走插件自己的 `jina-tools` 设置命名空间（`proxyUrl` 代理地址 + `useReaderLm` / `imagePolicy` / `autoAltText` / `useSelectors` / 三个选择器覆盖等阅读策略），任何 profile 组合都可以直接使用。
+- 主机插件只依赖 Node 内置模块与 dsh 主机服务（`fs`、`subprocess`、`tools`、`credentials`、`webServer`），无第三方 npm 依赖；凭据走 dsh 原生的 credential seam（key 池引用 `JINA_API_KEY` / `JINA_API_KEY_2` … `JINA_API_KEY_10`，seam 一个引用存一个值、且任何读取接口都不回传值，所以「多个 key」=「多个引用」；引用名只要满足 POSIX 标识符语法即可，无需 harness 改动），配置走插件自己的 `jina-tools` 设置命名空间（`proxyUrl` 代理地址 + `imagePolicy` / `autoAltText` / `useSelectors` / 三个选择器覆盖等阅读策略），任何 profile 组合都可以直接使用。
 - **设置通道的契约（dsh 0.1.4 起）**：`settings.register()` 已被删除，**设置命名空间就是 Loader/profile 组合条目的 id**——本插件在 `cordis.patch.yml` 里插入的行 id 正是 `jina-tools`，所以卡片里的 `NS` 与之一致。插件通过 `index.js` 的 `export const Config = createSettingsSchema()`（`proxy.js`，零依赖手写节点）声明可编辑字段：每个字段节点带 `meta.volatile: true`，`'~standard': { version: 1, vendor: 'schemastery', validate }` 是 harness 解析配置的唯一入口（`resolveConfig()` 要求**同步**返回纯对象；`vendor` 必须是 `'schemastery'`，否则每次保存都会退化成整插件重挂载）。`validate()` 为每个字段生成一个**跨副本安全的 volatile 引用**（`Symbol.for('cosmokit.volatile.write')`），harness 保存时只把新值写进这些引用，`apply(ctx, config)` 拿到的对象身份不变、插件不重挂载；插件在**每次操作**里用 `settingsSnapshot(config)` 重新读取（`toolSettingsOf()` 负责把"未设置"归一成默认值），因此保存与 API key 一样**立即生效、无需重启**。`/api/dsh-jina/primer` 的 `settingsLive` 就是这个契约的健康检查。
 - 客户端 bundle 直接提交（`ui/client.js`），无构建步骤，git 安装开箱即用。改 UI 后直接改该文件并重启即可。bundle 顶层 `window.__ModuleLoader__.load` 的注册 id **必须等于图行 id（精确包名 `dsh-jina`）**——模块系统只按图行 id 匹配注册（`/client` 后缀除外），注册在别的键上（如旧行名 `dsh-jina/ui`）会报 `loaded without registering "dsh-jina"` 并导致整页 `Failed to load plugins`。卡片注册进 Web 设置包声明的 `settings.plugin.item` 插槽（设置 → 插件 → 配置），这是第三方插件配置的标准位置。
 - **`remote.<ns>` 的注入铁律**：gateway `$mount` 时会把每个 Remote 命名空间注册成**独立 cordis 服务**，所以客户端插件读取 `remote.<ns>`（如 `remote.credentials`、`remote.settings`）之前，必须在自己的 `inject` 里声明该服务名——只声明 `'remote'` 是不够的，属性访问本身就会抛 `cannot get property "remote.settings" without inject`，而错误冒到 `settings.plugin.item` 的 slot 边界会让**整张卡片消失**（0.6.0 的回归，现已由 `test/client-bundle.test.js` 固化）。本插件的 `inject = ['slots','remote','remote.credentials','remote.settings']`。读取处仍然包一层 try/catch：服务缺失时降级为提示，不让 slot 崩溃。

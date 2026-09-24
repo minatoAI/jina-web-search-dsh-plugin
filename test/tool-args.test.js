@@ -214,10 +214,6 @@ test('jina_read: a valid url still reaches the Reader unchanged', async () => {
   assert.match(out, /Title: Example/, 'the markdown still comes back')
 })
 
-test('jina_read: readerlm without a key throws instead of returning a refusal string', async () => {
-  await rejected('jina_read', { url: 'https://example.com', readerlm: true }, /readerlm requires a Jina API key/)
-})
-
 test('jina_read_pdf: without a key throws instead of returning a refusal string', async () => {
   await rejected('jina_read_pdf', { url: 'https://example.com/paper.pdf' }, /jina_read_pdf requires a Jina API key/)
 })

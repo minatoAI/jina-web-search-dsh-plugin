@@ -76,10 +76,6 @@ window.__ModuleLoader__.load({
     // Reader-policy fields of the same `jina-tools` namespace. The host owns
     // the defaults (proxy.js `toolSettingsOf`), so the card only ever writes
     // deviations: `set` for opt-in flags, `unset` to fall back to a default.
-    // `useReaderLm` replaced the old OCR switch: OCR moved into the dedicated
-    // `jina_read_pdf` tool, because jina-ocr-v1 reads one rendered page image
-    // per call and fabricates on long HTML pages.
-    var READERLM_FIELD = 'useReaderLm'
     var IMAGE_POLICY_FIELD = 'imagePolicy'
     var AUTO_ALT_FIELD = 'autoAltText'
     var SELECTORS_FIELD = 'useSelectors'
@@ -168,7 +164,6 @@ window.__ModuleLoader__.load({
       // NOTE: every hook is declared before any early return below; the state
       // order is load-bearing for `test/client-render.test.js`, which renders
       // by overriding the first `useState` (the collapsible `open` flag).
-      var [readerLmInput, setReaderLmInput] = React.useState(false)
       var [imagePolicyInput, setImagePolicyInput] = React.useState('all')
       var [autoAltInput, setAutoAltInput] = React.useState(false)
       var [selectorsInput, setSelectorsInput] = React.useState(true)
@@ -220,7 +215,6 @@ window.__ModuleLoader__.load({
         var value = row && row.value && typeof row.value === 'object' ? row.value : {}
         var url = typeof value[PROXY_FIELD] === 'string' ? value[PROXY_FIELD] : ''
         var options = {
-          readerLm: value[READERLM_FIELD] === true,
           imagePolicy: IMAGE_POLICIES.indexOf(value[IMAGE_POLICY_FIELD]) >= 0 ? value[IMAGE_POLICY_FIELD] : 'all',
           autoAlt: value[AUTO_ALT_FIELD] === true,
           selectors: value[SELECTORS_FIELD] !== false,
@@ -239,7 +233,6 @@ window.__ModuleLoader__.load({
         // never touched follows the document (another tab, settings.yaml).
         if (!proxyDirty.current) setProxyInput(url)
         if (!optsDirty.current) {
-          setReaderLmInput(options.readerLm)
           setImagePolicyInput(options.imagePolicy)
           setAutoAltInput(options.autoAlt)
           setSelectorsInput(options.selectors)
@@ -477,9 +470,9 @@ window.__ModuleLoader__.load({
           : null)
 
       // ---- reader options block ---------------------------------------------
-      // The reader policy of the same namespace: the ReaderLM-v2 switch, the
-      // image policy, and the selector group. All of it is written through the
-      // same revision-fenced `writeProxy`, so a save here cannot clobber a proxy
+      // The reader policy of the same namespace: the image policy, the alt-text
+      // switch, and the selector group. All of it is written through the same
+      // revision-fenced `writeProxy`, so a save here cannot clobber a proxy
       // edit made in the other block.
       var optsReady = proxyView.phase === 'ready' && proxyView.writable
       var optsStatusStyle = optsStatusKind === 'ok' ? S.statusOk : (optsStatusKind === 'bad' ? S.statusBad : S.status)
@@ -503,7 +496,6 @@ window.__ModuleLoader__.load({
         // Only deviations are stored: `unset` is how a field returns to the
         // host default (see proxy.js `toolSettingsOf`).
         var ops = [
-          { op: readerLmInput ? 'set' : 'unset', path: [READERLM_FIELD], value: true },
           { op: imagePolicyInput === 'all' ? 'unset' : 'set', path: [IMAGE_POLICY_FIELD], value: imagePolicyInput },
           { op: autoAltInput ? 'set' : 'unset', path: [AUTO_ALT_FIELD], value: true },
           { op: selectorsInput ? 'unset' : 'set', path: [SELECTORS_FIELD], value: false },
@@ -522,14 +514,6 @@ window.__ModuleLoader__.load({
 
       var optionsBlock = React.createElement('div', { style: S.infoBox },
         React.createElement('p', { style: S.infoLabel }, '阅读工具选项'),
-        React.createElement('label', { style: S.checkRow },
-          React.createElement('input', {
-            type: 'checkbox',
-            checked: readerLmInput,
-            onChange: onOptsCheck(setReaderLmInput),
-            disabled: !optsReady,
-          }),
-          React.createElement('span', { style: S.checkLabel }, '使用 ReaderLM-v2 解析 HTML（X-Respond-With: readerlm-v2；官方为网页指定的 HTML→Markdown 模型，约 3× token 且有 4000 token 起步，需要 API key，与下面的 alt 生成互斥）。PDF 请用 jina_read_pdf 工具，它固定走 jina-ocr-v1')),
         React.createElement('label', { style: S.checkRow },
           React.createElement('input', {
             type: 'checkbox',

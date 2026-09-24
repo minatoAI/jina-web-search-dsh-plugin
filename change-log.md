@@ -2,6 +2,13 @@
 
 本文件记录 dsh-jina 的完整版本历史；[README.md](./README.md) 的「更新日志」一节只保留最新版本。
 
+### 0.11.0（2026-09-24）
+
+- **feat** **`jina_pdf` 现在把提取到的图表当作图片返回**。实测原始负载：`extract-pdf` 对每个检出的"浮动对象"（LaTeX 术语 floats = 图/表/公式）返回 `type / number / page / caption / image(base64 PNG) / width / height`——**没有任何文本字段**（`text`/`markdown`/`latex` 全部为 0 次），caption 是固定占位符 `"Table (detected)"`。也就是说**图片就是它的全部产出**，而旧版 `fmtPdf` 只打印清单、把 1.2MB 的图片全丢了，工具等于废的。现在：base64 → `Uint8Array` → `ctx.attachments.saveImage()` → 以 `{ type: 'image', attachment }` 内容块返回（与内置 `read_image` 同一契约），模型可以直接看图。清单仍保留（含每项像素尺寸、未附上的项会标注），`maxImages` 控制附上几张（默认 5，同时受 `attachments.imageLimits.maxImagesPerMessage` 限制），任何一张被存储拒绝（超限 / 媒体类型不支持 / 没有 attachments 服务）都只记进 `[Notes]`，不会丢掉整次提取。**真机验证**：对 arXiv `2601.21337` 提取 11 张表，前 2 张解码后前 8 字节为 `137,80,78,71,13,10,26,10`（PNG 魔数），77,173 / 116,983 字节。
+- **change** **删除 ReaderLM-v2 功能**（卡片选项 `useReaderLm`、调用参数 `readerlm`、相关代码/测试/文档）。理由全部来自实测：① 普通页面上与普通抽取**打平**（example.com、arXiv 内容一致），没有任何优势证据；② 它**不能带选择器组**（一带就 422 `No content available`），只能拿整页、导航噪声全带上；③ 官方定位其实是"已拿到 HTML → 转 markdown/JSON"，而唯一不可替代的 **HTML→JSON** 能力用不上；④ 在官方宣称最强的**长公式页**（Wikipedia「Normal distribution」）上反而失败——输出里是**原始 HTML**（`<b id="mwKg">`，疑似回显输入），冲破插件 1.5MB 传输上限被截断。另有一处官方文档已过期：模型卡写用 `x-engine: readerlm-v2` 接入 Reader，**实测该头不生效**（1× 计费、返回普通抽取形状），只有 `X-Respond-With` 才真走模型——即本插件原来的接法是对的。`jina_read` 现在只剩普通抽取，OCR 仍只在 `jina_read_pdf` 里。
+- **fix** **传输上限截断不再被误报**：`parse()` 现在检查 helper 的 `lossy` 标记——响应超过 1.5MB 时直接报"响应超过传输上限并已截断"，并给出 spill 文件路径与收窄建议；旧版忽略 `lossy`/`spillPath`，把截断内容交给 `JSON.parse`，报成 `helper output not parseable` 外加一段乱码。
+- **test** 全套 **169 例：168 通过 / 1 例（`JINA_LIVE_PROXY`）按需跳过 / 0 失败**。新增 `jina_pdf` 四例（图片块与附件名/字节、无 attachments 服务时的清单+说明、`maxImages` 上限、单张被拒不影响整次提取）；把 `jina_read` 的断言改成"永不发送 `X-Respond-With`"；卡片勾选断言从 3 个改为 2 个。
+
 ### 0.10.0（2026-09-24）
 
 - **feat** **新增 `jina_read_pdf` 工具：专门用 `jina-ocr-v1` 读 PDF**。起因是一次实测事故：`jina-ocr-v1` 一次只吃**一张页面图**，而 Reader 会把整个网页渲染成**一张**图再交给模型，于是**长 HTML 页会被压进 1024×1024 的全局视图、文字糊到读不出来，模型就"续写"出一篇假论文**——同一篇 arXiv 论文，HTML 版返回了伪造的"遗传算法测试用例"论文，PDF 版逐页读则完全正确（`inputTokens=957, outputTokens=1367, measuredTokens=2324, scaledTokens=92960` 三次调用逐位一致）。所以 OCR 不再是一个全局开关，而是**只属于 PDF 的专用工具**：固定发送 `X-Respond-With: jina-ocr-v1`，**逐页**请求（`X-Page`，1 起），默认读前 5 页（`maxPages`，硬上限 50），`pages` 支持 `"3"` / `"1-5"` / `"2,4,7"`。

@@ -41,20 +41,6 @@ export const PROXY_SETTING_FIELD = 'proxyUrl'
 // can still be overridden per call (the tool parameters win), which is why the
 // settings document only ever stores what the user actually changed.
 
-/**
- * Settings field: read HTML through ReaderLM-v2 (`X-Respond-With`) by default.
- *
- * This replaced the old OCR switch (`useOcr`). OCR moved into the dedicated
- * `jina_read_pdf` tool because `jina-ocr-v1` is only reliable on documents:
- * the Reader renders a page to **one image** and the model transcribes that
- * image, so a long HTML page is crushed into the global 1024x1024 view and the
- * model invents the text it cannot read (verified: the same arXiv paper
- * fabricated as HTML, correct as PDF). `readerlm-v2` is the vendor's
- * HTML -> Markdown model and the documented tool for web pages.
- *
- * A stale `useOcr` key left in settings.yaml is simply ignored.
- */
-export const READERLM_SETTING_FIELD = 'useReaderLm'
 /** Settings field: `X-Retain-Images` mode ('all' | 'alt' | 'none'). */
 export const IMAGE_POLICY_FIELD = 'imagePolicy'
 /** Settings field: let Jina caption images that lack alt text (paid feature). */
@@ -237,7 +223,7 @@ export function selectProxy(input) {
  * same contract `settingProxy()` already relies on.
  *
  * @param section - the resolved settings value (any shape).
- * @returns `{ proxyUrl, useReaderLm, imagePolicy, autoAltText, useSelectors,
+ * @returns `{ proxyUrl, imagePolicy, autoAltText, useSelectors,
  *            targetSelector, removeSelector, waitForSelector }`.
  */
 export function toolSettingsOf(section) {
@@ -245,11 +231,6 @@ export function toolSettingsOf(section) {
   const text = (value) => (typeof value === 'string' && value.trim() !== '' ? value.trim() : '')
   return {
     proxyUrl: proxySettingOf(s),
-    // ReaderLM-v2 is a key-gated generative pipeline that costs about 3x the
-    // tokens (plus a 4000-token minimum) and rewrites rather than transcribes:
-    // opt-in only. The plain extractor stays the default because it is
-    // verbatim and cheapest.
-    useReaderLm: s[READERLM_SETTING_FIELD] === true,
     imagePolicy: IMAGE_POLICIES.includes(s[IMAGE_POLICY_FIELD]) ? s[IMAGE_POLICY_FIELD] : DEFAULT_IMAGE_POLICY,
     // Opt-in, because supplying a key is what makes a read billable: defaulting
     // this to true would silently turn every anonymous (free) read into a
@@ -270,7 +251,6 @@ const VOLATILE_WRITE = Symbol.for('cosmokit.volatile.write')
 /** The live fields, in card order: `[key, schemastery type]`. */
 const SETTINGS_FIELDS = [
   [PROXY_SETTING_FIELD, 'string'],
-  [READERLM_SETTING_FIELD, 'boolean'],
   [IMAGE_POLICY_FIELD, 'string'],
   [AUTO_ALT_SETTING_FIELD, 'boolean'],
   [SELECTORS_SETTING_FIELD, 'boolean'],

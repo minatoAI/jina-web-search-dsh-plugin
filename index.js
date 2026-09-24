@@ -13,7 +13,7 @@
  * `cordis.patch.yml`) *is* the settings namespace, and this host half declares
  * its live fields through the module-level `Config` export built by proxy.js —
  * `proxyUrl` carries a manually configured local proxy address and the
- * remaining fields carry the reader policy (`useReaderLm`, `imagePolicy`,
+ * remaining fields carry the reader policy (`imagePolicy`,
  * `autoAltText`, `useSelectors` and the selector overrides). The browser half
  * registers its configuration form for that namespace, so the Plugins page
  * (the `dsh-jina` bundle card) renders the form only when the two halves agree.
@@ -539,6 +539,19 @@ export function apply(ctx, config) {
       return env
     }
     const parse = (r) => {
+      // The helper's stdout is capped at MAX_OUT. A body past the cap comes back
+      // flagged `lossy`, and JSON.parse on that truncated slice would report a
+      // baffling "not parseable" next to a mid-payload snippet. Name the real
+      // problem instead, and point at the spilled full body when there is one.
+      if (r.stdout.lossy === true) {
+        return {
+          ok: false,
+          status: 0,
+          text: 'the Jina response exceeded the transport cap (' + MAX_OUT + ' bytes) and was truncated'
+            + (typeof r.stdout.spillPath === 'string' && r.stdout.spillPath !== '' ? '; the full body was spilled to ' + r.stdout.spillPath : '')
+            + '. Narrow the request (fewer pages, a target selector, a smaller maxEdge) and retry.',
+        }
+      }
       let parsed
       try { parsed = JSON.parse(r.stdout.text) } catch (e) {
         return { ok: false, status: 0, text: 'helper output not parseable: ' + String(r.stdout.text).slice(0, 300) + (r.stderr.text ? ' [stderr: ' + String(r.stderr.text).slice(0, 300) + ']' : '') }
@@ -702,7 +715,7 @@ export function apply(ctx, config) {
       msg = 'Jina API server error (HTTP ' + status + '). Retry in a moment; status: https://status.jina.ai'
       // Official guidance for the model pipelines: they are serverless, a cold
       // start answers 503, and the vendor says to retry after 30-60 seconds.
-      if (status === 503) msg += ' If this call used a model pipeline (X-Respond-With: jina-ocr-v1 / readerlm-v2), a cold start is the likely cause — the vendor\'s guidance is to retry after 30–60 seconds.'
+      if (status === 503) msg += ' If this call used jina-ocr-v1 (jina_read_pdf), a cold start is the likely cause — the vendor\'s guidance is to retry after 30–60 seconds.'
     }
     // The pool's own account of what it tried: a quota error on a single key
     // reads very differently once the user can see every saved key was tried.
@@ -876,26 +889,122 @@ export function apply(ctx, config) {
     return text
   }
 
-  function fmtPdf(text, asJson) {
-    if (asJson) return text
+  /** The parsed `extract-pdf` payload, or undefined when the body is not JSON. */
+  function pdfPayload(text) {
     try {
       const data = JSON.parse(text)
-      const meta = data && data.meta ? data.meta : {}
-      const floats = data && Array.isArray(data.floats) ? data.floats : []
-      const lines = []
-      lines.push('Pages: ' + (meta.num_pages !== undefined ? meta.num_pages : '?'))
-      lines.push('Extracted items: ' + (meta.num_floats !== undefined ? meta.num_floats : floats.length))
-      for (const f of floats) {
-        if (!f || typeof f !== 'object') continue
-        const parts = [f.type || 'unknown']
-        if (f.number) parts.push(String(f.number))
-        lines.push('  [' + parts.join(' ') + '] page ' + (f.page !== undefined ? f.page : '?'))
-        if (f.caption) lines.push('    ' + String(f.caption))
-      }
-      return lines.join('\n')
-    } catch (e) { /* fall through */ }
-    return text
+      return data !== null && typeof data === 'object' ? data : undefined
+    } catch (err) { return undefined }
   }
+
+  /**
+   * The model-facing inventory of one `extract-pdf` payload.
+   *
+   * The API reports detected "floats" — LaTeX's word for figures/tables, i.e.
+   * the elements that float out of the text flow. Each one carries a cropped
+   * image plus `type`/`number`/`page`/`caption`; the caption is a placeholder
+   * ("Table (detected)"), so the inventory is orientation only and the real
+   * payload is the image.
+   */
+  function pdfEnvelope(data, attached) {
+    const meta = data && data.meta ? data.meta : {}
+    const floats = data && Array.isArray(data.floats) ? data.floats : []
+    const lines = [
+      'Pages: ' + (meta.num_pages !== undefined ? meta.num_pages : '?'),
+      'Extracted items: ' + (meta.num_floats !== undefined ? meta.num_floats : floats.length),
+    ]
+    floats.forEach((f, index) => {
+      if (!f || typeof f !== 'object') return
+      const parts = [f.type || 'unknown']
+      if (f.number) parts.push(String(f.number))
+      const size = f.width && f.height ? ', ' + f.width + 'x' + f.height + ' px' : ''
+      lines.push('  [' + parts.join(' ') + '] page ' + (f.page !== undefined ? f.page : '?') + size)
+      if (f.caption) lines.push('    ' + String(f.caption))
+      const attachedNow = attached.has(index)
+      if (typeof f.image === 'string' && f.image !== '' && !attachedNow) {
+        lines.push('    (image not attached — see the notes below)')
+      }
+    })
+    return lines.join('\n')
+  }
+
+  /** A stable, descriptive name for one extracted image attachment. */
+  function pdfImageName(float, index) {
+    const kind = typeof float.type === 'string' && float.type !== '' ? float.type : 'item'
+    const number = float.number !== undefined && float.number !== '' ? '-' + String(float.number) : '-' + (index + 1)
+    const page = float.page !== undefined ? '-page' + String(float.page) : ''
+    return 'jina-pdf-' + kind + number + page + '.png'
+  }
+
+  /**
+   * Turn the payload's base64 crops into image blocks the model can actually see.
+   *
+   * `extract-pdf` returns each detected figure/table/equation as a cropped PNG
+   * (base64) and nothing else — no markdown, no LaTeX, no real caption — so
+   * dropping the images would leave a useless inventory. They are handed to the
+   * attachment store and returned as image blocks, exactly the shape the
+   * built-in `read_image` uses. Every refusal (no store, wrong media type, an
+   * image over the deployment's limits) is reported in the notes rather than
+   * thrown: one oversized figure must not lose the whole extraction.
+   *
+   * @returns `{ blocks, notes, attached }` — image blocks, human-readable
+   *   refusals, and the indices of the floats that made it into `blocks`.
+   */
+  async function pdfImageBlocks(data, maxImages) {
+    const store = ctx.get('attachments')
+    const floats = data && Array.isArray(data.floats) ? data.floats : []
+    const wanted = floats
+      .map((f, index) => ({ f, index }))
+      .filter(({ f }) => f && typeof f === 'object' && typeof f.image === 'string' && f.image !== '')
+    const blocks = []
+    const notes = []
+    const attached = new Set()
+    if (wanted.length === 0) return { blocks, notes, attached }
+    if (store === undefined || store === null) {
+      notes.push('the deployment has no attachment store, so the ' + wanted.length + ' extracted image(s) could not be attached')
+      return { blocks, notes, attached }
+    }
+    const limits = store.imageLimits !== null && typeof store.imageLimits === 'object' ? store.imageLimits : {}
+    const mediaTypes = Array.isArray(limits.mediaTypes) ? limits.mediaTypes : ['image/png']
+    if (!mediaTypes.includes('image/png')) {
+      notes.push('this deployment does not accept image/png attachments, so the extracted images were skipped')
+      return { blocks, notes, attached }
+    }
+    const perMessage = Number.isFinite(limits.maxImagesPerMessage) ? limits.maxImagesPerMessage : wanted.length
+    const asked = Number(maxImages)
+    const cap = Math.max(1, Math.min(Number.isFinite(asked) && asked > 0 ? Math.floor(asked) : PDF_DEFAULT_IMAGES, perMessage))
+    for (const { f, index } of wanted) {
+      if (blocks.length >= cap) {
+        notes.push('only the first ' + cap + ' image(s) were attached; ' + (wanted.length - blocks.length) + ' more are in the payload (raise maxImages to attach more)')
+        break
+      }
+      let bytes
+      try { bytes = Buffer.from(String(f.image), 'base64') } catch (err) { bytes = undefined }
+      if (bytes === undefined || bytes.length === 0) {
+        notes.push('item ' + (index + 1) + ': the image data could not be decoded')
+        continue
+      }
+      try {
+        const ref = await store.saveImage({ data: new Uint8Array(bytes), mediaType: 'image/png', name: pdfImageName(f, index) })
+        blocks.push({
+          type: 'image',
+          attachment: {
+            attachmentId: ref.attachmentId,
+            mediaType: ref.mediaType,
+            bytes: ref.bytes,
+            width: ref.width,
+            height: ref.height,
+            ...(ref.name === undefined ? {} : { name: ref.name }),
+          },
+        })
+        attached.add(index)
+      } catch (err) {
+        notes.push('item ' + (index + 1) + ' (page ' + (f.page !== undefined ? f.page : '?') + '): ' + String((err && err.message) || err))
+      }
+    }
+    return { blocks, notes, attached }
+  }
+
 
   // ---- tool registration ---------------------------------------------------
   // IMPORTANT: `tools.register` forwards `parameters` verbatim to the model API.
@@ -906,6 +1015,20 @@ export function apply(ctx, config) {
   const OUT = {
     schema: { type: 'string' },
     render(_args, value) { return [{ type: 'text', text: value }] },
+  }
+
+  /**
+   * `jina_pdf`'s output contract: a text envelope plus the extracted images.
+   *
+   * `extract-pdf` answers with each detected figure/table/equation as a cropped
+   * base64 PNG — the image *is* the payload, since `caption` is a placeholder
+   * and there is no markdown/LaTeX field at all. So the crops ride along as real
+   * image blocks (the same `{ type: 'image', attachment }` shape the built-in
+   * `read_image` returns) instead of being dropped on the floor.
+   */
+  const PDF_OUT = {
+    schema: { type: 'object' },
+    render(_args, value) { return value.blocks },
   }
 
   /** Read one key from arguments the model may have sent as anything at all. */
@@ -1107,6 +1230,8 @@ export function apply(ctx, config) {
   const PDF_DEFAULT_PAGES = 5
   /** Hard ceiling on `maxPages`: one call must not be able to drain an account. */
   const PDF_MAX_PAGES = 50
+  /** Extracted images a bare `jina_pdf` call attaches to the result. */
+  const PDF_DEFAULT_IMAGES = 5
 
   /** Whether a URL looks like a PDF (path ends in `.pdf`, ignoring query/hash). */
   function isPdfUrl(value) {
@@ -1165,31 +1290,27 @@ export function apply(ctx, config) {
   /**
    * The provenance marker a generative pipeline earns.
    *
-   * Neither `jina-ocr-v1` nor `readerlm-v2` extracts text — both *produce* it,
-   * so their output can silently differ from the page (measured: the same
-   * arXiv paper came back correct as a PDF and wholly fabricated as HTML).
-   * Saying so inside the result is the cheapest guard there is: the model
-   * reading it can choose to verify instead of quoting it as fact.
+   * `jina-ocr-v1` does not extract text — it *produces* it, so its output can
+   * silently differ from the page (measured: the same arXiv paper came back
+   * correct as a PDF and wholly fabricated as HTML). Saying so inside the
+   * result is the cheapest guard there is: the model reading it can choose to
+   * verify instead of quoting it as fact.
    */
   function pipelineNote(pipeline) {
     if (pipeline === 'jina-ocr-v1') {
       return '\n\n[Reader pipeline: jina-ocr-v1 — a generative document model transcribed this page image. Numbers, names and tables can be misread or invented; verify anything load-bearing against the source.]'
-    }
-    if (pipeline === 'readerlm-v2') {
-      return '\n\n[Reader pipeline: readerlm-v2 — a generative HTML→Markdown model produced this text rather than extracting it verbatim; verify anything load-bearing against the source.]'
     }
     return ''
   }
 
   ctx.tools.register({
     name: 'jina_read',
-    description: 'Read a web page as clean markdown via Jina Reader (r.jina.ai), mirroring the jina-cli \'read\' command. Uses the vendor\'s `agent` preset, resolves relative links against the post-redirect URL, and strips page chrome by default. Works without an API key (rate-limited) unless readerlm is on. For a scanned / image-only PDF use jina_read_pdf; for a PDF with a text layer this tool is the cheaper and verbatim path.',
+    description: 'Read a web page as clean markdown via Jina Reader (r.jina.ai), mirroring the jina-cli \'read\' command. Uses the vendor\'s `agent` preset, resolves relative links against the post-redirect URL, and strips page chrome by default. Works without an API key (rate-limited). For a scanned / image-only PDF use jina_read_pdf; for a PDF with a text layer this tool is the cheaper and verbatim path.',
     parameters: {
       type: 'object',
       additionalProperties: false,
       properties: {
         url: { type: 'string', description: 'Page URL, starting with http:// or https://.' },
-        readerlm: { type: 'boolean', description: 'Read through ReaderLM-v2 (X-Respond-With: readerlm-v2), Jina\'s HTML→Markdown model, for pages the plain extractor mangles. Costs roughly 3x the tokens plus a 4000-token minimum and requires an API key. Ignored for .pdf URLs — use jina_read_pdf for those.' },
         targetSelector: { type: 'string', description: 'CSS selector(s) to keep instead of the whole page (overrides the configured default list).' },
         waitForSelector: { type: 'string', description: 'CSS selector to wait for before extracting (dynamically rendered pages).' },
         removeSelector: { type: 'string', description: 'CSS selector(s) to drop before extracting (overrides the configured default list).' },
@@ -1206,33 +1327,11 @@ export function apply(ctx, config) {
       requireUrlArg('jina_read', args, 'url', ['uri', 'link', 'href'])
       const signal = enterExec(exec)
       const defaults = toolSettings()
-      // ReaderLM-v2 is the vendor's HTML → Markdown model, i.e. the documented
-      // tool for *web pages*. OCR deliberately lives in jina_read_pdf instead:
-      // jina-ocr-v1 reads ONE rendered page image per call, so a long HTML page
-      // is crushed into the global 1024x1024 view and the model invents what it
-      // cannot read (measured: the same arXiv paper fabricated as HTML, correct
-      // as PDF). A .pdf URL therefore never gets ReaderLM either — the plain
-      // extractor reads PDFs natively, verbatim and ~40x cheaper.
-      const pdfUrl = isPdfUrl(args.url)
-      const readerLmWanted = args.readerlm === true || (args.readerlm === undefined && defaults.useReaderLm === true)
-      const useReaderLm = readerLmWanted && !pdfUrl
       const key = args.apiKey || await loadKey()
-      if (useReaderLm && !key) {
-        throw new Error('readerlm requires a Jina API key: the Reader rejects ReaderLM-v2 for anonymous callers (HTTP 401, '
-          + '"Authentication is required to use this feature (Language Model)"). '
-          + 'Save a key in the Plugins → dsh-jina card, or pass apiKey.')
-      }
-      // Alt-text generation is key-gated AND mutually exclusive with
-      // X-Respond-With, so it is only ever sent for the plain pipeline.
-      const useAltText = !useReaderLm && defaults.autoAltText === true && key !== undefined
-      // The selector group belongs to the DOM extractor. A model pipeline
-      // consumes the whole page instead, and — verified live — sending the
-      // group together with `X-Respond-With: readerlm-v2` makes the Reader
-      // answer 422 "No content available" as soon as the selector matches
-      // nothing (i.e. on every page the default list does not fit). So it is
-      // dropped here rather than retried: the group is a default, and a default
-      // must never be a trap.
-      const selectorsOn = defaults.useSelectors !== false && !useReaderLm
+      // Alt-text generation is key-gated: supplying a key is what makes a read
+      // billable, so it is sent only when the user opted in AND a key exists.
+      const useAltText = defaults.autoAltText === true && key !== undefined
+      const selectorsOn = defaults.useSelectors !== false
 
       /** Build one request's headers; the retry flips `withSelectors` off. */
       const buildHeaders = (withSelectors) => {
@@ -1247,11 +1346,7 @@ export function apply(ctx, config) {
         }
         if (args.links) headers['X-With-Links-Summary'] = 'all'
         if (args.images) headers['X-With-Images-Summary'] = 'true'
-        if (useReaderLm) {
-          headers['X-Respond-With'] = 'readerlm-v2'
-        } else if (useAltText) {
-          headers['X-With-Generated-Alt'] = 'true'
-        }
+        if (useAltText) headers['X-With-Generated-Alt'] = 'true'
         if (args.noCache) headers['X-No-Cache'] = 'true'
         if (withSelectors) {
           const target = args.targetSelector || defaults.targetSelector || DEFAULT_TARGET_SELECTORS
@@ -1267,7 +1362,7 @@ export function apply(ctx, config) {
       const request = (headers) => callJina({
         url: READER, method: 'POST', headers,
         body: { url: String(args.url) }, timeoutMs: 120000,
-        needsKey: useReaderLm || useAltText, apiKey: args.apiKey, signal,
+        needsKey: useAltText, apiKey: args.apiKey, signal,
       })
 
       let res = await request(buildHeaders(selectorsOn))
@@ -1305,12 +1400,7 @@ export function apply(ctx, config) {
           + (payload.published !== '' ? '\nPublished Time: ' + payload.published : '')
           + '\n\nMarkdown Content:\n' + out
       }
-      // ReaderLM was configured (or asked for) but this is a PDF: say so, so the
-      // caller never reads the plain extractor's output as a model's.
-      const pdfNote = readerLmWanted && pdfUrl
-        ? '\n\n[readerlm was not applied: this URL is a PDF, so the plain extractor read it (verbatim and ~40x cheaper than OCR). Use jina_read_pdf only when the PDF is a scan with no text layer.]'
-        : ''
-      return out + usageFooter(res.text) + pipelineNote(useReaderLm ? 'readerlm-v2' : '') + pdfNote + keySwitchNote(res)
+      return out + usageFooter(res.text) + keySwitchNote(res)
     },
   })
 
@@ -1592,20 +1682,21 @@ export function apply(ctx, config) {
 
   ctx.tools.register({
     name: 'jina_pdf',
-    description: 'Extract figures, tables and equations from a PDF via Jina (extract-pdf), mirroring the jina-cli \'pdf\' command. Provide either url or arxivId.',
+    description: 'Extract the figures, tables and equations of a PDF via Jina (extract-pdf), mirroring the jina-cli \'pdf\' command, and attach each extracted crop to the result as an image. This is a VISUAL extractor: it returns no text, no markdown and no LaTeX, and its caption is a placeholder — use jina_read_pdf when you need the document\'s words. Provide either url or arxivId.',
     parameters: {
       type: 'object',
       additionalProperties: false,
       properties: {
-        url: { type: 'string', description: 'PDF URL (https).' },
-        arxivId: { type: 'string', description: 'arXiv paper ID shorthand, e.g. 2301.12345.' },
+        url: { type: 'string', description: 'PDF URL (https). Only allowlisted sources are accepted — most hosts answer HTTP 400 "not an allowed PDF source".' },
+        arxivId: { type: 'string', description: 'arXiv paper ID shorthand, e.g. 2301.12345. The reliable way to reach this endpoint.' },
         extractType: { type: 'string', description: 'Filter by type: figure, table, equation (comma-separated).' },
         maxEdge: { type: 'number', description: 'Max pixel size for extracted images. Default: 1024.' },
-        json: { type: 'boolean', description: 'Return the raw JSON response instead of formatted output.' },
+        maxImages: { type: 'number', description: 'How many extracted crops to attach as images. Default: 5.' },
+        json: { type: 'boolean', description: 'Return the raw JSON response instead of the inventory (no image blocks).' },
         apiKey: { type: 'string', description: 'Optional Jina API key override.' },
       },
     },
-    output: OUT,
+    output: PDF_OUT,
     async execute(args, exec) {
       const signal = enterExec(exec)
       const body = { max_edge: args.maxEdge !== undefined ? args.maxEdge : 1024 }
@@ -1619,7 +1710,16 @@ export function apply(ctx, config) {
         body, timeoutMs: 120000, needsKey: true, apiKey: args.apiKey, signal,
       })
       if (!res.ok) return failJina(res)
-      return withKeyNote(fmtPdf(res.text, args.json === true), res, args.json === true)
+      if (args.json === true) return { blocks: [{ type: 'text', text: withKeyNote(res.text, res, true) }] }
+      const data = pdfPayload(res.text)
+      if (data === undefined) return { blocks: [{ type: 'text', text: withKeyNote(res.text, res, false) }] }
+      const extracted = await pdfImageBlocks(data, args.maxImages)
+      let text = pdfEnvelope(data, extracted.attached)
+      if (extracted.blocks.length > 0) {
+        text += '\n\n' + extracted.blocks.length + ' extracted image(s) are attached below — those crops are the figures/tables themselves.'
+      }
+      if (extracted.notes.length > 0) text += '\n\n[Notes]\n' + extracted.notes.map((note) => '- ' + note).join('\n')
+      return { blocks: [{ type: 'text', text: withKeyNote(text, res, false) }, ...extracted.blocks] }
     },
   })
 

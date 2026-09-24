@@ -106,13 +106,12 @@ test('client bundle: a non-http(s) address is refused before it can be saved', (
 test('client bundle: the reader options ride the same namespace and write path', () => {
   // The bundle is hand-edited, so a dropped field would silently make the
   // control a no-op: the card would render a checkbox that writes nothing.
-  for (const field of ['useReaderLm', 'imagePolicy', 'autoAltText', 'useSelectors', 'targetSelector', 'removeSelector']) {
+  for (const field of ['imagePolicy', 'autoAltText', 'useSelectors', 'targetSelector', 'removeSelector']) {
     assert.match(SOURCE, new RegExp("'" + field + "'"), field + ' must be wired into the card')
   }
-  assert.match(SOURCE, /readerlm-v2/, 'the switch must name the model it turns on')
-  assert.match(SOURCE, /3× token/, 'the cost must be stated where the switch is')
-  assert.match(SOURCE, /jina_read_pdf/, 'the switch must point PDFs at the tool that owns OCR')
   assert.doesNotMatch(SOURCE, /useOcr/, 'the retired OCR field must not be written any more')
+  assert.doesNotMatch(SOURCE, /useReaderLm/, 'the retired ReaderLM field must not be written any more')
+  assert.doesNotMatch(SOURCE, /readerlm/, 'the card must not offer the removed ReaderLM pipeline')
   // One writer, revision-fenced: the options must not grow a second mutate path.
   const mutations = SOURCE.match(/\.mutate\(/g) || []
   assert.equal(mutations.length, 1, 'exactly one settings write path')
