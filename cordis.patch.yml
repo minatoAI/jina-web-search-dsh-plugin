@@ -1,7 +1,7 @@
 # dsh-jina bundle layer — applied on top of a dsh profile's composition.
 #
 # One dual-face row (`dsh-jina`), the shape dsh uses for every browser-half
-# package: the host half registers the twelve jina_* model tools and the
+# package: the host half registers the eight jina_* model tools and the
 # network transport; the browser half is declared by the ROOT manifest's
 # `dsh.client` + `exports["./client"]` and registers the "Jina Tools" card in
 # the web settings panel. The client-modules scan only accepts rows whose
@@ -18,8 +18,9 @@
 # is exhausted/rate-limited/revoked and *deletes* a key that is definitively
 # unusable (401/402, or a balance of zero), so the card never has to show or
 # manage a single key. The `jina-tools` settings namespace this row serves
-# carries the local proxy address (`proxyUrl`) and the reader policy (`useOcr`,
-# `imagePolicy`, `autoAltText`, `useSelectors` and the three selector
+# carries the endpoint mode (`endpoint`: the mainland mirrors, Jina's global
+# hosts, or automatic) and the reader policy (`imagePolicy`,
+# `autoAltText`, `useSelectors` and the three selector
 # overrides); this patch itself defines no settings.
 - insert:
     - id: jina-tools

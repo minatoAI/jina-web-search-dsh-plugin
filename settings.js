@@ -1,43 +1,131 @@
 /**
- * dsh-jina — proxy policy (pure helpers, zero dependencies).
+ * dsh-jina — settings and endpoint policy (pure helpers, zero dependencies).
  *
- * The Jina endpoints are unreachable from mainland China without a proxy. A
- * local proxy client (Clash / v2ray / Surge / …) that is deliberately NOT
- * enabled as the system proxy listens on a loopback port only: the Windows
- * WinINET registry discovery in index.js cannot see it, and neither can any
- * other system-level probe. This module owns the manual override and the
- * precedence the transport applies, so the user can simply type the address
- * of their own local proxy and have every Jina call ride it.
+ * Two concerns live here, both of them policy rather than transport:
  *
- * Precedence (first usable candidate wins):
- *   1. `request` — transport-level override for one call (internal)
- *   2. `setting` — Settings → Plugins → Jina Tools → 本地代理地址
- *                  (the `proxyUrl` field of the `jina-tools` namespace)
- *   3. `envVar`  — the `JINA_PROXY_URL` environment variable, for headless
- *                  profiles that never mount a settings provider
- *   4. `system`  — the Windows system proxy discovered from WinINET
- *   5. (none)    — the harness-resolved proxy the subprocess seam already
- *                  carries (HTTP_PROXY / HTTPS_PROXY / ALL_PROXY / NO_PROXY)
+ * 1. The `jina-tools` settings namespace: which Jina host pair a call uses
+ *    (`endpoint`) and the reader policy the tools fall back to (image handling
+ *    and the selector overrides). The namespace *is* a Loader entry id
+ *    (contributed by this bundle's `cordis.patch.yml`) and `index.js` exports
+ *    the `Config` this module builds, so a field saved on the card reaches the
+ *    running plugin without a restart.
  *
- * Only http(s) proxies are usable: the network helper is a `node -e` script
- * using the global `fetch`, which honors proxy variables under
- * `NODE_USE_ENV_PROXY` — and Node exits at startup when that flag sees a
- * non-http(s) scheme. A SOCKS value is therefore reported as unusable instead
- * of being passed on silently.
+ * 2. The endpoint policy. Jina's global hosts (`r.jina.ai`, `s.jina.ai`) are
+ *    DNS-poisoned from mainland China and their origin addresses are
+ *    blackholed, so a call from there fails at connect time. The vendor
+ *    publishes official mainland mirrors — `r.jinaai.cn` and `s.jinaai.cn`,
+ *    served from a domestic CDN, same API, same parameters, same auth — and
+ *    documents them as the replacement domain (jina-ai/reader#1237). The
+ *    policy below decides the order in which the two host pairs are tried and
+ *    which one the process then sticks to; it never touches a proxy, because
+ *    the CN hosts are reachable directly and a local VPN is exactly the moving
+ *    part this route exists to remove.
+ *
+ * Precedence of the endpoint mode:
+ *   - `cn`     — mainland mirrors only (no proxy, no fallback: the user pinned it)
+ *   - `global` — Jina's global hosts only
+ *   - `auto`   — try the side that answered last, then the other one; a call
+ *                only ever spends two attempts and never repeats one host
  *
  * Kept free of Cordis / ctx / network dependencies so the policy is
- * unit-testable without a running harness (see test/proxy.test.js).
+ * unit-testable without a running harness (see test/settings.test.js).
  */
 
 /** Settings namespace the "Jina Tools" card edits; the host half serves it. */
 export const SETTINGS_NAMESPACE = 'jina-tools'
 
-/** Settings field holding the manually configured local proxy address. */
-export const PROXY_SETTING_FIELD = 'proxyUrl'
+// ---- endpoint policy -------------------------------------------------------
+
+/** Settings field: which Jina host pair every call uses. */
+export const ENDPOINT_FIELD = 'endpoint'
+
+/** The values `endpoint` accepts, in card order. */
+export const ENDPOINT_MODES = ['auto', 'global', 'cn']
+
+/** What an unset `endpoint` means: pick by reachability, prefer what worked. */
+export const DEFAULT_ENDPOINT_MODE = 'auto'
+
+/**
+ * The two host pairs, per API family.
+ *
+ * `search` deliberately points at `s.jina.ai` rather than the `svip.jina.ai`
+ * the plugin used before: `s.jina.ai` is the documented search endpoint, its
+ * mainland mirror is `s.jinaai.cn`, and both answer the same
+ * `{ code, status, data: [...] }` shape — so one formatter covers every route.
+ * The one field that does not survive the move is `domain` (ignored by
+ * `s.jina.ai`); `site` is honoured instead, which is what `index.js` sends for
+ * the arxiv / ssrn shortcuts.
+ */
+export const ENDPOINT_HOSTS = {
+  reader: { global: 'https://r.jina.ai/', cn: 'https://r.jinaai.cn/' },
+  search: { global: 'https://s.jina.ai/', cn: 'https://s.jinaai.cn/' },
+}
+
+/** API families a call can belong to. */
+export const ENDPOINT_KINDS = ['reader', 'search']
+
+/**
+ * The suffix a CN request must bypass any inherited proxy with.
+ *
+ * The plugin no longer configures a proxy, but the harness resolves its own
+ * outbound policy from the launching environment and hands the subprocess a
+ * base that may already carry `HTTP_PROXY` / `HTTPS_PROXY`. A CN host is a
+ * domestic CDN address: sending it through a VPN is at best slower and at
+ * worst the hang this whole route exists to avoid, so the CN attempt adds its
+ * own suffix to `NO_PROXY` (and never drops the inherited list).
+ */
+export const CN_NO_PROXY = 'jinaai.cn'
+
+/**
+ * Read the endpoint mode out of a resolved `jina-tools` section.
+ * @param section - the resolved settings value (any shape).
+ * @returns one of {@link ENDPOINT_MODES}; anything unknown means `auto`.
+ */
+export function endpointModeOf(section) {
+  if (section === null || typeof section !== 'object') return DEFAULT_ENDPOINT_MODE
+  const value = section[ENDPOINT_FIELD]
+  return typeof value === 'string' && ENDPOINT_MODES.includes(value) ? value : DEFAULT_ENDPOINT_MODE
+}
+
+/**
+ * The hosts one call tries, in order, for one API family.
+ *
+ * A pinned mode yields exactly one candidate, so a failure is reported instead
+ * of being papered over by the other side. `auto` yields both, starting with
+ * the side that answered last — the process learns which side works on its
+ * first call and stops paying for the other one, and it still falls back if
+ * that side later breaks.
+ *
+ * @param mode - `'auto' | 'global' | 'cn'` (already validated).
+ * @param kind - `'reader' | 'search'`; an unknown kind reads as `reader`.
+ * @param preferred - the side that answered last (`'global'` before any call).
+ * @returns `[{ side, base }]` — one or two candidates, in try order.
+ */
+export function routePlan(mode, kind, preferred) {
+  const hosts = ENDPOINT_HOSTS[ENDPOINT_KINDS.includes(kind) ? kind : 'reader']
+  if (mode === 'cn') return [{ side: 'cn', base: hosts.cn }]
+  if (mode === 'global') return [{ side: 'global', base: hosts.global }]
+  const first = preferred === 'cn' ? 'cn' : 'global'
+  const second = first === 'cn' ? 'global' : 'cn'
+  return [{ side: first, base: hosts[first] }, { side: second, base: hosts[second] }]
+}
+
+/**
+ * The environment overlay that keeps a CN attempt off any inherited proxy.
+ *
+ * @param inheritedNoProxy - `process.env.NO_PROXY` (either casing) or anything else.
+ * @returns `{ NO_PROXY, no_proxy }` with the CN suffix appended once.
+ */
+export function cnBypassEnv(inheritedNoProxy) {
+  const base = typeof inheritedNoProxy === 'string' ? inheritedNoProxy.trim() : ''
+  const already = base.split(',').map((part) => part.trim()).includes(CN_NO_PROXY)
+  const list = base === '' ? CN_NO_PROXY : (already ? base : base + ',' + CN_NO_PROXY)
+  return { NO_PROXY: list, no_proxy: list }
+}
 
 // ---- reader defaults -------------------------------------------------------
-// The `jina-tools` namespace carries the reader policy next to the proxy
-// address. Everything here is a *default* the tools fall back to; each value
+// The `jina-tools` namespace carries the reader policy next to the endpoint
+// mode. Everything here is a *default* the tools fall back to; each value
 // can still be overridden per call (the tool parameters win), which is why the
 // settings document only ever stores what the user actually changed.
 
@@ -97,140 +185,23 @@ export const DEFAULT_REMOVE_SELECTORS = 'header, footer, nav, [role="navigation"
  */
 export const SELECTOR_RETRY_MIN_CHARS = 200
 
-/** Environment variable carrying a deployment-wide manual proxy address. */
-export const PROXY_ENV_VAR = 'JINA_PROXY_URL'
-
 /**
- * Proxy variables a harness-resolved environment may carry, in inspection
- * order. Both cases are listed because Windows tooling and dsh itself differ.
- */
-export const PROXY_ENV_VARS = [
-  'HTTPS_PROXY', 'https_proxy',
-  'HTTP_PROXY', 'http_proxy',
-  'ALL_PROXY', 'all_proxy',
-]
-
-/** Human-readable reason a candidate address was rejected. */
-const REJECT_REASONS = {
-  empty: '地址为空',
-  type: '地址不是字符串',
-  invalid: '不是有效的主机:端口地址',
-  scheme: '不支持的协议（网络 helper 只支持 http:// 与 https:// 代理）',
-}
-
-/** Explain one rejection reason (the plugin's user-facing language). */
-export function describeRejectReason(reason) {
-  return REJECT_REASONS[reason] || String(reason)
-}
-
-/**
- * Parse one proxy address into a transport-usable URL.
- *
- * Accepts `127.0.0.1:7897` (scheme defaults to http), `http://host:port`,
- * `https://host:port` and credentials-bearing forms. A path, query, or
- * fragment is dropped — a proxy address is an origin. Anything without a host,
- * or with a scheme the Node helper cannot use, comes back `usable: false`
- * with the normalized-or-raw URL preserved for display.
- *
- * @param raw - the user/config-supplied address.
- * @returns `{ url, usable, reason }`; `url` is '' when nothing parsed at all.
- */
-export function parseProxyAddress(raw) {
-  if (typeof raw !== 'string') {
-    return { url: '', usable: false, reason: raw === undefined || raw === null || raw === '' ? 'empty' : 'type' }
-  }
-  const value = raw.trim()
-  if (value === '') return { url: '', usable: false, reason: 'empty' }
-  const candidate = /^[a-z][a-z0-9+.-]*:\/\//i.test(value) ? value : 'http://' + value
-  let parsed
-  try {
-    parsed = new URL(candidate)
-  } catch {
-    return { url: '', usable: false, reason: 'invalid' }
-  }
-  if (parsed.hostname === '') return { url: '', usable: false, reason: 'invalid' }
-  const scheme = parsed.protocol.toLowerCase()
-  const auth = parsed.username === ''
-    ? ''
-    : parsed.username + (parsed.password === '' ? '' : ':' + parsed.password) + '@'
-  const url = scheme + '//' + auth + parsed.host
-  if (scheme !== 'http:' && scheme !== 'https:') return { url, usable: false, reason: 'scheme' }
-  return { url, usable: true, reason: 'ok' }
-}
-
-/**
- * Read the manual proxy field out of a resolved `jina-tools` section.
- * @param section - the resolved settings value (any shape).
- * @returns the stored string, or '' when unset/non-string.
- */
-export function proxySettingOf(section) {
-  if (section === null || typeof section !== 'object') return ''
-  const value = section[PROXY_SETTING_FIELD]
-  return typeof value === 'string' ? value : ''
-}
-
-/**
- * First non-empty proxy variable in an environment-like object.
- * @param env - `process.env` or any plain object.
- * @returns the raw variable value, or ''.
- */
-export function envProxyValue(env) {
-  if (env === null || typeof env !== 'object') return ''
-  for (const name of PROXY_ENV_VARS) {
-    const value = env[name]
-    if (typeof value === 'string' && value.trim() !== '') return value.trim()
-  }
-  return ''
-}
-
-/**
- * Apply the precedence above to one operation's candidate addresses.
- *
- * A candidate that is present but unusable never wins; it is recorded in
- * `rejected` so the UI and the error text can report it rather than pretend
- * the user configured nothing.
- *
- * @param input - `{ request?, setting?, envVar?, system?, env? }`.
- * @returns `{ url, source, envHint, rejected }`; `url` is undefined when no
- *   candidate is usable, and `source` then names the inherited layer
- *   (`'environment'`) or nothing at all (`'none'`).
- */
-export function selectProxy(input) {
-  const env = (input && input.env) || {}
-  const envHint = envProxyValue(env)
-  const rejected = []
-  const consider = (field, raw) => {
-    if (typeof raw !== 'string' || raw.trim() === '') return undefined
-    const parsed = parseProxyAddress(raw)
-    if (parsed.usable) return { url: parsed.url, source: field }
-    rejected.push({ field, value: raw.trim(), reason: parsed.reason, message: describeRejectReason(parsed.reason) })
-    return undefined
-  }
-  const hit = consider('request', input && input.request)
-    || consider('setting', input && input.setting)
-    || consider('envVar', input && input.envVar)
-    || consider('system', input && input.system)
-  if (hit) return { url: hit.url, source: hit.source, envHint, rejected }
-  return { url: undefined, source: envHint === '' ? 'none' : 'environment', envHint, rejected }
-}
-
-/**
- * Resolve the `jina-tools` section into the reader policy the tools consume.
+ * Resolve the `jina-tools` section into the policy the tools consume.
  *
  * Every field is optional in the document, so this is where "unset" becomes a
  * concrete default. It never throws: a missing provider (`undefined`), a
  * hand-edited scalar, or an unknown value all resolve to a usable policy, the
- * same contract `settingProxy()` already relies on.
+ * same contract the settings seam relies on.
  *
  * @param section - the resolved settings value (any shape).
- * @returns `{ proxyUrl, imagePolicy, autoAltText, useSelectors,
+ * @returns `{ endpoint, imagePolicy, autoAltText, useSelectors,
  *            targetSelector, removeSelector, waitForSelector }`.
  */
 export function toolSettingsOf(section) {
   const s = section !== null && typeof section === 'object' ? section : {}
   const text = (value) => (typeof value === 'string' && value.trim() !== '' ? value.trim() : '')
   return {
-    proxyUrl: proxySettingOf(s),
+    endpoint: endpointModeOf(s),
     imagePolicy: IMAGE_POLICIES.includes(s[IMAGE_POLICY_FIELD]) ? s[IMAGE_POLICY_FIELD] : DEFAULT_IMAGE_POLICY,
     // Opt-in, because supplying a key is what makes a read billable: defaulting
     // this to true would silently turn every anonymous (free) read into a
@@ -250,7 +221,7 @@ const VOLATILE_WRITE = Symbol.for('cosmokit.volatile.write')
 
 /** The live fields, in card order: `[key, schemastery type]`. */
 const SETTINGS_FIELDS = [
-  [PROXY_SETTING_FIELD, 'string'],
+  [ENDPOINT_FIELD, 'string'],
   [IMAGE_POLICY_FIELD, 'string'],
   [AUTO_ALT_SETTING_FIELD, 'boolean'],
   [SELECTORS_SETTING_FIELD, 'boolean'],
@@ -284,8 +255,8 @@ function volatileRef(value) {
  * receives, unwrapping the volatile references.
  *
  * Tolerates a plain (already unwrapped) section too: if a harness copy hands
- * over the raw config, the manual proxy address and the reader policy still
- * apply instead of silently collapsing to the defaults.
+ * over the raw config, the endpoint mode and the reader policy still apply
+ * instead of silently collapsing to the defaults.
  *
  * @param config - the second argument of `apply` (any shape).
  * @returns a section of plain values, `undefined` for every unset field.
@@ -307,10 +278,10 @@ export function settingsSnapshot(config) {
  * state in which the settings card renders but every field is read-only.
  *
  * @param config - the second argument of `apply` (any shape).
- * @returns whether `proxyUrl` is a cosmokit-compatible reference.
+ * @returns whether `endpoint` is a cosmokit-compatible reference.
  */
 export function settingsAreLive(config) {
-  const ref = config !== null && typeof config === 'object' ? config[PROXY_SETTING_FIELD] : undefined
+  const ref = config !== null && typeof config === 'object' ? config[ENDPOINT_FIELD] : undefined
   return ref !== null && typeof ref === 'object' && typeof ref.get === 'function' && VOLATILE_WRITE in ref
 }
 

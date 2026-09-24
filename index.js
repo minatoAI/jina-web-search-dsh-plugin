@@ -1,19 +1,19 @@
 /**
  * dsh-jina — Jina AI tools for DeepSeek Harness.
  *
- * Host plugin: registers the twelve jina_* model tools mirroring jina-cli
+ * Host plugin: registers the eight jina_* model tools mirroring jina-cli
  * (search — with dedicated jina_search_arxiv / jina_search_ssrn academic
  * shortcuts so the model can hit the right domain without remembering the
- * `type` parameter — / read / screenshot / datetime / expand / embed /
- * rerank / classify / pdf / primer). The API key lives in the host credential seam
+ * `type` parameter — / read / read_pdf / screenshot / datetime / primer).
+ * The API key lives in the host credential seam
  * under the reference `JINA_API_KEY` — the "Jina Tools" web settings page
  * writes it through `credentials.set`, and this plugin resolves it per
  * operation (the seam's contract: never cache across operations). The web
  * settings pairing: the `jina-tools` Loader entry (contributed by this bundle's
  * `cordis.patch.yml`) *is* the settings namespace, and this host half declares
- * its live fields through the module-level `Config` export built by proxy.js —
- * `proxyUrl` carries a manually configured local proxy address and the
- * remaining fields carry the reader policy (`imagePolicy`,
+ * its live fields through the module-level `Config` export built by settings.js —
+ * `endpoint` selects the Jina host pair (mainland mirrors / global / auto) and
+ * the remaining fields carry the reader policy (`imagePolicy`,
  * `autoAltText`, `useSelectors` and the selector overrides). The browser half
  * registers its configuration form for that namespace, so the Plugins page
  * (the `dsh-jina` bundle card) renders the form only when the two halves agree.
@@ -38,19 +38,20 @@
  * `keys.js` owns the pure rotation policy.
  *
  * Network transport: the Jina endpoints are contacted through a small
- * `node -e` fetch helper spawned via the host `subprocess` service. The
- * spawn environment inherits the harness-resolved proxy policy (dsh 0.1.3+:
- * HTTP_PROXY/HTTPS_PROXY/ALL_PROXY/NO_PROXY from the startup environment),
- * and a proxy is layered on top in this order (proxy.js owns the policy):
- *   1. a manual address from the "Jina Tools" settings card (`jina-tools` →
- *      `proxyUrl`) — the fix for a local proxy client that listens on a
- *      loopback port WITHOUT being the system proxy, which no automatic
- *      discovery can see,
- *   2. the `JINA_PROXY_URL` environment variable (headless profiles),
- *   3. the Windows system proxy (WinINET registry), rediscovered
- *      automatically when a transport failure suggests the port changed.
- * The card's health check (`/api/dsh-jina/primer`) reports the proxy actually
- * in effect, and transport failures name it, so a misconfigured address is
+ * `node -e` fetch helper spawned via the host `subprocess` service. Which host
+ * pair a call talks to is decided per call by settings.js:
+ *   1. `cn`     — the vendor's official mainland mirrors (`r.jinaai.cn`,
+ *      `s.jinaai.cn`), served from a domestic CDN with the same API, the same
+ *      parameters and the same auth. The attempt adds `jinaai.cn` to
+ *      `NO_PROXY` so a proxy inherited from the launching environment cannot
+ *      capture it — these hosts are why the plugin needs no VPN at all.
+ *   2. `global` — `r.jina.ai` / `s.jina.ai`. Both are DNS-poisoned and their
+ *      origins blackholed from mainland China, where this side fails at
+ *      connect time.
+ *   3. `auto`   — try the side that answered last, then the other one. At most
+ *      two attempts per call, never the same host twice, and the winner is
+ *      remembered for the rest of the process.
+ * A transport failure reports every host it tried, so "no route at all" is
  * visible instead of looking like a generic network outage.
  */
 
@@ -62,11 +63,11 @@ import {
 } from './keys.js'
 import { buildPrimer, formatPrimer, parseIpInfo, parseJinaRoot } from './primer.js'
 import {
-  DEFAULT_REMOVE_SELECTORS, DEFAULT_TARGET_SELECTORS, PROXY_ENV_VAR,
+  DEFAULT_REMOVE_SELECTORS, DEFAULT_TARGET_SELECTORS,
   READER_BASE, READER_PRESET, READER_TIMEOUT_SECONDS, SELECTOR_RETRY_MIN_CHARS,
-  createSettingsSchema, describeRejectReason, proxySettingOf, selectProxy,
+  cnBypassEnv, createSettingsSchema, routePlan,
   settingsAreLive, settingsSnapshot, toolSettingsOf,
-} from './proxy.js'
+} from './settings.js'
 import { WEB_SEARCH_TOOL } from './tool-contracts.js'
 
 export const name = 'dsh-jina'
@@ -84,7 +85,7 @@ export const inject = ['fs', 'subprocess', 'tools']
  * result holds. That is what makes a save live: the card is editable only while
  * a row for this namespace exists, and this plugin is the row's only source.
  *
- * proxy.js owns the field list, the defaults and the cross-copy volatile
+ * settings.js owns the field list, the defaults and the cross-copy volatile
  * protocol; keeping the schema there is also what preserves the zero-dependency
  * promise (an out-of-tree bundle at this location cannot resolve the harness's
  * schemastery package).
@@ -96,8 +97,8 @@ export const Config = createSettingsSchema()
  * `node -e <script>` by the host `subprocess` service. It reads one JSON
  * request from stdin and writes one JSON result to stdout, so the transport
  * never depends on a bundled HTTP client. Exported because it is the exact
- * code a proxy misconfiguration has to be diagnosed against (see
- * test/plugin-proxy.test.js and README → 开发说明).
+ * code a routing problem has to be diagnosed against (see
+ * test/plugin-endpoints.test.js and README → 开发说明).
  */
 export const HTTP_HELPER_SCRIPT = [
   "const fs = require('fs')",
@@ -130,10 +131,7 @@ export const HTTP_HELPER_SCRIPT = [
 ].join('\n')
 
 export function apply(ctx, config) {
-  const READER = 'https://r.jina.ai/'
   const IPINFO = 'https://ipinfo.io/json'
-  const SEARCH = 'https://svip.jina.ai/'
-  const API = 'https://api.jina.ai'
   const MAX_OUT = 1500000
 
   let nodePath
@@ -152,7 +150,13 @@ export function apply(ctx, config) {
    * from the first slot.
    */
   let keyPoolState = { signature: 0, states: [], lastUsed: -1 }
-  let proxyCache = { text: undefined, at: 0, done: false }
+  /**
+   * The endpoint side that answered last (`'global'` before any call). `auto`
+   * mode tries it first and the other side second, so the process pays for the
+   * unreachable side once and then stops — and still falls back if the working
+   * side breaks later. In-memory only: a restart starts from the global side.
+   */
+  let preferredSide = 'global'
   /**
    * The resolved `jina-tools` config for this plugin instance (see the `Config`
    * export above). The harness keeps this object's identity stable and writes a
@@ -160,7 +164,7 @@ export function apply(ctx, config) {
    * `settingsSnapshot()` at the start of an operation always sees the current
    * values — the same "never cache across operations" contract the API key has.
    * `undefined` on a harness that passes no config, which is why the readers
-   * below fall back to the proxy.js defaults.
+   * below fall back to the settings.js defaults.
    */
   const settingsConfig = config
   let currentCwd = undefined
@@ -412,132 +416,49 @@ export function apply(ctx, config) {
     return asJson === true ? text : text + keySwitchNote(res)
   }
 
-  /** System proxy (the local VPN): read the user-level WinINET registry settings. */
-  async function discoverProxy() {
-    if (proxyCache.done && Date.now() - proxyCache.at < 60000) return proxyCache.text
-    let proxy
-    try {
-      const r = await runCollect(['reg.exe', 'query', 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings'], undefined, 32768)
-      const t = r.stdout.text || ''
-      if (/ProxyEnable\s+REG_DWORD\s+0x1\b/i.test(t)) {
-        const m = /ProxyServer\s+REG_SZ\s+([^\r\n]+)/i.exec(t)
-        if (m) {
-          const raw = m[1].trim()
-          const hit = /(?:^|;)\s*https=([^;]+)/i.exec(raw)
-          let addr = hit ? hit[1].trim() : raw
-          if (!/^https?:\/\//i.test(addr)) addr = 'http://' + addr
-          proxy = addr
-        }
-      }
-    } catch (err) { proxy = undefined }
-    proxyCache = { text: proxy, at: Date.now(), done: true }
-    return proxy
-  }
-
   /**
-   * The manual proxy address stored by the settings card, re-read per operation
-   * (same contract as the API key: a saved change reaches the next call without
-   * a restart). '' while unconfigured.
-   */
-  function settingProxy() {
-    try { return proxySettingOf(settingsSnapshot(settingsConfig)) } catch (err) { return '' }
-  }
-
-  /**
-   * The reader policy stored by the settings card, re-read per operation (same
-   * contract as the proxy address and the API key: a saved change reaches the
-   * next call without a restart). proxy.js owns the normalization and the
-   * defaults, so an unset (or entirely absent) config gets the defaults.
+   * The reader policy and the endpoint mode stored by the settings card, both
+   * re-read per operation (same contract as the API key: a saved change reaches
+   * the next call without a restart). settings.js owns the normalization and
+   * the defaults, so an unset (or entirely absent) config gets the defaults.
    */
   function toolSettings() {
     try { return toolSettingsOf(settingsSnapshot(settingsConfig)) } catch (err) { return toolSettingsOf(undefined) }
   }
 
+  /** The configured endpoint mode: `'auto' | 'global' | 'cn'`. */
+  function endpointMode() {
+    return toolSettings().endpoint
+  }
+
   /**
-   * Resolve the transport plan for one operation (proxy.js owns the
-   * precedence: request > setting > JINA_PROXY_URL > WinINET > inherited env).
-   * WinINET is only consulted when no explicit address exists, so a configured
-   * local proxy never pays for a `reg.exe` probe.
-   * @returns `{ url, source, envHint, rejected }`.
+   * The env overlay one attempt needs.
+   *
+   * The plugin configures no proxy of its own — a CN host is a domestic CDN
+   * address and must not ride a VPN — but the harness hands the subprocess a
+   * base resolved from the launching environment, which may already carry
+   * `HTTP_PROXY` / `HTTPS_PROXY`. The CN side therefore declares its own
+   * `NO_PROXY` suffix, merged with whatever this process's environment holds
+   * (the same source the seam resolves from); every other attempt inherits the
+   * base untouched. Replacing the seam's own list is harmless here: the only URL
+   * a CN attempt fetches is a public one, so no bypass entry it might carry can
+   * matter.
+   *
+   * @param side - `'global' | 'cn'`.
+   * @returns the `env` overlay, or `undefined` to inherit the seam's base.
    */
-  async function proxyPlan(request) {
+  function envForSide(side) {
+    if (side !== 'cn') return undefined
     const env = process.env || {}
-    const own = () => ({
-      request: request === undefined || request === null || request === '' ? undefined : String(request),
-      setting: settingProxy(),
-      envVar: env[PROXY_ENV_VAR],
-      env,
-    })
-    const explicit = selectProxy(own())
-    if (explicit.url !== undefined) return explicit
-    const system = await discoverProxy()
-    return selectProxy({ ...own(), system })
+    return cnBypassEnv(env.NO_PROXY !== undefined ? env.NO_PROXY : env.no_proxy)
   }
 
-  /** Attach the plan actually used to a helper result, for diagnostics. */
-  function withProxy(parsed, plan) {
-    return {
-      ...parsed,
-      proxy: {
-        url: plan.url === undefined ? null : plan.url,
-        source: plan.source,
-        rejected: plan.rejected.map((r) => ({ field: r.field, value: r.value, reason: r.reason })),
-      },
-    }
-  }
-
-  /** What the transport actually ran through. */
-  function effectiveProxyHint(proxy) {
-    if (proxy.source === 'setting') return '当前使用设置卡片（Jina Tools → 本地代理地址）里配置的代理 ' + proxy.url + '；请确认该本地代理正在运行、地址与端口正确（不需要时可在卡片中「清除」以回到自动检测）。'
-    if (proxy.source === 'envVar') return '当前使用环境变量 ' + PROXY_ENV_VAR + '=' + proxy.url + '。'
-    if (proxy.source === 'system') return '当前使用从 Windows 系统代理自动发现的 ' + proxy.url + '。'
-    if (proxy.source === 'request') return '当前使用调用级指定的代理 ' + proxy.url + '。'
-    if (proxy.source === 'environment') return '当前继承启动环境里的代理设置（HTTP_PROXY/HTTPS_PROXY）。'
-    return '未检测到可用代理：Windows 系统代理未开启、启动环境没有 HTTP_PROXY/HTTPS_PROXY、设置卡片也没有填写本地代理地址。若你使用只监听本地端口的代理软件（如 Clash/v2ray），请在设置卡片的「本地代理地址」里填写它的地址（例如 http://127.0.0.1:7897）。'
-  }
-
-  /** Plain-language account of the proxy a request ran through. */
-  function proxyHint(proxy) {
-    if (!proxy) return ''
-    const rejected = Array.isArray(proxy.rejected) ? proxy.rejected[0] : undefined
-    if (rejected === undefined) return effectiveProxyHint(proxy)
-    const where = rejected.field === 'envVar'
-      ? '环境变量 ' + PROXY_ENV_VAR + ' 配置的代理'
-      : rejected.field === 'request' ? '调用级指定的代理' : '设置卡片里配置的代理'
-    return where + '「' + rejected.value + '」不可用（' + describeRejectReason(rejected.reason) + '），已回退到自动检测。' + effectiveProxyHint(proxy)
-  }
-
-  /** One HTTP call through the node helper. */
+  /** One HTTP call through the node helper, on every route settings.js allows. */
   async function jinaRequest(spec) {
     const node = await resolveNode()
     if (!node) return { ok: false, status: 0, text: 'node executable not found on PATH; the helper needs Node.js to make the HTTP call' }
-    const plan = await proxyPlan(spec.proxy)
-    const payload = JSON.stringify({
-      url: spec.url,
-      method: spec.method || 'POST',
-      headers: spec.headers || {},
-      body: spec.body === undefined ? undefined : JSON.stringify(spec.body),
-      timeoutMs: spec.timeoutMs || 60000,
-    })
-    const makeEnv = (p) => {
-      // dsh 0.1.3+: the subprocess seam merges `env` over a scrubbed parent
-      // base that already carries the harness-resolved proxy policy
-      // (HTTP_PROXY/HTTPS_PROXY/ALL_PROXY/NO_PROXY from the startup
-      // environment + NODE_USE_ENV_PROXY). Returning `undefined` inherits
-      // that base untouched; only a selected/overridden proxy layers on
-      // top — and it never clobbers NO_PROXY (the base merges the user's
-      // list with the loopback bypass). WinINET discovery stays as the
-      // Windows complement to the env-only policy the harness resolves.
-      if (p === undefined || p === null || p === '') return undefined
-      let proxy = String(p)
-      if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(proxy)) proxy = 'http://' + proxy
-      const env = { HTTP_PROXY: proxy, HTTPS_PROXY: proxy, http_proxy: proxy, https_proxy: proxy }
-      // Mirror the harness: Node parses proxy vars at startup under this
-      // flag and exits on non-http(s) schemes, so a SOCKS value rides along
-      // for non-Node consumers without the flag.
-      if (/^https?:\/\//i.test(proxy)) env.NODE_USE_ENV_PROXY = '1'
-      return env
-    }
+    const kind = spec.kind === 'search' ? 'search' : 'reader'
+    const plan = routePlan(endpointMode(), kind, preferredSide)
     const parse = (r) => {
       // The helper's stdout is capped at MAX_OUT. A body past the cap comes back
       // flagged `lossy`, and JSON.parse on that truncated slice would report a
@@ -559,21 +480,28 @@ export function apply(ctx, config) {
       if (typeof parsed !== 'object' || parsed === null) return { ok: false, status: 0, text: 'bad helper output: ' + String(r.stdout.text).slice(0, 300) }
       return parsed
     }
-    let r = await runCollect([node, '-e', HTTP_HELPER_SCRIPT], payload, MAX_OUT, makeEnv(plan.url), spec.signal)
-    let parsed = withProxy(parse(r), plan)
-    if (parsed.ok || parsed.status !== 0) return parsed
-    // Transport-level failure: retry once. An automatically discovered proxy is
-    // rediscovered first (the VPN may have restarted on a new port); a manually
-    // configured address is honored as-is — it is the user's explicit choice and
-    // second-guessing it would hide the very misconfiguration they must fix.
-    const explicit = plan.source === 'setting' || plan.source === 'envVar' || plan.source === 'request'
-    let retryPlan = plan
-    if (!explicit) {
-      proxyCache = { text: undefined, at: 0, done: false }
-      retryPlan = await proxyPlan(spec.proxy)
+    const tried = []
+    let last
+    for (const attempt of plan) {
+      const payload = JSON.stringify({
+        url: attempt.base,
+        method: spec.method || 'POST',
+        headers: spec.headers || {},
+        body: spec.body === undefined ? undefined : JSON.stringify(spec.body),
+        timeoutMs: spec.timeoutMs || 60000,
+      })
+      tried.push(attempt.base)
+      const parsed = parse(await runCollect([node, '-e', HTTP_HELPER_SCRIPT], payload, MAX_OUT, envForSide(attempt.side), spec.signal))
+      // Anything that answered — a 200, a 422, even a 401 — proves the host is
+      // reachable, so that side becomes the preferred one. Only a transport
+      // failure (status 0) moves on to the next candidate.
+      if (parsed.ok || parsed.status !== 0) {
+        preferredSide = attempt.side
+        return { ...parsed, endpoint: { side: attempt.side, base: attempt.base } }
+      }
+      last = parsed
     }
-    r = await runCollect([node, '-e', HTTP_HELPER_SCRIPT], payload, MAX_OUT, makeEnv(retryPlan.url), spec.signal)
-    return withProxy(parse(r), retryPlan)
+    return { ...last, endpoint: { side: null, base: null }, endpointsTried: tried }
   }
 
   /**
@@ -629,7 +557,7 @@ export function apply(ctx, config) {
     const headers = {}
     for (const k of Object.keys(opts.headers || {})) headers[k] = opts.headers[k]
     const explicit = opts.apiKey !== undefined && opts.apiKey !== null && opts.apiKey !== ''
-    const mk = () => ({ url: opts.url, method: opts.method || 'POST', headers, body: opts.body, timeoutMs: opts.timeoutMs, signal: opts.signal, ...(opts.proxy !== undefined ? { proxy: opts.proxy } : {}) })
+    const mk = () => ({ kind: opts.kind, method: opts.method || 'POST', headers, body: opts.body, timeoutMs: opts.timeoutMs, signal: opts.signal })
     if (explicit) {
       headers.Authorization = 'Bearer ' + String(opts.apiKey)
       return jinaRequest(mk())
@@ -698,18 +626,24 @@ export function apply(ctx, config) {
       hint422 = 'The Reader extracted no content from this URL. If a target selector was sent, it may simply match nothing on this page (retry with targetSelector: "").'
     }
     const hints = {
-      0: 'No response from the Jina API (network/VPN problem). Check that the local VPN and its system proxy are enabled, then retry.',
+      0: 'No response from any Jina endpoint.',
       401: 'Invalid or expired API key. Fix: update it in the DSH settings page (Jina Tools) or the key file. Get a free key: https://jina.ai/?sui=apikey',
       402: 'API quota exhausted. Fix: top up credits at https://jina.ai/api-dashboard/billing',
       422: hint422,
       429: 'Rate limit hit. Wait a few seconds and retry, or add an API key for higher limits.',
     }
     let msg = 'Jina API error (HTTP ' + status + '). ' + (hints[status] || '')
-    // A transport failure is where a wrong proxy address shows up: name the
-    // proxy that was actually in play instead of a generic network outage.
+    // A transport failure is a routing fact, so report the hosts that were
+    // actually tried and what the user can do about it. `cn` mode is a single
+    // candidate by design: the user pinned that side, so a failure is stated
+    // rather than papered over.
     if (status === 0) {
-      const hint = proxyHint(res.proxy)
-      if (hint !== '') msg += ' ' + hint
+      const tried = Array.isArray(res.endpointsTried) && res.endpointsTried.length > 0 ? res.endpointsTried.join('、') : ''
+      const mode = endpointMode()
+      msg += tried === '' ? '' : ' 已尝试的接口域名：' + tried + '。'
+      msg += mode === 'cn'
+        ? '当前「接口域名」固定为国内域名（r.jinaai.cn / s.jinaai.cn），它无响应说明本机网络到国内 CDN 不通；可在插件卡片里改为「自动」或「国际」再试。'
+        : '请检查本机网络连通性，或稍后重试；Jina 官方在国内提供 r.jinaai.cn / s.jinaai.cn，可在插件卡片里把「接口域名」固定为「国内」以避免这条链路。'
     }
     if (status >= 500) {
       msg = 'Jina API server error (HTTP ' + status + '). Retry in a moment; status: https://status.jina.ai'
@@ -753,11 +687,23 @@ export function apply(ctx, config) {
     return (exec && exec.signal) || undefined
   }
 
+  /**
+   * Format one search payload.
+   *
+   * `s.jina.ai` and its mainland mirror answer
+   * `{ code, status, data: [{ title, url, description, date }] }` — so the
+   * snippet field is `description`, not the `snippet` the old `svip.jina.ai`
+   * host used. Both shapes are accepted (the older one keeps working for a
+   * payload that predates the move), and anything unrecognized is returned
+   * verbatim rather than silently swallowed.
+   */
   function fmtSearch(text, asJson) {
     if (asJson) return text
     let data
     try { data = JSON.parse(text) } catch (e) { return text }
-    const results = data && Array.isArray(data.results) ? data.results : undefined
+    const results = Array.isArray(data && data.data)
+      ? data.data
+      : (data && Array.isArray(data.results) ? data.results : undefined)
     if (results === undefined) return text
     if (results.length === 0) return '(no results)'
     const lines = []
@@ -765,7 +711,9 @@ export function apply(ctx, config) {
       if (r && typeof r === 'object') {
         lines.push(String(r.title || '(untitled)'))
         if (r.url) lines.push('  ' + String(r.url))
-        if (r.snippet) lines.push('  ' + String(r.snippet))
+        const snippet = r.description || r.snippet
+        if (snippet) lines.push('  ' + String(snippet))
+        if (r.date) lines.push('  ' + String(r.date))
       } else {
         lines.push(String(r))
       }
@@ -811,237 +759,6 @@ export function apply(ctx, config) {
     return text
   }
 
-  function fmtExpand(text, asJson) {
-    if (asJson) return text
-    try {
-      const data = JSON.parse(text)
-      const list = Array.isArray(data) ? data : (data && (data.results || data.data))
-      if (Array.isArray(list)) {
-        const lines = []
-        for (const r of list) {
-          if (typeof r === 'string') lines.push(r)
-          else if (r && typeof r === 'object') lines.push(String(r.query || r.text || ''))
-        }
-        const filtered = lines.filter((l) => l && l.length > 0)
-        if (filtered.length > 0) return filtered.join('\n')
-      }
-    } catch (e) { /* fall through */ }
-    return text
-  }
-
-  function fmtEmbed(text, asJson) {
-    if (asJson) return text
-    try {
-      const data = JSON.parse(text)
-      const items = Array.isArray(data) ? data : (data && data.data)
-      if (Array.isArray(items)) {
-        const lines = []
-        items.forEach((item, i) => {
-          const emb = item && Array.isArray(item.embedding) ? item.embedding : item
-          if (Array.isArray(emb)) {
-            const preview = emb.slice(0, 5).map((v) => Number(v).toFixed(6)).join(', ')
-            lines.push('[' + (item && item.index !== undefined ? item.index : i) + '] dim=' + emb.length + ' [' + preview + ', ...]')
-          }
-        })
-        if (lines.length > 0) return lines.join('\n')
-      }
-    } catch (e) { /* fall through */ }
-    return text
-  }
-
-  function fmtRerank(text, documents, asJson) {
-    if (asJson) return text
-    try {
-      const data = JSON.parse(text)
-      const results = Array.isArray(data) ? data : (data && (data.results || data.data))
-      if (Array.isArray(results)) {
-        const lines = []
-        for (const r of results) {
-          if (!r || typeof r !== 'object') continue
-          const idx = r.index !== undefined ? Number(r.index) : 0
-          const score = r.relevance_score !== undefined ? r.relevance_score : r.score
-          let t = (r.document && r.document.text) || (documents && documents[idx]) || ''
-          if (typeof t === 'string' && t.length > 200) t = t.slice(0, 200) + '...'
-          lines.push('[' + (typeof score === 'number' ? score.toFixed(4) : String(score)) + '] ' + t)
-        }
-        if (lines.length > 0) return lines.join('\n')
-      }
-    } catch (e) { /* fall through */ }
-    return text
-  }
-
-  function fmtClassify(text, asJson) {
-    if (asJson) return text
-    try {
-      const data = JSON.parse(text)
-      const items = Array.isArray(data) ? data : (data && (data.data || data.results))
-      if (Array.isArray(items)) {
-        const lines = []
-        for (const item of items) {
-          if (!item || typeof item !== 'object') continue
-          const pred = item.prediction !== undefined ? item.prediction : (Array.isArray(item.predictions) && item.predictions[0] !== undefined ? item.predictions[0] : '')
-          const score = item.score !== undefined ? item.score : item.confidence
-          lines.push(String(pred) + (typeof score === 'number' ? ' (' + score.toFixed(4) + ')' : ''))
-        }
-        if (lines.length > 0) return lines.join('\n')
-      }
-    } catch (e) { /* fall through */ }
-    return text
-  }
-
-  /** The parsed `extract-pdf` payload, or undefined when the body is not JSON. */
-  function pdfPayload(text) {
-    try {
-      const data = JSON.parse(text)
-      return data !== null && typeof data === 'object' ? data : undefined
-    } catch (err) { return undefined }
-  }
-
-  /**
-   * The model-facing inventory of one `extract-pdf` payload.
-   *
-   * The API reports detected "floats" — LaTeX's word for figures/tables, i.e.
-   * the elements that float out of the text flow. Each one carries a cropped
-   * image plus `type`/`number`/`page`/`caption`; the caption is a placeholder
-   * ("Table (detected)"), so the inventory is orientation only and the real
-   * payload is the image.
-   */
-  function pdfEnvelope(data, attached) {
-    const meta = data && data.meta ? data.meta : {}
-    const floats = data && Array.isArray(data.floats) ? data.floats : []
-    const lines = [
-      'Pages: ' + (meta.num_pages !== undefined ? meta.num_pages : '?'),
-      'Extracted items: ' + (meta.num_floats !== undefined ? meta.num_floats : floats.length),
-    ]
-    floats.forEach((f, index) => {
-      if (!f || typeof f !== 'object') return
-      const parts = [f.type || 'unknown']
-      if (f.number) parts.push(String(f.number))
-      const size = f.width && f.height ? ', ' + f.width + 'x' + f.height + ' px' : ''
-      lines.push('  [' + parts.join(' ') + '] page ' + (f.page !== undefined ? f.page : '?') + size)
-      if (f.caption) lines.push('    ' + String(f.caption))
-      const attachedNow = attached.has(index)
-      if (typeof f.image === 'string' && f.image !== '' && !attachedNow) {
-        lines.push('    (image not attached — see the notes below)')
-      }
-    })
-    return lines.join('\n')
-  }
-
-  /** A stable, descriptive name for one extracted image attachment. */
-  function pdfImageName(float, index) {
-    const kind = typeof float.type === 'string' && float.type !== '' ? float.type : 'item'
-    const number = float.number !== undefined && float.number !== '' ? '-' + String(float.number) : '-' + (index + 1)
-    const page = float.page !== undefined ? '-page' + String(float.page) : ''
-    return 'jina-pdf-' + kind + number + page + '.png'
-  }
-
-  /**
-   * Whether the calling route declares image input.
-   *
-   * Mirrors the harness's own gate (`read_image` resolves the same route and
-   * requires `inputModalities` to include `image`). The three-way answer matters:
-   * only a *resolved* text-only route justifies skipping the attachments — an
-   * unresolvable route must still attach, because the harness projects images to
-   * a text placeholder on its own and throwing the crops away would lose them
-   * for every caller whose route we merely failed to read.
-   *
-   * @returns `'image'` when the route accepts images, `'text-only'` on positive
-   *   proof that it does not, `'unknown'` when it cannot be resolved.
-   */
-  async function routeImageCapability(exec) {
-    const llm = ctx.get('llm')
-    if (llm === undefined || llm === null || typeof llm.resolveModelInfo !== 'function') return 'unknown'
-    const session = exec && exec.agent ? exec.agent.session : undefined
-    const routed = session && typeof session.requestHeader === 'function' ? (session.requestHeader() || {}).config : undefined
-    const options = exec && exec.agent && exec.agent.options ? exec.agent.options : {}
-    const provider = (routed && routed.provider) || options.provider
-    const model = (routed && routed.model) || options.model
-    if (provider === undefined || model === undefined) return 'unknown'
-    try {
-      const info = await llm.resolveModelInfo(provider, model, exec.signal)
-      if (info === null || typeof info !== 'object' || !Array.isArray(info.inputModalities)) return 'unknown'
-      return info.inputModalities.indexOf('image') === -1 ? 'text-only' : 'image'
-    } catch (err) { return 'unknown' }
-  }
-
-  /**
-   * Turn the payload's base64 crops into image blocks the model can actually see.
-   *
-   * `extract-pdf` returns each detected figure/table/equation as a cropped PNG
-   * (base64) and nothing else — no markdown, no LaTeX, no real caption — so
-   * dropping the images would leave a useless inventory. They are handed to the
-   * attachment store and returned as image blocks, exactly the shape the
-   * built-in `read_image` uses. Every refusal (no store, wrong media type, an
-   * image over the deployment's limits, a text-only route) is reported in the
-   * notes rather than thrown: one oversized figure must not lose the whole
-   * extraction.
-   *
-   * @returns `{ blocks, notes, attached }` — image blocks, human-readable
-   *   refusals, and the indices of the floats that made it into `blocks`.
-   */
-  async function pdfImageBlocks(data, maxImages, exec) {
-    const store = ctx.get('attachments')
-    const floats = data && Array.isArray(data.floats) ? data.floats : []
-    const wanted = floats
-      .map((f, index) => ({ f, index }))
-      .filter(({ f }) => f && typeof f === 'object' && typeof f.image === 'string' && f.image !== '')
-    const blocks = []
-    const notes = []
-    const attached = new Set()
-    if (wanted.length === 0) return { blocks, notes, attached }
-    // Attaching crops the route cannot read only fills durable history with
-    // blocks the harness must replace by a placeholder on every later request.
-    if (await routeImageCapability(exec) === 'text-only') {
-      notes.push('this model declares text-only input, so the ' + wanted.length + ' extracted image(s) were not attached — switch to a vision-capable model to see them')
-      return { blocks, notes, attached }
-    }
-    if (store === undefined || store === null) {
-      notes.push('the deployment has no attachment store, so the ' + wanted.length + ' extracted image(s) could not be attached')
-      return { blocks, notes, attached }
-    }
-    const limits = store.imageLimits !== null && typeof store.imageLimits === 'object' ? store.imageLimits : {}
-    const mediaTypes = Array.isArray(limits.mediaTypes) ? limits.mediaTypes : ['image/png']
-    if (!mediaTypes.includes('image/png')) {
-      notes.push('this deployment does not accept image/png attachments, so the extracted images were skipped')
-      return { blocks, notes, attached }
-    }
-    const perMessage = Number.isFinite(limits.maxImagesPerMessage) ? limits.maxImagesPerMessage : wanted.length
-    const asked = Number(maxImages)
-    const cap = Math.max(1, Math.min(Number.isFinite(asked) && asked > 0 ? Math.floor(asked) : PDF_DEFAULT_IMAGES, perMessage))
-    for (const { f, index } of wanted) {
-      if (blocks.length >= cap) {
-        notes.push('only the first ' + cap + ' image(s) were attached; ' + (wanted.length - blocks.length) + ' more are in the payload (raise maxImages to attach more)')
-        break
-      }
-      let bytes
-      try { bytes = Buffer.from(String(f.image), 'base64') } catch (err) { bytes = undefined }
-      if (bytes === undefined || bytes.length === 0) {
-        notes.push('item ' + (index + 1) + ': the image data could not be decoded')
-        continue
-      }
-      try {
-        const ref = await store.saveImage({ data: new Uint8Array(bytes), mediaType: 'image/png', name: pdfImageName(f, index) })
-        blocks.push({
-          type: 'image',
-          attachment: {
-            attachmentId: ref.attachmentId,
-            mediaType: ref.mediaType,
-            bytes: ref.bytes,
-            width: ref.width,
-            height: ref.height,
-            ...(ref.name === undefined ? {} : { name: ref.name }),
-          },
-        })
-        attached.add(index)
-      } catch (err) {
-        notes.push('item ' + (index + 1) + ' (page ' + (f.page !== undefined ? f.page : '?') + '): ' + String((err && err.message) || err))
-      }
-    }
-    return { blocks, notes, attached }
-  }
-
-
   // ---- tool registration ---------------------------------------------------
   // IMPORTANT: `tools.register` forwards `parameters` verbatim to the model API.
   // It must therefore be a full JSON Schema object ({ type: 'object',
@@ -1051,20 +768,6 @@ export function apply(ctx, config) {
   const OUT = {
     schema: { type: 'string' },
     render(_args, value) { return [{ type: 'text', text: value }] },
-  }
-
-  /**
-   * `jina_pdf`'s output contract: a text envelope plus the extracted images.
-   *
-   * `extract-pdf` answers with each detected figure/table/equation as a cropped
-   * base64 PNG — the image *is* the payload, since `caption` is a placeholder
-   * and there is no markdown/LaTeX field at all. So the crops ride along as real
-   * image blocks (the same `{ type: 'image', attachment }` shape the built-in
-   * `read_image` returns) instead of being dropped on the floor.
-   */
-  const PDF_OUT = {
-    schema: { type: 'object' },
-    render(_args, value) { return value.blocks },
   }
 
   /** Read one key from arguments the model may have sent as anything at all. */
@@ -1108,26 +811,6 @@ export function apply(ctx, config) {
   }
 
   /**
-   * Reject a missing, empty or non-string required string-array argument.
-   * Same contract and same reasoning as {@link requireStringArg}.
-   * @param name - tool name, quoted into the message.
-   * @param args - raw model arguments.
-   * @param key - the required property name.
-   * @returns nothing when the value is a non-empty array of strings; otherwise throws.
-   */
-  function requireStringArrayArg(name, args, key) {
-    const value = argAt(args, key)
-    if (Array.isArray(value) && value.length > 0 && value.every((item) => typeof item === 'string')) return
-    const got = value === undefined
-      ? 'nothing'
-      : Array.isArray(value)
-        ? 'an array of ' + value.length + ' entries, not all strings'
-        : '(' + typeof value + ') ' + JSON.stringify(value)
-    throw new Error('invalid arguments: ' + name + ' requires a non-empty array of strings in "' + key + '", but got ' + got
-      + ' (arguments received: ' + argsReceived(args) + ')')
-  }
-
-  /**
    * Reject a missing or non-http(s) required URL argument.
    * Same contract and same reasoning as {@link requireStringArg}: a returned
    * string is a *successful* result the model may read as data, so an argument
@@ -1155,8 +838,12 @@ export function apply(ctx, config) {
     const signal = enterExec(exec)
     const body = { q: String(args.query) }
     const t = fixedType || args.type
-    if (t === 'arxiv') body.domain = 'arxiv'
-    else if (t === 'ssrn') body.domain = 'ssrn'
+    // The academic shortcuts used to ride `svip.jina.ai`'s `domain` field. The
+    // `s.jina.ai` endpoint (and its mainland mirror) ignores `domain` but
+    // honours `site` — verified against both hosts — so the restriction moved
+    // to the field that actually survives the route change.
+    if (t === 'arxiv') body.site = 'arxiv.org'
+    else if (t === 'ssrn') body.site = 'ssrn.com'
     else if (t === 'images') body.type = 'images'
     else if (t === 'blog') body.q = 'site:jina.ai/news ' + String(args.query)
     if (args.num !== undefined) body.num = args.num
@@ -1165,7 +852,7 @@ export function apply(ctx, config) {
     if (args.gl) body.gl = args.gl
     if (args.hl) body.hl = args.hl
     const res = await callJina({
-      url: SEARCH, method: 'POST',
+      kind: 'search', method: 'POST',
       headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
       body, timeoutMs: 60000, needsKey: true, apiKey: args.apiKey, signal,
     })
@@ -1266,8 +953,6 @@ export function apply(ctx, config) {
   const PDF_DEFAULT_PAGES = 5
   /** Hard ceiling on `maxPages`: one call must not be able to drain an account. */
   const PDF_MAX_PAGES = 50
-  /** Extracted images a bare `jina_pdf` call attaches to the result. */
-  const PDF_DEFAULT_IMAGES = 5
 
   /** Whether a URL looks like a PDF (path ends in `.pdf`, ignoring query/hash). */
   function isPdfUrl(value) {
@@ -1341,7 +1026,7 @@ export function apply(ctx, config) {
 
   ctx.tools.register({
     name: 'jina_read',
-    description: 'Read a web page as clean markdown via Jina Reader (r.jina.ai), mirroring the jina-cli \'read\' command. Uses the vendor\'s `agent` preset, resolves relative links against the post-redirect URL, and strips page chrome by default. Works without an API key (rate-limited). For a scanned / image-only PDF use jina_read_pdf; for a PDF with a text layer this tool is the cheaper and verbatim path.',
+    description: 'Read a web page as clean markdown via Jina Reader, mirroring the jina-cli \'read\' command. Uses the vendor\'s `agent` preset, resolves relative links against the post-redirect URL, and strips page chrome by default. Works without an API key (rate-limited). For a scanned / image-only PDF use jina_read_pdf; for a PDF with a text layer this tool is the cheaper and verbatim path.',
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -1396,7 +1081,7 @@ export function apply(ctx, config) {
       }
 
       const request = (headers) => callJina({
-        url: READER, method: 'POST', headers,
+        method: 'POST', headers,
         body: { url: String(args.url) }, timeoutMs: 120000,
         needsKey: useAltText, apiKey: args.apiKey, signal,
       })
@@ -1483,7 +1168,7 @@ export function apply(ctx, config) {
       let switchNote = ''
       for (const page of pages) {
         const res = await callJina({
-          url: READER, method: 'POST',
+          method: 'POST',
           headers: {
             Accept: 'application/json',
             'Content-Type': 'application/json',
@@ -1558,7 +1243,7 @@ export function apply(ctx, config) {
       requireUrlArg('jina_screenshot', args, 'url', ['uri', 'link', 'href'])
       const signal = enterExec(exec)
       const res = await callJina({
-        url: READER, method: 'POST',
+        method: 'POST',
         headers: { Accept: 'application/json', 'Content-Type': 'application/json', 'X-Return-Format': args.fullPage ? 'pageshot' : 'screenshot' },
         body: { url: String(args.url) }, timeoutMs: 120000, needsKey: true, apiKey: args.apiKey, signal,
       })
@@ -1569,7 +1254,7 @@ export function apply(ctx, config) {
 
   ctx.tools.register({
     name: 'jina_datetime',
-    description: 'Guess the publish/update datetime of a URL via Jina (r.jina.ai), mirroring the jina-cli \'datetime\' command. Works without an API key.',
+    description: 'Guess the publish/update datetime of a URL via Jina Reader, mirroring the jina-cli \'datetime\' command. Works without an API key.',
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -1584,178 +1269,12 @@ export function apply(ctx, config) {
       requireUrlArg('jina_datetime', args, 'url', ['uri', 'link', 'href'])
       const signal = enterExec(exec)
       const res = await callJina({
-        url: READER, method: 'POST',
+        method: 'POST',
         headers: { Accept: 'application/json', 'Content-Type': 'application/json', 'X-Return-Format': 'datetime' },
         body: { url: String(args.url) }, timeoutMs: 60000, needsKey: false, signal,
       })
       if (!res.ok) return failJina(res)
       return withKeyNote(fmtDatetime(res.text, args.json === true), res, args.json === true)
-    },
-  })
-
-  ctx.tools.register({
-    name: 'jina_expand',
-    description: 'Expand a search query into related queries via Jina, mirroring the jina-cli \'expand\' command.',
-    parameters: {
-      type: 'object',
-      additionalProperties: false,
-      properties: {
-        query: { type: 'string', description: 'The query to expand.' },
-        json: { type: 'boolean', description: 'Return the raw JSON response instead of formatted queries.' },
-        apiKey: { type: 'string', description: 'Optional Jina API key override.' },
-      },
-      required: ['query'],
-    },
-    output: OUT,
-    async execute(args, exec) {
-      requireStringArg('jina_expand', args, 'query', ['queries', 'q'])
-      const signal = enterExec(exec)
-      const res = await callJina({
-        url: SEARCH, method: 'POST',
-        headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
-        body: { q: String(args.query), query_expansion: true }, timeoutMs: 60000, needsKey: true, apiKey: args.apiKey, signal,
-      })
-      if (!res.ok) return failJina(res)
-      return withKeyNote(fmtExpand(res.text, args.json === true), res, args.json === true)
-    },
-  })
-
-  ctx.tools.register({
-    name: 'jina_embed',
-    description: 'Generate embeddings for texts via Jina Embeddings API, mirroring the jina-cli \'embed\' command. Default model: jina-embeddings-v5-text-small.',
-    parameters: {
-      type: 'object',
-      additionalProperties: false,
-      properties: {
-        texts: { type: 'array', items: { type: 'string' }, description: 'Texts to embed (up to a few hundred).' },
-        model: { type: 'string', description: 'Embedding model. Default: jina-embeddings-v5-text-small.' },
-        task: { type: 'string', description: 'Embedding task type. Default: text-matching.' },
-        dimensions: { type: 'number', description: 'Optional output dimensions (Matryoshka).' },
-        json: { type: 'boolean', description: 'Return the raw JSON response (full vectors) instead of a preview.' },
-        apiKey: { type: 'string', description: 'Optional Jina API key override.' },
-      },
-      required: ['texts'],
-    },
-    output: OUT,
-    async execute(args, exec) {
-      requireStringArrayArg('jina_embed', args, 'texts')
-      const signal = enterExec(exec)
-      const body = { model: args.model || 'jina-embeddings-v5-text-small', task: args.task || 'text-matching', input: args.texts }
-      if (args.dimensions !== undefined) body.dimensions = args.dimensions
-      const res = await callJina({
-        url: API + '/v1/embeddings', method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body, timeoutMs: 90000, needsKey: true, apiKey: args.apiKey, signal,
-      })
-      if (!res.ok) return failJina(res)
-      return withKeyNote(fmtEmbed(res.text, args.json === true), res, args.json === true)
-    },
-  })
-
-  ctx.tools.register({
-    name: 'jina_rerank',
-    description: 'Rerank documents by relevance to a query via Jina Reranker API, mirroring the jina-cli \'rerank\' command. Default model: jina-reranker-v3.5.',
-    parameters: {
-      type: 'object',
-      additionalProperties: false,
-      properties: {
-        query: { type: 'string', description: 'The reference query.' },
-        documents: { type: 'array', items: { type: 'string' }, description: 'Documents (strings) to rerank.' },
-        topN: { type: 'number', description: 'Maximum number of results to return.' },
-        model: { type: 'string', description: 'Reranker model. Default: jina-reranker-v3.5.' },
-        json: { type: 'boolean', description: 'Return the raw JSON response instead of formatted results.' },
-        apiKey: { type: 'string', description: 'Optional Jina API key override.' },
-      },
-      required: ['query', 'documents'],
-    },
-    output: OUT,
-    async execute(args, exec) {
-      requireStringArg('jina_rerank', args, 'query', ['queries', 'q'])
-      requireStringArrayArg('jina_rerank', args, 'documents')
-      const signal = enterExec(exec)
-      const body = { model: args.model || 'jina-reranker-v3.5', query: String(args.query), documents: args.documents }
-      if (args.topN !== undefined) body.top_n = args.topN
-      const res = await callJina({
-        url: API + '/v1/rerank', method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body, timeoutMs: 90000, needsKey: true, apiKey: args.apiKey, signal,
-      })
-      if (!res.ok) return failJina(res)
-      return withKeyNote(fmtRerank(res.text, args.documents, args.json === true), res, args.json === true)
-    },
-  })
-
-  ctx.tools.register({
-    name: 'jina_classify',
-    description: 'Classify texts into labels via Jina Classify API, mirroring the jina-cli \'classify\' command. Default model: jina-embeddings-v5-text-small.',
-    parameters: {
-      type: 'object',
-      additionalProperties: false,
-      properties: {
-        texts: { type: 'array', items: { type: 'string' }, description: 'Texts to classify.' },
-        labels: { type: 'array', items: { type: 'string' }, description: 'Candidate labels.' },
-        model: { type: 'string', description: 'Embedding model used for classification. Default: jina-embeddings-v5-text-small.' },
-        json: { type: 'boolean', description: 'Return the raw JSON response instead of formatted predictions.' },
-        apiKey: { type: 'string', description: 'Optional Jina API key override.' },
-      },
-      required: ['texts', 'labels'],
-    },
-    output: OUT,
-    async execute(args, exec) {
-      requireStringArrayArg('jina_classify', args, 'texts')
-      requireStringArrayArg('jina_classify', args, 'labels')
-      const signal = enterExec(exec)
-      const body = { model: args.model || 'jina-embeddings-v5-text-small', input: args.texts, labels: args.labels }
-      const res = await callJina({
-        url: API + '/v1/classify', method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body, timeoutMs: 90000, needsKey: true, apiKey: args.apiKey, signal,
-      })
-      if (!res.ok) return failJina(res)
-      return withKeyNote(fmtClassify(res.text, args.json === true), res, args.json === true)
-    },
-  })
-
-  ctx.tools.register({
-    name: 'jina_pdf',
-    description: 'Extract the figures, tables and equations of a PDF via Jina (extract-pdf), mirroring the jina-cli \'pdf\' command, and attach each extracted crop to the result as an image. This is a VISUAL extractor: it returns no text, no markdown and no LaTeX, and its caption is a placeholder — use jina_read_pdf when you need the document\'s words. Provide either url or arxivId.',
-    parameters: {
-      type: 'object',
-      additionalProperties: false,
-      properties: {
-        url: { type: 'string', description: 'PDF URL (https). Only allowlisted sources are accepted — most hosts answer HTTP 400 "not an allowed PDF source".' },
-        arxivId: { type: 'string', description: 'arXiv paper ID shorthand, e.g. 2301.12345. The reliable way to reach this endpoint.' },
-        extractType: { type: 'string', description: 'Filter by type: figure, table, equation (comma-separated).' },
-        maxEdge: { type: 'number', description: 'Max pixel size for extracted images. Default: 1024.' },
-        maxImages: { type: 'number', description: 'How many extracted crops to attach as images. Default: 5.' },
-        json: { type: 'boolean', description: 'Return the raw JSON response instead of the inventory (no image blocks).' },
-        apiKey: { type: 'string', description: 'Optional Jina API key override.' },
-      },
-    },
-    output: PDF_OUT,
-    async execute(args, exec) {
-      const signal = enterExec(exec)
-      const body = { max_edge: args.maxEdge !== undefined ? args.maxEdge : 1024 }
-      if (args.arxivId) body.id = String(args.arxivId)
-      else if (args.url) body.url = String(args.url)
-      else throw new Error('invalid arguments: jina_pdf requires either a "url" or an "arxivId" (arguments received: ' + argsReceived(args) + ')')
-      if (args.extractType) body.type = args.extractType
-      const res = await callJina({
-        url: SEARCH + 'extract-pdf', method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body, timeoutMs: 120000, needsKey: true, apiKey: args.apiKey, signal,
-      })
-      if (!res.ok) return failJina(res)
-      if (args.json === true) return { blocks: [{ type: 'text', text: withKeyNote(res.text, res, true) }] }
-      const data = pdfPayload(res.text)
-      if (data === undefined) return { blocks: [{ type: 'text', text: withKeyNote(res.text, res, false) }] }
-      const extracted = await pdfImageBlocks(data, args.maxImages, exec)
-      let text = pdfEnvelope(data, extracted.attached)
-      if (extracted.blocks.length > 0) {
-        text += '\n\n' + extracted.blocks.length + ' extracted image(s) are attached below — those crops are the figures/tables themselves.'
-      }
-      if (extracted.notes.length > 0) text += '\n\n[Notes]\n' + extracted.notes.map((note) => '- ' + note).join('\n')
-      return { blocks: [{ type: 'text', text: withKeyNote(text, res, false) }, ...extracted.blocks] }
     },
   })
 
@@ -1776,7 +1295,7 @@ export function apply(ctx, config) {
       // Best-effort parallel probes; one failing section must not fail the tool.
       const [jinaRes, ipRes] = await Promise.all([
         callJina({
-          url: READER, method: 'GET',
+          method: 'GET',
           headers: { Accept: 'application/json' },
           body: undefined, timeoutMs: 60000, needsKey: false, signal,
         }),
@@ -1795,7 +1314,7 @@ export function apply(ctx, config) {
   // ---- web settings health-check endpoint -----------------------------------
   // The Jina Tools card asks this route how many keys it holds and how many can
   // serve a call, plus the total credits behind them (jina-cli `primer`), and
-  // for the proxy actually in effect. Registered when the deployment composes a
+  // which endpoint side answered. Registered when the deployment composes a
   // web server (the web profile); profiles without one simply never get the
   // route. Nothing per key leaves the host: the payload carries counts and one
   // total, never a key, its fingerprint, or its individual balance — and a key
@@ -1813,7 +1332,7 @@ export function apply(ctx, config) {
   function probeKey(key, signal) {
     const headers = { Accept: 'application/json' }
     if (key !== undefined && key !== null && key !== '') headers.Authorization = 'Bearer ' + String(key)
-    return jinaRequest({ url: READER, method: 'GET', headers, body: undefined, timeoutMs: 30000, signal })
+    return jinaRequest({ method: 'GET', headers, body: undefined, timeoutMs: 30000, signal })
   }
 
   /**
@@ -1888,8 +1407,14 @@ export function apply(ctx, config) {
         // `balanceTotal` is null when no key reported a balance, so the page can
         // say "unknown" instead of "0".
         const extra = {
-          proxy: out.proxy || null,
-          proxyConfigured: settingProxy(),
+          // Which host pair answered, and what the card has configured. The card
+          // uses this to show the live route, so a user who pinned the wrong
+          // side sees it before the model reports a transport failure.
+          endpoint: {
+            mode: endpointMode(),
+            side: out.endpoint === undefined ? null : out.endpoint.side,
+            base: out.endpoint === undefined ? null : out.endpoint.base,
+          },
           settingsLive: settingsAreLive(settingsConfig),
           keyCount: counts.keyCount,
           balanceTotal: counts.balanceTotal,
@@ -1928,6 +1453,6 @@ export function apply(ctx, config) {
   // volatile references, so a save reaches the next operation without a restart.
   //
   // The stored document only ever holds what the user changed — defaults live in
-  // proxy.js (`toolSettingsOf`) so "unset" keeps meaning "default" and a later
+  // settings.js (`toolSettingsOf`) so "unset" keeps meaning "default" and a later
   // default change reaches users who never touched the field.
 }

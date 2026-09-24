@@ -5,10 +5,10 @@
  * scoping bug — exactly the class of defect that shipped in 0.7.0: the form was
  * hoisted out of the `JinaCard` component into a factory-scope `body()`, which
  * still read the component's own state (`input`, `onInput`, `configured`,
- * `proxyBlock`, …). Every reference resolved to nothing, the slot entry threw
+ * `endpointBlock`, …). Every reference resolved to nothing, the slot entry threw
  * `ReferenceError: input is not defined`, and the Plugins page replaced the
- * whole configuration section with an error boundary — the API key and local
- * proxy fields silently vanished from the UI.
+ * whole configuration section with an error boundary — the API key and endpoint
+ * fields silently vanished from the UI.
  *
  * This test materializes the bundle for real: it runs `ui/client.js` in a VM
  * with a minimal `window.__ModuleLoader__`, mounts the plugin against a fake
@@ -134,7 +134,32 @@ function renderView(entry, view) {
   return element.type(element.props)
 }
 
-test('client bundle: the page view renders the API key and local proxy fields', () => {
+/**
+ * The `<option>` props under a `<select>`'s props, flattened.
+ *
+ * `React.createElement('select', props, modes.map(...))` nests the array one
+ * level deep, so a direct `.children.some(...)` would miss every option.
+ */
+function optionsOf(selectProps) {
+  const out = []
+  const walk = (kids) => {
+    for (const kid of Array.isArray(kids) ? kids : [kids]) {
+      if (Array.isArray(kid)) { walk(kid); continue }
+      if (kid === null || kid === undefined || typeof kid !== 'object') continue
+      if (kid.type === 'option') out.push(kid.props)
+      else if (kid.props !== undefined) walk(kid.props.children)
+    }
+  }
+  walk(selectProps.children)
+  return out
+}
+
+/** The endpoint select's props: the one whose options name the mainland mirror. */
+function endpointSelect(selects) {
+  return selects.find(select => optionsOf(select).some(option => String(option.children).includes('r.jinaai.cn')))
+}
+
+test('client bundle: the page view renders the API key and endpoint controls', () => {
   const { registrations, elements } = mount()
   const entry = bundleEntry(registrations)
   assert.doesNotThrow(() => renderView(entry, 'page'),
@@ -143,8 +168,12 @@ test('client bundle: the page view renders the API key and local proxy fields', 
   const password = inputs.find(props => props.type === 'password')
   assert.ok(password !== undefined, 'the API key password field must render on the page view')
   assert.equal(password.placeholder, '粘贴 API key…')
-  assert.ok(inputs.some(props => props.placeholder === 'http://127.0.0.1:7897'),
-    'the manual local-proxy field must render on the page view')
+  const selects = elements.filter(node => node.type === 'select').map(node => node.props)
+  const endpoint = endpointSelect(selects)
+  assert.ok(endpoint !== undefined, 'the endpoint select must render on the page view')
+  assert.equal(endpoint.value, 'auto', 'the select must default to the automatic mode')
+  assert.equal(typeof endpoint.onChange, 'function', 'the select must carry a real handler')
+  assert.deepEqual(optionsOf(endpoint).map(option => option.value), ['auto', 'global', 'cn'])
 })
 
 test('client bundle: the page view renders the save controls bound to the component', () => {
@@ -153,7 +182,7 @@ test('client bundle: the page view renders the save controls bound to the compon
   const tree = renderView(entry, 'page')
   assert.equal(tree.type, 'div')
   const buttons = elements.filter(node => node.type === 'button').map(node => node.props)
-  assert.ok(buttons.some(props => (props.children ?? []).includes('保存')), 'the save control must render')
+  assert.ok(buttons.some(props => (props.children ?? []).includes('保存选项')), 'the options save control must render')
   assert.ok(buttons.every(props => typeof props.onClick === 'function'),
     'every rendered control must carry a real handler, not a missing binding')
 })
@@ -178,8 +207,9 @@ test('client bundle: the legacy settings card renders its collapsible body when 
   const inputs = elements.filter(node => node.type === 'input').map(node => node.props)
   assert.ok(inputs.some(props => props.type === 'password'),
     'the opened legacy card must render the API key field too')
-  assert.ok(inputs.some(props => props.placeholder === 'http://127.0.0.1:7897'),
-    'the opened legacy card must render the local-proxy field too')
+  const selects = elements.filter(node => node.type === 'select').map(node => node.props)
+  assert.ok(endpointSelect(selects) !== undefined,
+    'the opened legacy card must render the endpoint select too')
 })
 
 test('client bundle: the page view renders the reader option controls', () => {
@@ -196,9 +226,10 @@ test('client bundle: the page view renders the reader option controls', () => {
   assert.ok(inputs.some(props => props.placeholder === '排除选择器（留空使用内置列表）'),
     'the remove-selector override must render')
   const selects = elements.filter(node => node.type === 'select').map(node => node.props)
-  assert.equal(selects.length, 1, 'the image-policy select must render')
-  assert.equal(selects[0].value, 'all', 'the select must default to the API image policy')
-  assert.equal(selects[0].onChange !== undefined, true, 'the select must carry a handler')
+  assert.equal(selects.length, 2, 'the endpoint select and the image-policy select must render')
+  assert.equal(selects.every(props => props.onChange !== undefined), true, 'every select must carry a handler')
+  const imagePolicy = selects.find(props => props.value === 'all')
+  assert.ok(imagePolicy !== undefined, 'the image-policy select must default to the API image policy')
 })
 
 test('client bundle: the page view renders ONE key input and describes exactly the pool refs', () => {
@@ -263,7 +294,7 @@ test('client bundle: the health section shows counts and one total, nothing per 
     data: {
       ok: true, keyCount: 2, discardedCount: 1,
       authenticatedAs: 'acct-2', balanceLeft: 900, balanceTotal: 1100,
-      proxy: { url: null, source: 'none', rejected: [] },
+      endpoint: { mode: 'auto', side: 'cn', base: 'https://r.jinaai.cn/' },
     },
     error: undefined,
   }

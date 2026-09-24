@@ -43,11 +43,11 @@
 //
 // It also owns the plugin's `jina-tools` settings namespace through the
 // standard settings Remote namespace (`remote.settings`, mounted by the same
-// api-remotes client plugin): the `proxyUrl` field carries a manually
-// configured local proxy address. That is the entry point for a proxy client
-// which listens on a loopback port WITHOUT being the Windows system proxy —
-// WinINET discovery cannot see it, and neither can the harness environment, so
-// without this field every Jina call would go direct and fail. Reads ride
+// api-remotes client plugin): the `endpoint` field selects which Jina host pair
+// every call uses — `cn` for the vendor's official mainland mirrors
+// (`r.jinaai.cn` / `s.jinaai.cn`, served from a domestic CDN, same API and same
+// auth), `global` for `r.jina.ai` / `s.jina.ai`, and `auto` (the default) to
+// try whichever side answered last and fall back to the other. Reads ride
 // `settings.describe`, writes `settings.mutate` fenced by the namespace
 // revision the page read, and external edits (another tab, a hand-edited
 // settings.yaml) arrive as `settings/document-updated` and reload the card.
@@ -55,8 +55,8 @@
 // It also runs the key health check: a GET to the host-provided
 // `/api/dsh-jina/primer` route (registered by the bundle's host half when a
 // web server is composed), which answers with the key's Jina identity and
-// credit balance — the same data `jina_primer` reports — and with the proxy the
-// probe actually ran through. The key itself never leaves the host.
+// credit balance — the same data `jina_primer` reports — and with the endpoint
+// side that probe actually ran through. The key itself never leaves the host.
 window.__ModuleLoader__.load({
   id: 'dsh-jina',
   factory: function (require) {
@@ -72,9 +72,22 @@ window.__ModuleLoader__.load({
       'JINA_API_KEY_6', 'JINA_API_KEY_7', 'JINA_API_KEY_8', 'JINA_API_KEY_9', 'JINA_API_KEY_10',
     ]
     var NS = 'jina-tools'
-    var PROXY_FIELD = 'proxyUrl'
+    var ENDPOINT_FIELD = 'endpoint'
+    // Endpoint modes, in card order. The host owns the defaults
+    // (settings.js `toolSettingsOf`), so the card only ever writes deviations.
+    var ENDPOINT_MODES = ['auto', 'global', 'cn']
+    var ENDPOINT_LABELS = {
+      auto: '自动',
+      global: '国际（r.jina.ai / s.jina.ai）',
+      cn: '国内（r.jinaai.cn / s.jinaai.cn）',
+    }
+    // Host-reported endpoint side → the label the card shows for a probe.
+    var ENDPOINT_SIDES = {
+      global: '国际域名 r.jina.ai / s.jina.ai',
+      cn: '国内域名 r.jinaai.cn / s.jinaai.cn',
+    }
     // Reader-policy fields of the same `jina-tools` namespace. The host owns
-    // the defaults (proxy.js `toolSettingsOf`), so the card only ever writes
+    // the defaults (settings.js `toolSettingsOf`), so the card only ever writes
     // deviations: `set` for opt-in flags, `unset` to fall back to a default.
     var IMAGE_POLICY_FIELD = 'imagePolicy'
     var AUTO_ALT_FIELD = 'autoAltText'
@@ -82,22 +95,6 @@ window.__ModuleLoader__.load({
     var TARGET_SELECTOR_FIELD = 'targetSelector'
     var REMOVE_SELECTOR_FIELD = 'removeSelector'
     var IMAGE_POLICIES = ['all', 'alt', 'none']
-    // Host-reported proxy source → the label the card shows.
-    var PROXY_SOURCES = {
-      setting: '设置卡片',
-      envVar: '环境变量 JINA_PROXY_URL',
-      system: 'Windows 系统代理（自动发现）',
-      environment: '启动环境变量（HTTP_PROXY 等）',
-      request: '调用级指定',
-      none: '无（直连）',
-    }
-    // Host-reported rejection reason code → the label the card shows.
-    var PROXY_REJECTS = {
-      scheme: '只支持 http:// 或 https:// 代理',
-      invalid: '地址格式不正确',
-      empty: '地址为空',
-      type: '地址不是字符串',
-    }
 
     var S = {
       card: { boxSizing: 'border-box', background: 'var(--dsw-alias-bg-layer-2)', borderRadius: 16, boxShadow: 'var(--dsw-shadow-lv3)', overflow: 'hidden', margin: 0, listStyle: 'none' },
@@ -151,15 +148,14 @@ window.__ModuleLoader__.load({
       var [keyDraft, setKeyDraft] = React.useState('')
       var [keyStatus, setKeyStatus] = React.useState({ kind: 'info', message: '' })
       var [primer, setPrimer] = React.useState({ phase: 'loading', data: undefined, error: undefined })
-      // ---- manual local proxy ---------------------------------------------
-      // `proxyView` mirrors the host's `jina-tools` namespace: phase 'ready'
-      // carries the stored address, the revision the next write is fenced
+      // ---- endpoint mode (the `jina-tools` namespace) -----------------------
+      // `nsView` mirrors the host's `jina-tools` namespace: phase 'ready'
+      // carries the stored endpoint mode, the revision the next write is fenced
       // against, and whether the document accepts writes at all.
-      var [proxyView, setProxyView] = React.useState({ phase: 'loading', url: '', revision: undefined, writable: false, error: '', options: undefined })
-      var [proxyInput, setProxyInput] = React.useState('')
-      var [proxyStatus, setProxyStatus] = React.useState('')
-      var [proxyStatusKind, setProxyStatusKind] = React.useState('info')
-      var proxyDirty = React.useRef(false)
+      var [nsView, setNsView] = React.useState({ phase: 'loading', endpoint: 'auto', revision: undefined, writable: false, error: '', options: undefined })
+      var [endpointInput, setEndpointInput] = React.useState('auto')
+      var [endpointStatus, setEndpointStatus] = React.useState('')
+      var [endpointStatusKind, setEndpointStatusKind] = React.useState('info')
       // ---- reader options (same namespace, same revision-fenced write path) --
       // NOTE: every hook is declared before any early return below; the state
       // order is load-bearing for `test/client-render.test.js`, which renders
@@ -211,9 +207,9 @@ window.__ModuleLoader__.load({
       }
 
       /** Adopt one settings namespace view (describe row or mutate answer). */
-      var adoptProxy = function (row, writable) {
+      var adoptNs = function (row, writable) {
         var value = row && row.value && typeof row.value === 'object' ? row.value : {}
-        var url = typeof value[PROXY_FIELD] === 'string' ? value[PROXY_FIELD] : ''
+        var endpoint = ENDPOINT_MODES.indexOf(value[ENDPOINT_FIELD]) >= 0 ? value[ENDPOINT_FIELD] : 'auto'
         var options = {
           imagePolicy: IMAGE_POLICIES.indexOf(value[IMAGE_POLICY_FIELD]) >= 0 ? value[IMAGE_POLICY_FIELD] : 'all',
           autoAlt: value[AUTO_ALT_FIELD] === true,
@@ -221,17 +217,19 @@ window.__ModuleLoader__.load({
           targetSelector: typeof value[TARGET_SELECTOR_FIELD] === 'string' ? value[TARGET_SELECTOR_FIELD] : '',
           removeSelector: typeof value[REMOVE_SELECTOR_FIELD] === 'string' ? value[REMOVE_SELECTOR_FIELD] : '',
         }
-        setProxyView({
+        setNsView({
           phase: 'ready',
-          url: url,
+          endpoint: endpoint,
           revision: row ? row.revision : undefined,
           writable: writable === true,
           error: '',
           options: options,
         })
+        // The select always follows the stored value: a failed save reloads the
+        // document, so snapping back to what is actually stored is correct.
+        setEndpointInput(endpoint)
         // An unsaved edit is never clobbered by a refresh; a field the user
         // never touched follows the document (another tab, settings.yaml).
-        if (!proxyDirty.current) setProxyInput(url)
         if (!optsDirty.current) {
           setImagePolicyInput(options.imagePolicy)
           setAutoAltInput(options.autoAlt)
@@ -239,67 +237,66 @@ window.__ModuleLoader__.load({
           setTargetSelectorInput(options.targetSelector)
           setRemoveSelectorInput(options.removeSelector)
         }
-        return url
+        return endpoint
       }
 
-      var loadProxy = function () {
+      var loadNs = function () {
         var api = settingsApi()
         if (api === undefined || typeof api.describe !== 'function') {
-          setProxyView({ phase: 'unavailable', url: '', revision: undefined, writable: false, error: '当前环境未挂载 settings Remote，无法在此配置本地代理；可改用环境变量 JINA_PROXY_URL。' })
+          setNsView({ phase: 'unavailable', endpoint: 'auto', revision: undefined, writable: false, error: '当前环境未挂载 settings Remote，无法在此配置接口域名。' })
           return
         }
         api.describe().then(function (response) {
           if (!response || response.ok !== true) {
             var message = (response && response.error && response.error.message) || 'settings.describe 失败'
-            setProxyView({ phase: 'unavailable', url: '', revision: undefined, writable: false, error: message })
+            setNsView({ phase: 'unavailable', endpoint: 'auto', revision: undefined, writable: false, error: message })
             return
           }
           var doc = response.value || {}
           var rows = Array.isArray(doc.namespaces) ? doc.namespaces : []
           var row = rows.filter(function (entry) { return entry && entry.ns === NS })[0]
           if (row === undefined) {
-            setProxyView({ phase: 'unavailable', url: '', revision: undefined, writable: doc.writable === true, error: '主机未提供 ' + NS + ' 设置命名空间（当前 profile 可能没有 settings 提供方）。' })
+            setNsView({ phase: 'unavailable', endpoint: 'auto', revision: undefined, writable: doc.writable === true, error: '主机未提供 ' + NS + ' 设置命名空间（当前 profile 可能没有 settings 提供方）。' })
             return
           }
-          adoptProxy(row, doc.writable === true)
+          adoptNs(row, doc.writable === true)
         }, function (err) {
-          setProxyView({ phase: 'unavailable', url: '', revision: undefined, writable: false, error: String((err && err.message) || err) })
+          setNsView({ phase: 'unavailable', endpoint: 'auto', revision: undefined, writable: false, error: String((err && err.message) || err) })
         })
       }
 
       /**
        * Write operations into the namespace, fenced by the revision the card
-       * read. One writer serves both blocks (proxy + reader options) so the
+       * read. One writer serves both blocks (endpoint + reader options) so the
        * revision can never drift between them; `report` lets a block render its
        * own status line while sharing the same write.
        */
-      var writeProxy = function (ops, okMessage, report) {
-        var say = report || function (kind, message) { setProxyStatusKind(kind); setProxyStatus(message) }
+      var writeNs = function (ops, okMessage, report) {
+        var say = report || function (kind, message) { setEndpointStatusKind(kind); setEndpointStatus(message) }
         var api = settingsApi()
         if (api === undefined || typeof api.mutate !== 'function') {
           say('bad', '当前环境未挂载 settings Remote，无法保存。')
           return
         }
-        if (proxyView.phase !== 'ready') {
+        if (nsView.phase !== 'ready') {
           say('bad', '设置尚未加载完成，请稍后重试。')
           return
         }
-        if (!proxyView.writable) {
+        if (!nsView.writable) {
           say('bad', '当前环境只读（设置文档不可写），无法在此保存。')
           return
         }
         say('info', '保存中…')
-        api.mutate(NS, ops, proxyView.revision).then(function (response) {
+        api.mutate(NS, ops, nsView.revision).then(function (response) {
           if (response && response.ok === true) {
-            adoptProxy(response.value, proxyView.writable)
+            adoptNs(response.value, nsView.writable)
             say('ok', okMessage)
             loadPrimer()
           } else {
             var message = (response && response.error && response.error.message) || '未知错误'
             say('bad', '保存失败：' + message + '（已重新读取当前设置，请重试）')
-            proxyDirty.current = false
             optsDirty.current = false
-            loadProxy()
+            loadNs()
           }
         }, function () {
           say('bad', '保存失败，请重试。')
@@ -308,7 +305,7 @@ window.__ModuleLoader__.load({
 
       React.useEffect(function () {
         refresh()
-        loadProxy()
+        loadNs()
         loadPrimer()
         var disposers = [
           remote.$on('credentials/reference-updated', function (ref) {
@@ -322,7 +319,7 @@ window.__ModuleLoader__.load({
           remote.$on('settings/document-updated', function (ns) {
             // Our own write answers already carry the new view; this covers
             // edits from another tab or a hand-edited settings.yaml.
-            if (ns === undefined || ns === NS) loadProxy()
+            if (ns === undefined || ns === NS) loadNs()
           }),
         ]
         return function () {
@@ -399,82 +396,49 @@ window.__ModuleLoader__.load({
       // for "is anything configured at all", fall back to the slots.
       var poolCount = primer.data && typeof primer.data.keyCount === 'number' ? primer.data.keyCount : keyCount
       var keyStatusStyle = keyStatus.kind === 'ok' ? S.statusOk : (keyStatus.kind === 'bad' ? S.statusBad : S.status)
-      var proxyStatusStyle = proxyStatusKind === 'ok' ? S.statusOk : (proxyStatusKind === 'bad' ? S.statusBad : S.status)
+      var endpointStatusStyle = endpointStatusKind === 'ok' ? S.statusOk : (endpointStatusKind === 'bad' ? S.statusBad : S.status)
 
-      // ---- manual proxy block -----------------------------------------------
-      function onProxyInput(e) {
-        proxyDirty.current = true
-        setProxyInput(e.target.value)
+      // ---- endpoint block ----------------------------------------------------
+      // One select, saved on change: this is the switch that decides whether a
+      // call rides the vendor's mainland mirrors or Jina's global hosts.
+      function onEndpointChange(e) {
+        var value = e.target.value
+        setEndpointInput(value)
+        writeNs([{ op: value === 'auto' ? 'unset' : 'set', path: [ENDPOINT_FIELD], value: value }],
+          value === 'auto'
+            ? '已改为「自动」（默认），下一次调用立即生效。'
+            : '已固定为' + ENDPOINT_LABELS[value] + '，下一次调用立即生效。')
       }
 
-      function onProxySave() {
-        var value = proxyInput.trim()
-        if (value === '') {
-          setProxyStatusKind('bad')
-          setProxyStatus('请输入本地代理地址，例如 http://127.0.0.1:7897。')
-          return
-        }
-        var scheme = /^([a-z][a-z0-9+.-]*):\/\//i.exec(value)
-        if (scheme !== null && scheme[1].toLowerCase() !== 'http' && scheme[1].toLowerCase() !== 'https') {
-          setProxyStatusKind('bad')
-          setProxyStatus('只支持 http:// 或 https:// 代理（例如 http://127.0.0.1:7897）。socks:// 不会被网络 helper 使用。')
-          return
-        }
-        if (scheme === null && !/^[^\s/]+:\d+$/.test(value)) {
-          setProxyStatusKind('bad')
-          setProxyStatus('请填写「主机:端口」（例如 127.0.0.1:7897）或完整地址（例如 http://127.0.0.1:7897）。')
-          return
-        }
-        proxyDirty.current = false
-        writeProxy([{ op: 'set', path: [PROXY_FIELD], value: value }], '已保存，下一次调用立即生效。')
-      }
-
-      function onProxyClear() {
-        proxyDirty.current = false
-        writeProxy([{ op: 'unset', path: [PROXY_FIELD] }], '已清除，回到自动检测（系统代理 / 环境变量）。')
-      }
-
-      var proxyConfigured = proxyView.url !== ''
-      var proxyShown
-      if (proxyView.phase === 'loading') proxyShown = '正在读取设置…'
-      else if (proxyView.phase === 'unavailable') proxyShown = proxyView.error + ' 自动检测仍然生效：Windows 系统代理、启动环境变量（HTTP_PROXY / HTTPS_PROXY）。'
-      else if (proxyConfigured) proxyShown = '已保存：' + proxyView.url + '（下一次工具调用立即使用）。'
-      else proxyShown = '未配置：使用自动检测（Windows 系统代理 → 启动环境变量）。'
-      var proxyBlock = React.createElement('div', { style: S.infoBox },
-        React.createElement('div', { style: S.infoHead },
-          React.createElement('p', { style: S.infoLabel }, '本地代理（可选）'),
-          proxyConfigured && proxyView.phase === 'ready'
-            ? React.createElement('button', { type: 'button', style: S.smallButton, onClick: onProxyClear, disabled: !proxyView.writable }, '清除')
-            : null),
-        React.createElement('p', { style: S.note }, '代理软件只监听本地端口、没有开启系统代理时，自动检测找不到它——把它的地址填在这里即可（例如 http://127.0.0.1:7897）。支持 http:// 与 https://（可省略协议头）。'),
-        React.createElement('div', { style: S.row },
-          React.createElement('input', {
-            style: S.input,
-            type: 'text',
-            value: proxyInput,
-            placeholder: 'http://127.0.0.1:7897',
-            onChange: onProxyInput,
-            autoComplete: 'off',
-            spellCheck: false,
-            disabled: proxyView.phase !== 'ready' || !proxyView.writable,
-          }),
-          React.createElement('button', {
-            style: S.button,
-            onClick: onProxySave,
-            disabled: proxyView.phase !== 'ready' || !proxyView.writable,
-          }, '保存')),
-        proxyStatus !== '' ? React.createElement('p', { style: proxyStatusStyle }, proxyStatus) : null,
-        React.createElement('p', { style: S.note }, proxyShown),
-        proxyView.phase === 'ready' && !proxyView.writable
-          ? React.createElement('p', { style: S.note }, '当前环境只读（设置文档不可写），无法在此修改；可用环境变量 JINA_PROXY_URL 代替。')
+      var endpointShown
+      if (nsView.phase === 'loading') endpointShown = '正在读取设置…'
+      else if (nsView.phase === 'unavailable') endpointShown = nsView.error + ' 工具仍按「自动」工作：先用上次可用的域名，失败后自动改用另一个。'
+      else if (nsView.endpoint === 'auto') endpointShown = '当前：自动 —— 先用上次可用的域名，失败时自动改用另一个（每个进程的第一次调用可能多花几秒探测）。'
+      else endpointShown = '当前：' + ENDPOINT_LABELS[nsView.endpoint] + ' —— 只使用这一侧，不做自动切换。'
+      var endpointBlock = React.createElement('div', { style: S.infoBox },
+        React.createElement('p', { style: S.infoLabel }, '接口域名'),
+        React.createElement('p', { style: S.note }, 'Jina 的全球域名（r.jina.ai / s.jina.ai）在中国大陆被 DNS 污染、源站不可达；官方提供国内镜像 r.jinaai.cn / s.jinaai.cn（国内 CDN，同一套接口与认证），直连即可，不需要 VPN。国内域名请求会自动绕过继承来的代理设置。'),
+        React.createElement('select', {
+          style: S.select,
+          value: endpointInput,
+          onChange: onEndpointChange,
+          disabled: nsView.phase !== 'ready' || !nsView.writable,
+        },
+          ENDPOINT_MODES.map(function (mode) {
+            return React.createElement('option', { key: mode, value: mode }, ENDPOINT_LABELS[mode])
+          })),
+        endpointStatus !== '' ? React.createElement('p', { style: endpointStatusStyle }, endpointStatus) : null,
+        React.createElement('p', { style: S.note }, endpointShown),
+        nsView.phase === 'ready' && !nsView.writable
+          ? React.createElement('p', { style: S.note }, '当前环境只读（设置文档不可写），无法在此修改；可直接编辑 settings.yaml 里 jina-tools 的 endpoint 字段。')
           : null)
 
       // ---- reader options block ---------------------------------------------
       // The reader policy of the same namespace: the image policy, the alt-text
       // switch, and the selector group. All of it is written through the same
-      // revision-fenced `writeProxy`, so a save here cannot clobber a proxy
+      // revision-fenced `writeNs`, so a save here cannot clobber an endpoint
       // edit made in the other block.
-      var optsReady = proxyView.phase === 'ready' && proxyView.writable
+      var optsReady = nsView.phase === 'ready' && nsView.writable
       var optsStatusStyle = optsStatusKind === 'ok' ? S.statusOk : (optsStatusKind === 'bad' ? S.statusBad : S.status)
       var optsReport = function (kind, message) { setOptsStatusKind(kind); setOptsStatus(message) }
 
@@ -494,7 +458,7 @@ window.__ModuleLoader__.load({
 
       function onOptsSave() {
         // Only deviations are stored: `unset` is how a field returns to the
-        // host default (see proxy.js `toolSettingsOf`).
+        // host default (see settings.js `toolSettingsOf`).
         var ops = [
           { op: imagePolicyInput === 'all' ? 'unset' : 'set', path: [IMAGE_POLICY_FIELD], value: imagePolicyInput },
           { op: autoAltInput ? 'set' : 'unset', path: [AUTO_ALT_FIELD], value: true },
@@ -509,7 +473,7 @@ window.__ModuleLoader__.load({
           ? { op: 'unset', path: [REMOVE_SELECTOR_FIELD] }
           : { op: 'set', path: [REMOVE_SELECTOR_FIELD], value: remove })
         optsDirty.current = false
-        writeProxy(ops, '工具选项已保存，下一次调用立即生效。', optsReport)
+        writeNs(ops, '工具选项已保存，下一次调用立即生效。', optsReport)
       }
 
       var optionsBlock = React.createElement('div', { style: S.infoBox },
@@ -633,19 +597,18 @@ window.__ModuleLoader__.load({
           primerLines.push(React.createElement('p', { key: 'discarded', style: S.note }, '本次检测自动丢弃了 ' + d.discardedCount + ' 个已失效或额度耗尽的 key。'))
         }
       }
-      // The probe reports which proxy it actually used — the one fact that
-      // tells a working manual address apart from a lucky environment variable.
-      var probe = primer.data && primer.data.proxy ? primer.data.proxy : undefined
+      // The probe reports which endpoint side it actually used — the one fact
+      // that tells a pinned mode apart from a lucky automatic fallback.
+      var probe = primer.data && primer.data.endpoint ? primer.data.endpoint : undefined
       var probeLines = []
       if (probe !== undefined) {
-        var probeLabel = probe.url
-          ? probe.url + '（来源：' + String(PROXY_SOURCES[probe.source] || probe.source || '未知') + '）'
-          : '无（直连）'
-        probeLines.push(React.createElement('p', { key: 'proxy', style: S.mono }, '本次检测所用代理：' + probeLabel))
-      }
-      if (probe !== undefined && Array.isArray(probe.rejected) && probe.rejected.length > 0) {
-        var rejectReason = String(PROXY_REJECTS[probe.rejected[0].reason] || probe.rejected[0].reason)
-        probeLines.push(React.createElement('p', { key: 'rejected', style: S.statusBad }, '⚠️ 已保存的代理「' + probe.rejected[0].value + '」不可用（' + rejectReason + '），已回退到自动检测。'))
+        var probeLabel = probe.side
+          ? String(ENDPOINT_SIDES[probe.side] || probe.side) + (probe.base ? '（' + probe.base + '）' : '')
+          : '无（两侧都没有响应）'
+        probeLines.push(React.createElement('p', { key: 'endpoint', style: S.mono }, '本次检测所用接口域名：' + probeLabel))
+        if (probe.mode && probe.mode !== 'auto') {
+          probeLines.push(React.createElement('p', { key: 'mode', style: S.note }, '当前「接口域名」固定为' + String(ENDPOINT_LABELS[probe.mode] || probe.mode) + '。'))
+        }
       }
       var primerBlock = React.createElement('div', { style: S.infoBox },
         React.createElement('div', { style: S.infoHead },
@@ -664,12 +627,12 @@ window.__ModuleLoader__.load({
        *
        * Defined INSIDE the component on purpose: the form reads this
        * component's own state and handlers (`keyBlock`, `keyDraft`,
-       * `keyStatus`, `onAdd`, `keyCount`, `keysLoading`, `proxyBlock`,
+       * `keyStatus`, `onAdd`, `keyCount`, `keysLoading`, `endpointBlock`,
        * `optionsBlock`, `primerBlock`). Hoisting it to factory scope — as 0.7.0
        * did — leaves every one of those bindings unresolved: the slot entry
        * throws `ReferenceError: input is not defined`, the Plugins page swaps
        * the whole configuration section for an error boundary, and the API key
-       * plus local-proxy fields silently disappear from the UI.
+       * plus endpoint fields silently disappear from the UI.
        * `test/client-render.test.js` renders both views to keep it here.
        * @returns the form column.
        */
@@ -677,18 +640,18 @@ window.__ModuleLoader__.load({
         return React.createElement('div', { style: S.body },
             React.createElement('p', { style: S.note }, 'jina_web_search / jina_read 等工具会优先使用这里保存的 key，某个 key 失效或额度耗尽时自动丢弃并切换到下一个。免费 key 可在 ', React.createElement('a', { style: S.link, href: 'https://jina.ai/?sui=apikey', target: '_blank', rel: 'noreferrer' }, 'jina.ai'), ' 获取。'),
             keyBlock,
-            proxyBlock,
+            endpointBlock,
             optionsBlock,
             primerBlock,
             !keysLoading && keyCount > 0
               ? React.createElement('p', { style: S.note }, '提示：key 明文只在本机保存（dsh 凭据存储，如 ~/.dsh/.credentials.yaml），本页不会读回已保存的值；失效或额度耗尽的 key 由插件自动丢弃，不需要手动管理。')
               : null,
             React.createElement('p', { style: S.note }, 'key 解析顺序：1. 工具参数 apiKey（单个，不轮换）；2. 本页添加的 key（保存在 dsh 凭据存储里，按添加顺序轮换）；3. 会话工作区的 jina-api-key.txt（每行一个 key）；4. dsh 主目录下的 jina-api-key.txt。添加后立即生效。'),
-            React.createElement('p', { style: S.note }, '代理优先级：1. 本页「本地代理」保存的地址；2. 环境变量 JINA_PROXY_URL；3. Windows 系统代理（自动发现，端口变化会自愈）；4. 继承启动环境的 HTTP_PROXY / HTTPS_PROXY。只有 http(s) 代理可用于网络 helper。中国大陆网络环境下调用 Jina 需要代理；本地代理只监听端口、未开启系统代理时，请填上面的「本地代理」。'))
+            React.createElement('p', { style: S.note }, '接口域名策略：1.「国内」= r.jinaai.cn / s.jinaai.cn（Jina 官方国内镜像，国内 CDN 直连，不需要代理/VPN）；2.「国际」= r.jina.ai / s.jina.ai（全球域名，中国大陆需要自备代理）；3.「自动」（默认）= 先用上次可用的那一侧，失败后自动改用另一侧，每个进程最多多花一次探测时间。插件本身不再配置任何代理；国内域名的请求会通过 NO_PROXY 绕过继承来的代理设置。'))
       }
 
       var title = 'Jina Tools'
-      var description = 'Jina AI 搜索/阅读/嵌入等工具的多个 API key（自动轮换、失效自动丢弃）、本地代理与阅读选项。'
+      var description = 'Jina AI 搜索/阅读工具的多个 API key（自动轮换、失效自动丢弃）、接口域名（国内/国际/自动）与阅读选项。'
 
       // The Plugins page draws the card's title, icon, and crumb itself and
       // asks a configuration entry for one of two views: `summary` is the

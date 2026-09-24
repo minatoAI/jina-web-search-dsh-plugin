@@ -1,7 +1,7 @@
 {
   "name": "dsh-jina",
-  "version": "0.11.0",
-  "description": "Jina AI tools for DeepSeek Harness: search (incl. arxiv/ssrn academic domains), read (plain extraction, plus jina_read_pdf for jina-ocr-v1 document OCR), screenshot, embed, rerank, classify, pdf (figures/tables/equations attached as images), expand, datetime, primer — with a Plugins-page UI for several API keys (round-robin + automatic failover), a manually configurable local proxy, and reader options.",
+  "version": "0.12.0",
+  "description": "Jina AI tools for DeepSeek Harness: search (incl. arxiv/ssrn academic domains), read (plain extraction, plus jina_read_pdf for jina-ocr-v1 document OCR), screenshot, datetime, primer — with a Plugins-page UI for several API keys (round-robin + automatic failover), the endpoint host pair (mainland mirrors / global / auto) and reader options.",
   "type": "module",
   "main": "index.js",
   "exports": {
@@ -23,7 +23,7 @@
     "change-log.en.md",
     "LICENSE",
     "primer.js",
-    "proxy.js",
+    "settings.js",
     "keys.js",
     "tool-contracts.js"
   ],
@@ -45,8 +45,7 @@
     "jina",
     "jina-ai",
     "search",
-    "embedding",
-    "rerank",
+    "reader",
     "plugin"
   ],
   "scripts": {

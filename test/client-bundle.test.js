@@ -15,7 +15,7 @@
  *     (`dsh-jina`) — the surface current harnesses declare — and into the
  *     older `settings.plugin.item` slot, keyed by the settings namespace the
  *     host half serves (`jina-tools`), so one bundle configures on either.
- *   - the manual proxy field (`proxyUrl`) rides the standard `remote.settings`
+ *   - the endpoint field (`endpoint`) rides the standard `remote.settings`
  *     transport (`describe` / `mutate`), and external edits arrive through
  *     `settings/document-updated`.
  */
@@ -81,26 +81,36 @@ test('client bundle: the settings face is read defensively, never crashing a slo
   assert.match(SOURCE, /catch \(err\) \{\s*return undefined\s*\}/)
 })
 
-test('client bundle: the manual proxy rides the settings Remote namespace', () => {
-  assert.match(SOURCE, /PROXY_FIELD\s*=\s*'proxyUrl'/)
+test('client bundle: the endpoint mode rides the settings Remote namespace', () => {
+  assert.match(SOURCE, /ENDPOINT_FIELD\s*=\s*'endpoint'/)
   assert.match(SOURCE, /remote\.settings/)
   assert.match(SOURCE, /\.describe\(\)/)
   assert.match(SOURCE, /\.mutate\(/)
   assert.match(SOURCE, /settings\/document-updated/)
 })
 
-test('client bundle: proxy writes are fenced by the revision the card read', () => {
-  assert.match(SOURCE, /mutate\(NS,\s*ops,\s*proxyView\.revision\)/)
+test('client bundle: endpoint writes are fenced by the revision the card read', () => {
+  assert.match(SOURCE, /mutate\(NS,\s*ops,\s*nsView\.revision\)/)
 })
 
-test('client bundle: the card shows the proxy the probe actually used', () => {
-  assert.match(SOURCE, /JINA_PROXY_URL/)
-  assert.match(SOURCE, /本次检测所用代理/)
-  assert.match(SOURCE, /proxyConfigured/)
+test('client bundle: the card shows the endpoint side the probe actually used', () => {
+  assert.match(SOURCE, /本次检测所用接口域名/)
+  assert.match(SOURCE, /ENDPOINT_SIDES/)
+  assert.match(SOURCE, /primer\.data\.endpoint/)
 })
 
-test('client bundle: a non-http(s) address is refused before it can be saved', () => {
-  assert.match(SOURCE, /只支持 http:\/\/ 或 https:\/\/ 代理/)
+test('client bundle: the card offers exactly the three endpoint modes', () => {
+  // A missing option would make a mode unreachable from the UI; an extra one
+  // would be a value the host rejects.
+  const modes = /var ENDPOINT_MODES = \[([^\]]*)\]/.exec(SOURCE)
+  assert.ok(modes, 'the bundle must declare the endpoint modes')
+  const names = modes[1].split(',').map((part) => part.trim().replace(/^'|'$/g, '')).filter((part) => part !== '')
+  assert.deepEqual(names, ['auto', 'global', 'cn'])
+  assert.match(SOURCE, /r\.jinaai\.cn/)
+  assert.match(SOURCE, /s\.jinaai\.cn/)
+  // The proxy machinery is gone: no proxy field, no proxy copy.
+  assert.equal(/proxyUrl/.test(SOURCE), false, 'the retired proxy field must not be written any more')
+  assert.equal(/JINA_PROXY_URL/.test(SOURCE), false, 'the retired proxy env var must not be referenced')
 })
 
 test('client bundle: the reader options ride the same namespace and write path', () => {
@@ -115,7 +125,7 @@ test('client bundle: the reader options ride the same namespace and write path',
   // One writer, revision-fenced: the options must not grow a second mutate path.
   const mutations = SOURCE.match(/\.mutate\(/g) || []
   assert.equal(mutations.length, 1, 'exactly one settings write path')
-  assert.match(SOURCE, /mutate\(NS,\s*ops,\s*proxyView\.revision\)/)
+  assert.match(SOURCE, /mutate\(NS,\s*ops,\s*nsView\.revision\)/)
 })
 
 test('client bundle: the key pool is the same reference list the host resolves', () => {

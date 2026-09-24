@@ -320,17 +320,21 @@ test('an upstream 5xx is returned as-is without rotating', async () => {
   assert.equal(host.requests.length, 1)
 })
 
-test('a transport failure is retried on the same key, not rotated', async () => {
+test('a transport failure moves to the other endpoint side, not another key', async () => {
   const host = mount({
     keys: { JINA_API_KEY: 'k1', JINA_API_KEY_2: 'k2' },
-    reply: envelope(0, 'fetch failed (proxy unreachable)'),
+    reply: envelope(0, 'fetch failed'),
   })
   const out = await callTool(host, 'jina_web_search', { query: 'q' })
-  // jinaRequest retries a transport failure once; both attempts use the key the
-  // walk chose, because status 0 says nothing about the key.
+  // `auto` (the default) tries Jina's global host first, then the vendor's
+  // mainland mirror; both attempts use the key the walk chose, because status 0
+  // says nothing about the key. A transport failure is a routing fact, so it
+  // never rotates the pool and never repeats the same host.
   assert.equal(host.requests.length, 2)
   assert.deepEqual(host.requests.map(keyOf), ['k1', 'k1'])
-  assert.match(out, /No response from the Jina API/)
+  assert.deepEqual(host.requests.map((r) => r.url), ['https://s.jina.ai/', 'https://s.jinaai.cn/'])
+  assert.match(out, /No response from any Jina endpoint/)
+  assert.match(out, /已尝试的接口域名：https:\/\/s\.jina\.ai\/、https:\/\/s\.jinaai\.cn\//)
   assert.doesNotMatch(out, /已自动切换/)
 })
 

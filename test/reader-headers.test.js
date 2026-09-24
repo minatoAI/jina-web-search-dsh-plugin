@@ -26,7 +26,7 @@ import {
   DEFAULT_IMAGE_POLICY, DEFAULT_REMOVE_SELECTORS, DEFAULT_TARGET_SELECTORS,
   READER_BASE, READER_PRESET, READER_TIMEOUT_SECONDS,
   settingsAreLive, settingsSnapshot, toolSettingsOf,
-} from '../proxy.js'
+} from '../settings.js'
 
 /**
  * Resolve one raw stored settings section the way the Loader does before
@@ -85,7 +85,7 @@ function createHost(options = {}) {
         const stdin = spec.stdio && spec.stdio.stdin && typeof spec.stdio.stdin === 'object'
           ? spec.stdio.stdin.data
           : undefined
-        if (spec.argv[1] !== '-e') return fakeHandle('') // WinINET discovery probe
+        if (spec.argv[1] !== '-e') return fakeHandle('') // any non-helper spawn
         requests.push(JSON.parse(stdin))
         return fakeHandle(queue.length > 1 ? queue.shift() : queue[0])
       },
@@ -108,50 +108,6 @@ function callPdf(host, args) {
   assert.ok(tool !== undefined, 'jina_read_pdf must be registered')
   return tool.execute(args, { agent: { session: { header: { cwd: 'C:\\ws' } } } })
 }
-
-/** Invoke `jina_pdf` the way the tool seam does. */
-function callJinaPdf(host, args, agent) {
-  const tool = host.tools.get('jina_pdf')
-  assert.ok(tool !== undefined, 'jina_pdf must be registered')
-  return tool.execute(args, { agent: agent || { session: { header: { cwd: 'C:\\ws' } } } })
-}
-
-/** One `extract-pdf` envelope, as the network helper hands it back. */
-function pdfBody(floats, meta = {}) {
-  return JSON.stringify({
-    ok: true,
-    status: 200,
-    text: JSON.stringify({ floats, meta: { num_pages: 2, num_floats: floats.length, ...meta } }),
-  })
-}
-
-/** A recording stand-in for the harness attachment store. */
-function fakeAttachments(options = {}) {
-  const saved = []
-  return {
-    saved,
-    imageLimits: {
-      mediaTypes: ['image/png'],
-      maxImageBytes: 10 * 1024 * 1024,
-      maxImagesPerMessage: 20,
-      ...(options.limits || {}),
-    },
-    async saveImage(input) {
-      if (options.fail !== undefined) throw new Error(options.fail)
-      saved.push(input)
-      return {
-        attachmentId: 'att-' + saved.length,
-        mediaType: input.mediaType,
-        bytes: input.data.length,
-        width: 923,
-        height: 842,
-        name: input.name,
-      }
-    },
-  }
-}
-
-const PNG_B64 = Buffer.from('not-really-a-png').toString('base64')
 
 /** Mount the plugin and return the host plus its first request's headers. */
 async function headersFor(args, setting) {
@@ -348,106 +304,13 @@ test('jina_read_pdf: the default range is the first five pages', async () => {
   assert.match(text, /jina_read_pdf: 1 page/)
 })
 
-test('jina_pdf: the extracted crops are attached as image blocks', async () => {
-  // The API returns each detected float as a cropped base64 PNG and nothing
-  // else — no markdown, no LaTeX, a placeholder caption — so dropping the
-  // images would leave a useless inventory.
-  const attachments = fakeAttachments()
-  const host = createHost({
-    attachments,
-    responses: [pdfBody([
-      { type: 'table', number: '1', caption: 'Table (detected)', page: 4, image: PNG_B64, width: 923, height: 842 },
-      { type: 'figure', number: '2', caption: 'Figure (detected)', page: 5, image: PNG_B64, width: 100, height: 200 },
-    ])],
-  })
-  apply(host.ctx, resolveSettings(host.settingsValue))
-  const value = await callJinaPdf(host, { arxivId: '2601.21337', apiKey: 'k' })
-
-  assert.equal(attachments.saved.length, 2, 'every crop must reach the attachment store')
-  assert.equal(attachments.saved[0].mediaType, 'image/png')
-  assert.equal(attachments.saved[0].name, 'jina-pdf-table-1-page4.png')
-  assert.ok(attachments.saved[0].data.length > 0, 'the base64 must be decoded to bytes')
-
-  const images = value.blocks.filter((block) => block.type === 'image')
-  assert.equal(images.length, 2, 'one image block per attached crop')
-  assert.equal(images[0].attachment.attachmentId, 'att-1')
-  assert.equal(images[1].attachment.width, 923)
-  assert.match(value.blocks[0].text, /Extracted items: 2/)
-  assert.match(value.blocks[0].text, /\[table 1\] page 4, 923x842 px/)
-  assert.match(value.blocks[0].text, /2 extracted image\(s\) are attached below/)
-})
-
-test('jina_pdf: without an attachment store the inventory still comes back, with a note', async () => {
-  const host = createHost({ responses: [pdfBody([{ type: 'table', number: '1', page: 4, image: PNG_B64 }])] })
-  apply(host.ctx, resolveSettings(host.settingsValue))
-  const value = await callJinaPdf(host, { arxivId: '1', apiKey: 'k' })
-  assert.equal(value.blocks.filter((block) => block.type === 'image').length, 0)
-  assert.match(value.blocks[0].text, /Extracted items: 1/)
-  assert.match(value.blocks[0].text, /no attachment store/)
-})
-
-test('jina_pdf: maxImages caps the attachments and says what was left out', async () => {
-  const attachments = fakeAttachments()
-  const floats = Array.from({ length: 4 }, (_, i) => ({ type: 'table', number: String(i + 1), page: i + 1, image: PNG_B64 }))
-  const host = createHost({ attachments, responses: [pdfBody(floats)] })
-  apply(host.ctx, resolveSettings(host.settingsValue))
-  const value = await callJinaPdf(host, { arxivId: '1', maxImages: 2, apiKey: 'k' })
-  assert.equal(value.blocks.filter((block) => block.type === 'image').length, 2)
-  assert.match(value.blocks[0].text, /only the first 2 image\(s\) were attached/)
-})
-
-test('jina_pdf: an image the store refuses is reported, never thrown', async () => {
-  const attachments = fakeAttachments({ fail: 'the image exceeds the deployment limits' })
-  const host = createHost({ attachments, responses: [pdfBody([{ type: 'table', number: '1', page: 1, image: PNG_B64 }])] })
-  apply(host.ctx, resolveSettings(host.settingsValue))
-  const value = await callJinaPdf(host, { arxivId: '1', apiKey: 'k' })
-  assert.equal(value.blocks.filter((block) => block.type === 'image').length, 0)
-  assert.match(value.blocks[0].text, /Extracted items: 1/, 'one oversized figure must not lose the extraction')
-  assert.match(value.blocks[0].text, /exceeds the deployment limits/)
-})
-
-test('jina_pdf: a text-only route is told why the crops were not attached', async () => {
-  // The harness replaces an image block with "[image omitted because this model
-  // accepts text only; …]" before dispatching, so attaching crops that a
-  // text-only route cannot read only fills durable history with placeholders.
-  const attachments = fakeAttachments()
-  const host = createHost({
-    attachments,
-    llm: { async resolveModelInfo() { return { inputModalities: ['text'] } } },
-    responses: [pdfBody([{ type: 'table', number: '1', page: 4, image: PNG_B64 }])],
-  })
-  apply(host.ctx, resolveSettings(host.settingsValue))
-  const value = await callJinaPdf(host, { arxivId: '1', apiKey: 'k' }, {
-    session: { header: { cwd: 'C:\\ws' } }, options: { provider: 'p', model: 'm' },
-  })
-  assert.equal(attachments.saved.length, 0, 'nothing must be stored for a route that cannot read it')
-  assert.equal(value.blocks.filter((block) => block.type === 'image').length, 0)
-  assert.match(value.blocks[0].text, /declares text-only input/)
-  assert.match(value.blocks[0].text, /Extracted items: 1/, 'the inventory is still useful')
-})
-
-test('jina_pdf: an unresolvable route still attaches the crops', async () => {
-  const attachments = fakeAttachments()
-  const host = createHost({
-    attachments,
-    llm: { async resolveModelInfo() { throw new Error('no such route') } },
-    responses: [pdfBody([{ type: 'table', number: '1', page: 4, image: PNG_B64 }])],
-  })
-  apply(host.ctx, resolveSettings(host.settingsValue))
-  const value = await callJinaPdf(host, { arxivId: '1', apiKey: 'k' }, {
-    session: { header: { cwd: 'C:\\ws' } }, options: { provider: 'p', model: 'm' },
-  })
-  assert.equal(value.blocks.filter((block) => block.type === 'image').length, 1,
-    'the harness projects images itself, so an unread route must never lose them')
-})
-
 test('settings schema: every reader field is declared as a live (volatile) field', () => {
   // The entry id `jina-tools` *is* the settings namespace; this export is what
   // the settings provider serves. A field is editable without a restart only
   // when its node carries `meta.volatile` — the provider derives the form from
   // exactly that flag, and `write()` rejects any path that lacks it.
   const fields = [
-    'proxyUrl', 'imagePolicy', 'autoAltText', 'useSelectors',
+    'endpoint', 'imagePolicy', 'autoAltText', 'useSelectors',
     'targetSelector', 'removeSelector', 'waitForSelector',
   ]
   const dict = Config.toJSON().dict
@@ -459,21 +322,21 @@ test('settings schema: every reader field is declared as a live (volatile) field
     assert.equal(typeof dict[field].meta, 'object', field + ' needs `meta` for schemastery rehydration')
     assert.equal(dict[field].type, Config.dict[field].type)
   }
-  assert.equal(dict.proxyUrl.type, 'string')
+  assert.equal(dict.endpoint.type, 'string')
   assert.equal(dict.imagePolicy.type, 'string')
   // A fresh envelope per call: `plainSchema()` walks the result and deletes
   // `meta.volatile`, so a shared dict would silently disable live editing for
   // every later save.
-  assert.notEqual(Config.toJSON().dict.proxyUrl, Config.toJSON().dict.proxyUrl)
-  assert.equal(Config.toJSON().dict.proxyUrl.meta.volatile, true)
+  assert.notEqual(Config.toJSON().dict.endpoint, Config.toJSON().dict.endpoint)
+  assert.equal(Config.toJSON().dict.endpoint.meta.volatile, true)
 })
 
 test('settings schema: resolve() hands back the volatile refs the harness writes into', () => {
-  const resolved = resolveSettings({ proxyUrl: 'http://127.0.0.1:7897', useSelectors: false })
+  const resolved = resolveSettings({ endpoint: 'cn', useSelectors: false })
   assert.equal(settingsAreLive(resolved), true)
   // `settingsSnapshot` reads through the refs, so a write by the settings
   // provider is visible to the very next operation — no restart.
-  assert.equal(settingsSnapshot(resolved).proxyUrl, 'http://127.0.0.1:7897')
+  assert.equal(settingsSnapshot(resolved).endpoint, 'cn')
   assert.equal(settingsSnapshot(resolved).useSelectors, false)
   const write = Symbol.for('cosmokit.volatile.write')
   resolved.useSelectors[write](true)
@@ -481,8 +344,8 @@ test('settings schema: resolve() hands back the volatile refs the harness writes
   // A malformed / absent stored section must not throw: the entry may start
   // with no config at all.
   assert.equal(settingsAreLive(resolveSettings(undefined)), true)
-  assert.equal(settingsSnapshot(resolveSettings('nonsense')).proxyUrl, undefined)
-  assert.equal(settingsSnapshot(undefined).proxyUrl, undefined)
+  assert.equal(settingsSnapshot(resolveSettings('nonsense')).endpoint, undefined)
+  assert.equal(settingsSnapshot(undefined).endpoint, undefined)
   assert.equal(settingsAreLive(undefined), false)
 })
 
@@ -494,12 +357,12 @@ test('settings schema: unset fields mean "default", and toolSettingsOf owns the 
   assert.equal(defaults.imagePolicy, 'all')
   assert.equal(defaults.autoAltText, false)
   assert.equal(defaults.useSelectors, true, 'the selector group is on unless it is explicitly turned off')
-  assert.equal(defaults.proxyUrl, '')
+  assert.equal(defaults.endpoint, 'auto')
 })
 
 test('toolSettingsOf: an absent or malformed section resolves to the documented defaults', () => {
   assert.deepEqual(toolSettingsOf(undefined), {
-    proxyUrl: '',
+    endpoint: 'auto',
     imagePolicy: 'all',
     autoAltText: false,
     useSelectors: true,
@@ -512,4 +375,10 @@ test('toolSettingsOf: an absent or malformed section resolves to the documented 
   assert.equal(toolSettingsOf({ imagePolicy: 'alt' }).imagePolicy, 'alt')
   assert.equal(toolSettingsOf({ useSelectors: false }).useSelectors, false)
   assert.equal(toolSettingsOf({ targetSelector: '  article  ' }).targetSelector, 'article')
+  // The endpoint mode is validated, not trusted: a hand-edited value that is
+  // not one of the three modes falls back to `auto`.
+  assert.equal(toolSettingsOf({ endpoint: 'cn' }).endpoint, 'cn')
+  assert.equal(toolSettingsOf({ endpoint: 'global' }).endpoint, 'global')
+  assert.equal(toolSettingsOf({ endpoint: 'bogus' }).endpoint, 'auto')
+  assert.equal(toolSettingsOf({ endpoint: 42 }).endpoint, 'auto')
 })

@@ -2,40 +2,36 @@
 
 # dsh-jina
 
-DeepSeek Harness 的 [Jina AI](https://jina.ai/) 插件（bundle）：把 jina-cli 的全部 API 能力以模型工具的形式装进 dsh，并在 Web 的 **Plugins** 侧边栏页（`dsh-jina` bundle 卡片）提供配置表单来设置**多个 API key（额度耗尽自动切换）**与**本地代理地址**；旧版 harness 上则回落到 **设置 → 插件 → 配置** 的同名卡片。
+DeepSeek Harness 的 [Jina AI](https://jina.ai/) 插件（bundle）：把 Jina Reader / Search 的 API 能力以模型工具的形式装进 dsh，并在 Web 的 **Plugins** 侧边栏页（`dsh-jina` bundle 卡片）提供配置表单来设置**多个 API key（额度耗尽自动切换）**与**接口域名（国内镜像 / 国际 / 自动）**；旧版 harness 上则回落到 **设置 → 插件 → 配置** 的同名卡片。
+
+> **不需要代理。** Jina 的全球域名（`r.jina.ai` / `s.jina.ai`）在中国大陆被 DNS 污染、源站不可达，插件默认走 Jina 官方提供的国内镜像 `r.jinaai.cn` / `s.jinaai.cn`（国内 CDN，同一套接口与认证），直连即可。插件本身**不再配置任何代理**。
 
 ## 更新日志
 
 > 此处仅展示最新版本，完整版本历史见 [change-log.md](./change-log.md)。
 
-### 0.11.0（2026-09-24）
+### 0.12.0（2026-09-24）
 
-- **feat** **`jina_pdf` 现在把提取到的图表当作图片返回**。实测原始负载：`extract-pdf` 对每个检出的"浮动对象"（LaTeX 术语 floats = 图/表/公式）只返回 `type / number / page / caption / image(base64 PNG) / width / height`——**没有任何文本字段**，caption 还是固定占位符 `"Table (detected)"`。**图片就是它的全部产出**，而旧版只打印清单、把 1.2MB 图片全丢了，工具等于废的。现在：base64 → `Uint8Array` → `ctx.attachments.saveImage()` → 以 `{ type: 'image', attachment }` 内容块返回（与内置 `read_image` 同一契约），**模型可以直接看图**。`maxImages` 控制附上几张（默认 5）；任何一张被存储拒绝都只记进 `[Notes]`，不会丢掉整次提取。**真机验证**：arXiv `2601.21337` 提取 11 张表，前 2 张解码后前 8 字节是 `137,80,78,71,13,10,26,10`（PNG 魔数）。
-- **change** **删除 ReaderLM-v2 功能**（卡片选项 `useReaderLm`、`readerlm` 参数及相关代码/测试/文档）。实测结论：① 普通页面上与普通抽取**打平**，没有优势证据；② **不能带选择器组**（一带就 422），只能拿整页、噪声全带上；③ 官方定位是"已拿到 HTML → 转 markdown/JSON"，而唯一不可替代的 HTML→JSON 用不上；④ 在官方宣称最强的**长公式页**上反而失败——输出里是**原始 HTML**（疑似回显输入），冲破 1.5MB 传输上限。附带发现官方文档一处已过期：模型卡写的 `x-engine: readerlm-v2` **实测不生效**，只有 `X-Respond-With` 才真走模型。
-- **fix** **传输上限截断不再被误报**：响应超过 1.5MB 时直接报"超过传输上限并已截断"并给出 spill 路径；旧版会把它报成 `helper output not parseable` 外加一段乱码。
-- **change** **`jina_pdf` 会先问当前模型能不能看图**：插件按 harness 自己的门（与内置 `read_image` 同一条路线解析 + `inputModalities`）判断——**确定**是纯文本模型时就不附图片，并把原因写进 `[Notes]`（否则只是往历史里塞一堆每轮请求都会被替换成占位符的块）；路线**解析不出来**时仍然附上，因为 harness 自己会把图片投影成 `[image omitted because this model accepts text only; …]`，插件不该替它丢掉。
-- **test** 全套 **171 例：170 通过 / 1 例按需跳过 / 0 失败**；新增 `jina_pdf` 六例（图片块/附件名/字节、无 attachments 服务的降级、`maxImages` 上限、单张被拒不影响整次提取、纯文本路线不附图片、路线解析失败仍附图片）。
-
-### 0.10.0（2026-09-24）
+- **feat** **新增「接口域名」开关（国内 / 国际 / 自动），插件从此不需要代理**。`jina-tools` 命名空间新增 `endpoint` 字段，卡片上是一个三选一的下拉：`cn` = Jina 官方国内镜像 `r.jinaai.cn` / `s.jinaai.cn`；`global` = `r.jina.ai` / `s.jina.ai`；`auto`（默认）= **先用上次可用的那一侧，失败后自动改用另一侧**，进程内记住胜者。实测依据：国内镜像解析到 182.140.172.x / 220.167.110.x（`Server: ESA`，阿里云边缘），**不走任何代理**直连 200，返回内容与经代理访问 `r.jina.ai` **逐字节一致**（7521 字符、同一标题），稳定后 1.1–1.2s；`api.jina.ai` 的国内域名不存在（`api.jinaai.cn` → HTTP 525），且按 SNI 阻断，所以它随本次改动一起被移除（见下一条）。
+- **change** **移除 5 个工具**：`jina_embed` / `jina_rerank` / `jina_classify`（`api.jina.ai`，无国内域名）、`jina_expand`（`s.jina.ai` 不支持 `query_expansion`）、`jina_pdf`（`extract-pdf` 只在 `svip.jina.ai` 上存在，无国内镜像）。依据是真实使用量：近 21 天 557 个会话日志里，这 5 个工具合计只有 21 条调用记录（约 10 次调用），而 `jina_read` 2570 条、`jina_web_search` 1620 条。这些能力将迁到独立仓库维护。
+- **change** **删除整套代理机制**：`proxy.js`（代理地址规范化 / 优先级 / WinINET 自动发现）被 `settings.js`（设置与端点策略）取代，卡片上的「本地代理」输入框、`JINA_PROXY_URL` 环境变量、错误信息里的代理提示、`/api/dsh-jina/primer` 的 `proxy` 字段全部移除。国内域名的请求会通过 `NO_PROXY` **追加** `jinaai.cn`（不覆盖继承来的列表），确保即使启动环境里带着 `HTTP_PROXY` 也不会把国内 CDN 地址塞进 VPN。
+- **change** **搜索端点从 `svip.jina.ai` 迁到 `s.jina.ai`**（国内镜像 `s.jinaai.cn`）：这是官方文档化的端点，两侧返回同一形状 `{ code, status, data: [{ title, url, description, date }] }`，因此一个格式化函数覆盖两条路由（`fmtSearch` 已适配，同时仍容忍旧的 `{ results: [...] }` 形状）。`domain` 字段在 `s.jina.ai` 上**不生效**（实测返回了 distill.pub 的结果），所以 arxiv / ssrn 两个学术工具改用实测有效的 `site` 字段（`site: 'arxiv.org'` / `site: 'ssrn.com'`）。
+- **fix** **传输失败不再重试同一个 host**：旧行为是原地重试一次，配合 120s 超时最坏要等 **240s** 才报错。现在 `auto` 模式把失败当作路由事实——换到另一侧，每个 host 只试一次、每次调用最多两次尝试；`cn` / `global` 这种固定模式则一次失败即报错，并在错误里列出**实际尝试过的接口域名**。
+- **test** 全套 **150 例：149 通过 / 1 例按需跳过 / 0 失败**。新增 `test/settings.test.js`（端点策略纯函数：模式校验、路由顺序、`NO_PROXY` 合并）与 `test/plugin-endpoints.test.js`（假宿主集成：默认走国际侧、失败自动切国内侧并附加 `NO_PROXY`、固定模式不回落、胜者记忆、搜索用搜索域名对、`site` 字段、保存即时生效、primer 报告实际使用的域名），其中 `JINA_LIVE_CN=1` 的用例会真实 spawn helper 打通一次国内域名请求（实测通过，824ms）。
 
 ## 功能
 
-安装后所有会话（所有 agent preset）都会获得 13 个 `jina_*` 工具：
+安装后所有会话（所有 agent preset）都会获得 8 个 `jina_*` 工具：
 
 | 工具 | 对应 jina-cli 命令 | 说明 |
 | --- | --- | --- |
 | `jina_web_search` | `jina search` | 通用网页搜索（默认 web 域；images / blog 域，支持时间过滤与地区/语言提示） |
-| `jina_search_arxiv` | `jina search --arxiv` | arXiv 预印本检索（CS / ML / 数学 / 物理等，返回 arxiv.org 官方论文直链） |
-| `jina_search_ssrn` | `jina search --ssrn` | SSRN 论文检索（经济 / 金融 / 法律 / 管理等社会科学，返回 papers.ssrn.com 直链） |
+| `jina_search_arxiv` | `jina search --arxiv` | arXiv 预印本检索（CS / ML / 数学 / 物理等，返回 arxiv.org 官方论文直链；用 `site: arxiv.org` 限定来源） |
+| `jina_search_ssrn` | `jina search --ssrn` | SSRN 论文检索（经济 / 金融 / 法律 / 管理等社会科学，返回 papers.ssrn.com 直链；用 `site: ssrn.com` 限定来源） |
 | `jina_read` | `jina read` | 把网页读成干净的 markdown；支持正文选择器与噪声过滤（见下节）。**PDF 一律走普通抽取**——逐字，且比 OCR 便宜约 40× |
 | `jina_read_pdf` | `jina read` + `X-Respond-With: jina-ocr-v1` | **专门用 `jina-ocr-v1` 逐页读 PDF**：扫描件 / 图片型 PDF 唯一可用的路径。`pages` 选页（`"3"` / `"1-5"` / `"2,4,7"`），默认前 5 页（`maxPages`，上限 50）。**一次一页**（API 对超出页数的 `X-Page` 会静默返回第 1 页，工具据此判定文档结尾）；结果自带来源标记 |
 | `jina_screenshot` | `jina screenshot` | 网页截图，返回托管图片 URL（支持整页截图） |
 | `jina_datetime` | `jina datetime` | 推测网页的发布/更新时间 |
-| `jina_expand` | `jina expand` | 把搜索词扩展成一组相关查询 |
-| `jina_embed` | `jina embed` | 文本向量化（默认 jina-embeddings-v5-text-small） |
-| `jina_rerank` | `jina rerank` | 按相关性重排文档（默认 jina-reranker-v3.5） |
-| `jina_classify` | `jina classify` | 文本分类 |
-| `jina_pdf` | `jina pdf` | 从 PDF 提取**图表/公式**（支持 arXiv ID）并**把每张裁图作为图片附在结果里**（模型可直接看图）。注意：这是**视觉**抽取器，不返回正文/表格内容/公式 LaTeX，caption 是占位符——要正文请用 `jina_read_pdf`。且**只接受白名单来源**（arXiv 可以，多数主机返回 400） |
 | `jina_primer` | `jina primer` | 获取当前上下文：主机时钟（ISO 时间/unix/时区/UTC 偏移）、网络事实（公网 IP 与位置，尽力而为）与 Jina 账户状态（身份/余额） |
 
 ## 阅读工具选项（`jina_read`）
@@ -53,7 +49,6 @@ DeepSeek Harness 的 [Jina AI](https://jina.ai/) 插件（bundle）：把 jina-c
 
 调用级参数（`jina_read`）：`targetSelector`、`waitForSelector`、`removeSelector`、`noCache`，以及原有的 `links` / `images` / `json` / `apiKey`。
 调用级参数（`jina_read_pdf`）：`url`、`pages`、`maxPages`、`allowNonPdf`、`apiKey`。非 `.pdf` 的 URL 会被拒绝（`allowNonPdf: true` 可强制放行）——因为 `jina-ocr-v1` 在普通网页上会**编造内容**。
-调用级参数（`jina_pdf`）：`url` / `arxivId`、`extractType`、`maxEdge`、`maxImages`、`json`、`apiKey`。
 
 > 关于"为什么默认这样"：这三项是官方 Reader API 里**最坏情况不损失什么**的参数；而 alt 生成需要 key 且会计费，所以默认关闭。`X-Remove-Overlay` / `X-Detach-Invisibles` 这两个未在官方参数面板文档化的隐藏参数**没有**被默认启用（后者官方明确要求 browser 引擎且禁用缓存）。
 
@@ -142,9 +137,9 @@ dsh --profile web
 >
 > 本地文件夹安装（`add ./jina-dsh-plugin`）不经过远端：在该目录 `git pull` 之后重启 dsh 即可。
 
-同一张卡片里还有 **本地代理（可选）**：如果你的代理软件只监听本地端口（没有开启系统代理，也没有设置 `HTTP_PROXY` 环境变量），把它的地址填进去即可，例如 `http://127.0.0.1:7897`（可省略 `http://`）→ 保存，下一次工具调用立即生效。代理软件换端口时改这里即可，不需要重启 dsh。
+同一张卡片里还有 **接口域名**：一个三选一的下拉，决定每次调用走哪一对域名——**国内**（`r.jinaai.cn` / `s.jinaai.cn`，Jina 官方国内镜像，国内 CDN 直连、不需要代理/VPN）、**国际**（`r.jina.ai` / `s.jina.ai`）、**自动**（默认：先用上次可用的那一侧，失败后自动改用另一侧）。选中即保存，下一次工具调用立即生效，不需要重启 dsh。
 
-卡片中的 **API key / 连接检测** 区域只报告两件事：**Key 总数**与**总余额**（存活 key 的 credits 之和），另外显示连接状态与**本次检测实际使用的代理地址与来源**；点击「刷新」重新检测（添加 key 或代理后也会自动重检）。**不显示任何单个 key 的信息**——没有 key 明文、没有指纹、不标识正在使用哪一个、也没有手动移除。该数据由主机端插件通过 `/api/dsh-jina/primer` 路由提供（与 `jina_primer` 工具同一接口），**key 明文永不离开主机**；代理地址是明文配置，会显示在页面上。
+卡片中的 **API key / 连接检测** 区域只报告两件事：**Key 总数**与**总余额**（存活 key 的 credits 之和），另外显示连接状态与**本次检测实际使用的接口域名**；点击「刷新」重新检测（添加 key 或域名变更后也会自动重检）。**不显示任何单个 key 的信息**——没有 key 明文、没有指纹、不标识正在使用哪一个、也没有手动移除。该数据由主机端插件通过 `/api/dsh-jina/primer` 路由提供（与 `jina_primer` 工具同一接口），**key 明文永不离开主机**。
 
 ## API key 解析顺序与自动轮换
 
@@ -173,25 +168,24 @@ dsh --profile web
 - 同一个 key 在多个槽位或文件里重复出现时只请求一次。
 - **key 文件与只读来源不会被删除**：`jina-api-key.txt` 里的 key（插件不会改写用户的文件）和由启动环境变量只读提供的引用（seam 拒绝写入）只会被跳过冷却，不会从磁盘上消失。
 
-## 本地代理（本地网络代理软件）
+## 接口域名（不需要代理）
 
-Jina 域名被直连网络屏蔽，需要代理。插件的代理解析顺序（每次调用即时解析，改完即生效）：
+Jina 的全球域名 `r.jina.ai` / `s.jina.ai` 在中国大陆被 **DNS 污染**，源站地址也被黑洞，直连必然失败。Jina 官方为此提供了国内镜像域名（见 [jina-ai/reader#1237](https://github.com/jina-ai/reader/issues/1237)）：`r.jina.ai → r.jinaai.cn`、`s.jina.ai → s.jinaai.cn`，**接口、参数、认证方式完全一致，只需替换域名**。
 
-| 优先级 | 来源 | 说明 |
+| 模式 | 使用的域名 | 适用 |
 | --- | --- | --- |
-| 1 | 设置卡片「本地代理」 | `jina-tools` 命名空间的 `proxyUrl` 字段，最推荐的手动方式 |
-| 2 | 环境变量 `JINA_PROXY_URL` | 没有挂载 settings 提供方的 profile（如 headless）也能用 |
-| 3 | Windows 系统代理 | 从 WinINET 注册表自动发现（`ProxyEnable=1` 时），传输失败会重新发现一次，VPN 换端口可自愈 |
-| 4 | 启动环境变量 | harness 解析的 `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` / `NO_PROXY`，由 `subprocess` 自动带给网络 helper |
+| `cn`（国内） | `r.jinaai.cn` / `s.jinaai.cn` | 中国大陆网络。国内 CDN 直连，**不需要任何代理**；固定这一侧时不会回落到国际域名 |
+| `global`（国际） | `r.jina.ai` / `s.jina.ai` | 海外网络，或自备代理时 |
+| `auto`（默认） | 两侧都用 | 先用上次可用的那一侧，失败后自动改用另一侧。**每个 host 只试一次**，一次调用最多两次尝试；进程内记住胜者，所以只有第一次调用可能多花一次探测时间 |
 
 规则与注意事项：
 
-- **只支持 `http://` 和 `https://` 代理**。网络 helper 是 `node -e` + 全局 `fetch`，靠 `NODE_USE_ENV_PROXY` 识别代理；`socks://` 等 scheme 会让 Node 启动即退出，因此这类地址会被拒绝并在页面/错误信息里说明。
-- **本地代理软件只监听端口、未设为系统代理时**（WinINET `ProxyEnable=0x0`），优先级 3 发现不到它——这正是要在卡片里手填地址的场景。
-- 手动填写的地址**优先于**自动发现；传输失败时插件不会偷偷改用自动发现的代理，而是把当前使用的地址写进错误信息，便于确认端口是否写错。
-- 地址可以省略协议头（`127.0.0.1:7897` 等价于 `http://127.0.0.1:7897`），可以带账号密码（`http://user:pass@127.0.0.1:7897`），路径/查询串会被忽略。
-- 代理地址会明文保存在 dsh 的设置文档（`settings.yaml` 的 `jina-tools` 段）并可被 Web 页面读回；**只在本机受信环境使用**，不要把带凭据的地址提交到公开仓库。
-- 「清除」后回到自动检测（优先级 3 → 4）。
+- **插件不再配置任何代理**：卡片上没有代理输入框，也不读 `JINA_PROXY_URL`。你仍然可以自己用 VPN/系统代理，但插件不会去发现或设置它们。
+- **国内域名的请求会绕过继承来的代理**：如果启动 dsh 的环境里带着 `HTTP_PROXY` / `HTTPS_PROXY`，国内域名的尝试会把 `jinaai.cn` **追加**到 `NO_PROXY`（保留原有列表），避免把国内 CDN 地址塞进 VPN。
+- **实测数据**：`r.jinaai.cn` 不走代理直连 200，返回内容与经代理访问 `r.jina.ai` 逐字节一致（7521 字符、同一标题），稳定后 1.1–1.2s（首次冷启 24.8s，CDN 回源预热）；`s.jinaai.cn` 搜索接口带 key 返回 200。`api.jina.ai` 没有国内域名（`api.jinaai.cn` → HTTP 525），且其 SNI 被阻断（同一 CF IP 用 SNI `cloudflare.com` 正常、用 SNI `api.jina.ai` 立即 ECONNRESET），这也是 `jina_embed` / `jina_rerank` / `jina_classify` 被移除的原因。
+- **错误信息会点名实际尝试过的域名**，例如「已尝试的接口域名：https://r.jina.ai/、https://r.jinaai.cn/」，便于判断是国际侧被墙还是本机网络整体不通。
+- 域名的落地 IP 变化时不需要改配置（走系统 DNS 解析）；若某天官方下线 `.cn` 域名，把模式改成「自动」或「国际」并自备代理即可。
+- **升级提示**：0.11.x 及更早版本可能在 `jina-tools` 段里存过 `proxyUrl`。新版本不再读取该字段，**留着无害**；想让配置干净可以删掉那一行。
 
 ## 卸载
 
@@ -205,16 +199,16 @@ dsh plugin --profile web remove dsh-jina
 jina-dsh-plugin/
 ├── package.json       # manifest: "dsh": { "bundle": {"patch": ...}, "client": {"platform": "web"} }; 浏览器半身经 exports["./client"] 指向 ui/client.js
 ├── cordis.patch.yml   # 组合层：单个双面孔行 dsh-jina（宿主工具 + 浏览器卡片；行名 = 精确包名是 client-modules 扫描的硬条件）
-├── index.js           # 主机插件：13 个工具（含 jina_search_arxiv / jina_search_ssrn 专用学术检索、jina_read_pdf 专用 OCR）+ 网络传输 + 多 key 均流池（JINA_API_KEY / _2 … _10 + key 文件）+ jina-tools 代理与阅读策略
+├── index.js           # 主机插件：8 个工具（含 jina_search_arxiv / jina_search_ssrn 专用学术检索、jina_read_pdf 专用 OCR）+ 网络传输（双端点路由）+ 多 key 均流池（JINA_API_KEY / _2 … _10 + key 文件）
 ├── keys.js            # 纯函数模块：key 池策略（凭据引用 / key 文件解析 / 轮换顺序与冷却 / 状态标签，零依赖，可单测）
-├── proxy.js           # 纯函数模块：代理地址规范化 / 优先级 / 阅读策略默认值与设置 schema（零依赖，可单测）
+├── settings.js        # 纯函数模块：端点策略（国内 / 国际 / 自动的路由顺序与 NO_PROXY 覆盖）+ 阅读策略默认值与设置 schema（零依赖，可单测）
 ├── primer.js          # 纯函数模块：jina_primer 的解析 / 格式化逻辑（零依赖，可单测）
 ├── test/
 │   ├── primer.test.js        # jina_primer 单元测试（node --test 自动发现）
-│   ├── proxy.test.js         # 代理策略单元测试
+│   ├── settings.test.js      # 端点策略单元测试（模式校验 / 路由顺序 / NO_PROXY 合并）
 │   ├── keys.test.js          # key 池策略单元测试（轮换 / 冷却 / 解析 / 自动丢弃判定）
 │   ├── multi-key.test.js     # mock 宿主的多 key 集成测试（逐请求断言 Authorization 与 failover）
-│   ├── plugin-proxy.test.js  # mock 宿主的代理集成测试（含可选实时代理用例）
+│   ├── plugin-endpoints.test.js # mock 宿主的端点路由集成测试（含可选实时国内域名用例）
 │   ├── reader-headers.test.js# jina_read 请求头契约测试（解码 helper 的 stdin，断言真实发出的头）
 │   ├── client-bundle.test.js # 浏览器 bundle 契约测试（语法 + 注册 id + settings 通道 + 单输入 key 表单接线）
 │   ├── client-render.test.js # 在 VM 中真实渲染两种视图（抓作用域/绑定类缺陷）
@@ -222,7 +216,7 @@ jina-dsh-plugin/
 ├── ui/
 │   ├── package.json   # 子包 manifest（exports["./client"]；dsh.client 主声明已在根包，此处仅保持子包完整）
 │   ├── index.js       # 空主机半身（保留历史子包结构；组合层不再引用）
-│   └── client.js      # 预构建浏览器 bundle：Plugins 页的 "Jina Tools" 卡片（单输入 key 表单 + 本地代理 + 阅读选项）
+│   └── client.js      # 预构建浏览器 bundle：Plugins 页的 "Jina Tools" 卡片（单输入 key 表单 + 接口域名 + 阅读选项）
 ├── change-log.md      # 完整版本历史（简体中文）
 ├── change-log.en.md   # 完整版本历史（English）
 ├── README.md          # 简体中文说明（本文件）
@@ -231,28 +225,28 @@ jina-dsh-plugin/
 
 ## 开发说明
 
-- 主机插件只依赖 Node 内置模块与 dsh 主机服务（`fs`、`subprocess`、`tools`、`credentials`、`llm`、`webServer`），无第三方 npm 依赖；凭据走 dsh 原生的 credential seam（key 池引用 `JINA_API_KEY` / `JINA_API_KEY_2` … `JINA_API_KEY_10`，seam 一个引用存一个值、且任何读取接口都不回传值，所以「多个 key」=「多个引用」；引用名只要满足 POSIX 标识符语法即可，无需 harness 改动），配置走插件自己的 `jina-tools` 设置命名空间（`proxyUrl` 代理地址 + `imagePolicy` / `autoAltText` / `useSelectors` / 三个选择器覆盖等阅读策略），任何 profile 组合都可以直接使用。
-- **设置通道的契约（dsh 0.1.4 起）**：`settings.register()` 已被删除，**设置命名空间就是 Loader/profile 组合条目的 id**——本插件在 `cordis.patch.yml` 里插入的行 id 正是 `jina-tools`，所以卡片里的 `NS` 与之一致。插件通过 `index.js` 的 `export const Config = createSettingsSchema()`（`proxy.js`，零依赖手写节点）声明可编辑字段：每个字段节点带 `meta.volatile: true`，`'~standard': { version: 1, vendor: 'schemastery', validate }` 是 harness 解析配置的唯一入口（`resolveConfig()` 要求**同步**返回纯对象；`vendor` 必须是 `'schemastery'`，否则每次保存都会退化成整插件重挂载）。`validate()` 为每个字段生成一个**跨副本安全的 volatile 引用**（`Symbol.for('cosmokit.volatile.write')`），harness 保存时只把新值写进这些引用，`apply(ctx, config)` 拿到的对象身份不变、插件不重挂载；插件在**每次操作**里用 `settingsSnapshot(config)` 重新读取（`toolSettingsOf()` 负责把"未设置"归一成默认值），因此保存与 API key 一样**立即生效、无需重启**。`/api/dsh-jina/primer` 的 `settingsLive` 就是这个契约的健康检查。
+- 主机插件只依赖 Node 内置模块与 dsh 主机服务（`fs`、`subprocess`、`tools`、`credentials`、`llm`、`webServer`），无第三方 npm 依赖；凭据走 dsh 原生的 credential seam（key 池引用 `JINA_API_KEY` / `JINA_API_KEY_2` … `JINA_API_KEY_10`，seam 一个引用存一个值、且任何读取接口都不回传值，所以「多个 key」=「多个引用」；引用名只要满足 POSIX 标识符语法即可，无需 harness 改动），配置走插件自己的 `jina-tools` 设置命名空间（`endpoint` 接口域名 + `imagePolicy` / `autoAltText` / `useSelectors` / 三个选择器覆盖等阅读策略），任何 profile 组合都可以直接使用。
+- **设置通道的契约（dsh 0.1.4 起）**：`settings.register()` 已被删除，**设置命名空间就是 Loader/profile 组合条目的 id**——本插件在 `cordis.patch.yml` 里插入的行 id 正是 `jina-tools`，所以卡片里的 `NS` 与之一致。插件通过 `index.js` 的 `export const Config = createSettingsSchema()`（`settings.js`，零依赖手写节点）声明可编辑字段：每个字段节点带 `meta.volatile: true`，`'~standard': { version: 1, vendor: 'schemastery', validate }` 是 harness 解析配置的唯一入口（`resolveConfig()` 要求**同步**返回纯对象；`vendor` 必须是 `'schemastery'`，否则每次保存都会退化成整插件重挂载）。`validate()` 为每个字段生成一个**跨副本安全的 volatile 引用**（`Symbol.for('cosmokit.volatile.write')`），harness 保存时只把新值写进这些引用，`apply(ctx, config)` 拿到的对象身份不变、插件不重挂载；插件在**每次操作**里用 `settingsSnapshot(config)` 重新读取（`toolSettingsOf()` 负责把"未设置"归一成默认值），因此保存与 API key 一样**立即生效、无需重启**。`/api/dsh-jina/primer` 的 `settingsLive` 就是这个契约的健康检查。
 - 客户端 bundle 直接提交（`ui/client.js`），无构建步骤，git 安装开箱即用。改 UI 后直接改该文件并重启即可。bundle 顶层 `window.__ModuleLoader__.load` 的注册 id **必须等于图行 id（精确包名 `dsh-jina`）**——模块系统只按图行 id 匹配注册（`/client` 后缀除外），注册在别的键上（如旧行名 `dsh-jina/ui`）会报 `loaded without registering "dsh-jina"` 并导致整页 `Failed to load plugins`。卡片注册进 Web 设置包声明的 `settings.plugin.item` 插槽（设置 → 插件 → 配置），这是第三方插件配置的标准位置。
 - **`remote.<ns>` 的注入铁律**：gateway `$mount` 时会把每个 Remote 命名空间注册成**独立 cordis 服务**，所以客户端插件读取 `remote.<ns>`（如 `remote.credentials`、`remote.settings`）之前，必须在自己的 `inject` 里声明该服务名——只声明 `'remote'` 是不够的，属性访问本身就会抛 `cannot get property "remote.settings" without inject`，而错误冒到 `settings.plugin.item` 的 slot 边界会让**整张卡片消失**（0.6.0 的回归，现已由 `test/client-bundle.test.js` 固化）。本插件的 `inject = ['slots','remote','remote.credentials','remote.settings']`。读取处仍然包一层 try/catch：服务缺失时降级为提示，不让 slot 崩溃。
-- key 通过凭据 Remote 命名空间管理（`credentials.describe/set/unset`，变更事件 `credentials/reference-updated` 由 `remote` 服务转发）：卡片一次性 `describe(KEY_REFS)` 拿全部槽位的「是否已配置 / 来源 / 是否可写」（**永远拿不到值**，值只在保存时单向上行），表单因此只有**一个输入框**——「添加」把 key 写进第一个空槽位；宿主半身在 401/402 或探测到余额为 0 时用 `credentials.unset` **自动删除**该槽位（卡片自身不调用 `unset`，也不展示任何单个 key）。`ui/client.js` 里的 `KEY_REFS` 必须与 `keys.js` 的 `KEY_REFS` 完全一致（凭据命名空间没有枚举接口，卡片只能描述自己写下的引用名），由 `test/client-bundle.test.js` 固化。轮换/冷却策略在 `keys.js`（纯函数），宿主半身每次操作重新解析整池（与 key 的「每次调用即时解析」契约一致），`/api/dsh-jina/primer` 并行探测每个 key 并清理死 key，只回传**可用数量 / Key 总数 / 总余额 / 本次丢弃数**四个数字。代理字段走 `settings` Remote 命名空间（`remote.settings.describe/mutate`，写入按读到的 `revision` 设栅；外部编辑由转发事件 `settings/document-updated` 触发热重读）。
+- key 通过凭据 Remote 命名空间管理（`credentials.describe/set/unset`，变更事件 `credentials/reference-updated` 由 `remote` 服务转发）：卡片一次性 `describe(KEY_REFS)` 拿全部槽位的「是否已配置 / 来源 / 是否可写」（**永远拿不到值**，值只在保存时单向上行），表单因此只有**一个输入框**——「添加」把 key 写进第一个空槽位；宿主半身在 401/402 或探测到余额为 0 时用 `credentials.unset` **自动删除**该槽位（卡片自身不调用 `unset`，也不展示任何单个 key）。`ui/client.js` 里的 `KEY_REFS` 必须与 `keys.js` 的 `KEY_REFS` 完全一致（凭据命名空间没有枚举接口，卡片只能描述自己写下的引用名），由 `test/client-bundle.test.js` 固化。轮换/冷却策略在 `keys.js`（纯函数），宿主半身每次操作重新解析整池（与 key 的「每次调用即时解析」契约一致），`/api/dsh-jina/primer` 并行探测每个 key 并清理死 key，只回传**可用数量 / Key 总数 / 总余额 / 本次丢弃数**四个数字。接口域名字段走 `settings` Remote 命名空间（`remote.settings.describe/mutate`，写入按读到的 `revision` 设栅；外部编辑由转发事件 `settings/document-updated` 触发热重读）。
 - 组合层遵循 dsh 约定：单个双面孔行 `dsh-jina` 同时携带宿主半身与浏览器半身。浏览器半身由**根 manifest** 的 `dsh.client`（platform: web，图边注入 `@deepseek-ai/dsh-api-remotes`）与 `exports["./client"]` 声明，host 的 client-modules 服务扫描时按行名（精确包名）定位根 manifest 并接入 Web boot graph。注意 client-modules 扫描只接受精确包名行：子路径行（如 `dsh-jina/ui`）永远不会被扫描为客户端行——浏览器半身必须声明在根包。
 
 ## 测试
 
-纯函数逻辑（代理策略、primer 解析/格式化等）使用 Node 内置测试运行器，零依赖：
+纯函数逻辑（端点策略、primer 解析/格式化等）使用 Node 内置测试运行器，零依赖：
 
 ```sh
 npm test   # 等价于 node --test（自动发现 test/*.test.js）
 ```
 
-- `test/proxy.test.js`、`test/primer.test.js`、`test/keys.test.js`、`test/tools.test.js`：纯函数与模型可见契约（`keys.test.js` 覆盖凭据引用语法、key 文件解析、状态归类、冷却折叠、轮换顺序、池签名与来源标签）。
-- `test/multi-key.test.js`：用假 Cordis 上下文驱动主机半身，逐请求解码网络 helper 的 stdin 并断言 `Authorization`，覆盖 402→备用 key 接管并**从凭据存储删除**该 key、401 同样丢弃、429 只跳过、只读环境变量与 key 文件来源不被删除、均流轮换与冷却跳过、三 key 顺序轮换、422/5xx/网络失败不轮换、显式 `apiKey` 不轮换、全池耗尽的逐 key 报错、key 文件回退与多行解析、同 key 去重、添加 key 下一次调用即生效，以及 primer 路由只返回数量与总额且余额为 0 的 key 被丢弃。
-- `test/reader-headers.test.js`：用假 Cordis 上下文驱动主机半身，**解码网络 helper 的 stdin**，逐条断言 `jina_read` 真实发出的 Reader 请求头——固定三项（`X-Preset: agent` / `X-Base: final` / `X-Timeout: 120`）、图片策略、选择器组与"空结果自动重试"、OCR 开关与 `X-Page`、无 key 时零请求、alt 生成的 opt-in / 需 key / 与 OCR 互斥、JSON 信封解包与 usage、不可解析响应原文兜底，以及设置 schema 的字段声明（8 个字段都带 `meta.volatile`）、`validate` 的容错面与"保存后下一次调用即生效"。
-- `test/plugin-proxy.test.js`：用假 Cordis 上下文驱动主机半身，断言 `Config` 导出的 volatile 契约、代理优先级、**网络 helper 实际收到的环境变量**、错误文案与 `/api/dsh-jina/primer` 负载（含 `settingsLive`），以及"卡片保存的代理地址在下一次调用即生效、且不再探测注册表"。其中带 `JINA_LIVE_PROXY=1` 的用例会真实 spawn helper 打通一次 Jina 请求（干净环境 + 手填代理，用来证明是手填地址而非残留环境变量在起作用）：
+- `test/settings.test.js`、`test/primer.test.js`、`test/keys.test.js`、`test/tools.test.js`：纯函数与模型可见契约（`keys.test.js` 覆盖凭据引用语法、key 文件解析、状态归类、冷却折叠、轮换顺序、池签名与来源标签；`settings.test.js` 覆盖端点模式校验、路由顺序、`NO_PROXY` 合并）。
+- `test/multi-key.test.js`：用假 Cordis 上下文驱动主机半身，逐请求解码网络 helper 的 stdin 并断言 `Authorization`，覆盖 402→备用 key 接管并**从凭据存储删除**该 key、401 同样丢弃、429 只跳过、只读环境变量与 key 文件来源不被删除、均流轮换与冷却跳过、三 key 顺序轮换、422/5xx/网络失败不轮换（传输失败只换端点域名，不轮换 key）、显式 `apiKey` 不轮换、全池耗尽的逐 key 报错、key 文件回退与多行解析、同 key 去重、添加 key 下一次调用即生效，以及 primer 路由只返回数量与总额且余额为 0 的 key 被丢弃。
+- `test/reader-headers.test.js`：用假 Cordis 上下文驱动主机半身，**解码网络 helper 的 stdin**，逐条断言 `jina_read` 真实发出的 Reader 请求头——固定三项（`X-Preset: agent` / `X-Base: final` / `X-Timeout: 120`）、图片策略、选择器组与"空结果自动重试"、OCR 开关与 `X-Page`、无 key 时零请求、alt 生成的 opt-in / 需 key / 与 OCR 互斥、JSON 信封解包与 usage、不可解析响应原文兜底，以及设置 schema 的字段声明（7 个字段都带 `meta.volatile`）、`validate` 的容错面与"保存后下一次调用即生效"。
+- `test/plugin-endpoints.test.js`：用假 Cordis 上下文驱动主机半身，断言 `Config` 导出的 volatile 契约、**每次尝试真实请求的 URL**、**网络 helper 实际收到的环境变量**（国内域名附加 `NO_PROXY`、其他情况完整继承）、错误文案里实际尝试过的域名，以及 `/api/dsh-jina/primer` 负载（含 `settingsLive` 与本次使用的端点侧）。其中带 `JINA_LIVE_CN=1` 的用例会真实 spawn helper 打通一次国内域名请求：
 
   ```powershell
-  $env:JINA_LIVE_PROXY='1'; $env:JINA_LIVE_PROXY_URL='http://127.0.0.1:7897'; npm test
+  $env:JINA_LIVE_CN='1'; npm test
   ```
 
   在无法 spawn 子进程的沙箱里该用例会自动跳过并说明原因。

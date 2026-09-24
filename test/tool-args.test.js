@@ -161,27 +161,6 @@ test('the academic search tools are guarded under their own names', async () => 
   await rejected('jina_search_ssrn', {}, /jina_search_ssrn requires a non-empty "query" string/)
 })
 
-test('jina_expand: a missing query is rejected instead of expanding "undefined"', async () => {
-  await rejected('jina_expand', { queries: ['x'] }, /jina_expand requires a non-empty "query" string/)
-})
-
-test('jina_embed / jina_classify: a missing or malformed texts array is rejected', async () => {
-  await rejected('jina_embed', {}, /jina_embed requires a non-empty array of strings in "texts", but got nothing/)
-  await rejected('jina_embed', { texts: [] }, /jina_embed requires a non-empty array of strings in "texts"/)
-  await rejected('jina_embed', { texts: ['ok', 7] }, /jina_embed requires a non-empty array of strings in "texts"/)
-  await rejected('jina_embed', { texts: 'one string' }, /jina_embed requires a non-empty array of strings in "texts"/)
-  await rejected('jina_classify', { texts: ['t'] }, /jina_classify requires a non-empty array of strings in "labels"/)
-})
-
-test('jina_rerank: both the query and the documents are required', async () => {
-  await rejected('jina_rerank', { documents: ['d'] }, /jina_rerank requires a non-empty "query" string/)
-  await rejected('jina_rerank', { query: 'q' }, /jina_rerank requires a non-empty array of strings in "documents"/)
-})
-
-test('jina_pdf: neither url nor arxivId is a hard error, not a successful-looking string', async () => {
-  await rejected('jina_pdf', {}, /jina_pdf requires either a "url" or an "arxivId"/)
-})
-
 // ---- 0.8.2: the URL guard and the error channel -----------------------------
 // Before 0.8.2 a bad `url` came back as the *string* `invalid url: undefined`,
 // and an upstream 401/422 came back as a hint string. Both are successful tool
