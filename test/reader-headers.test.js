@@ -69,6 +69,7 @@ function createHost(options = {}) {
     get(key) {
       if (key === 'sandboxPolicy') return { workspaceRoot: 'C:\\ws' }
       if (key === 'attachments') return options.attachments
+      if (key === 'llm') return options.llm
       return undefined
     },
     inject(keys, callback) {
@@ -109,10 +110,10 @@ function callPdf(host, args) {
 }
 
 /** Invoke `jina_pdf` the way the tool seam does. */
-function callJinaPdf(host, args) {
+function callJinaPdf(host, args, agent) {
   const tool = host.tools.get('jina_pdf')
   assert.ok(tool !== undefined, 'jina_pdf must be registered')
-  return tool.execute(args, { agent: { session: { header: { cwd: 'C:\\ws' } } } })
+  return tool.execute(args, { agent: agent || { session: { header: { cwd: 'C:\\ws' } } } })
 }
 
 /** One `extract-pdf` envelope, as the network helper hands it back. */
@@ -403,6 +404,41 @@ test('jina_pdf: an image the store refuses is reported, never thrown', async () 
   assert.equal(value.blocks.filter((block) => block.type === 'image').length, 0)
   assert.match(value.blocks[0].text, /Extracted items: 1/, 'one oversized figure must not lose the extraction')
   assert.match(value.blocks[0].text, /exceeds the deployment limits/)
+})
+
+test('jina_pdf: a text-only route is told why the crops were not attached', async () => {
+  // The harness replaces an image block with "[image omitted because this model
+  // accepts text only; …]" before dispatching, so attaching crops that a
+  // text-only route cannot read only fills durable history with placeholders.
+  const attachments = fakeAttachments()
+  const host = createHost({
+    attachments,
+    llm: { async resolveModelInfo() { return { inputModalities: ['text'] } } },
+    responses: [pdfBody([{ type: 'table', number: '1', page: 4, image: PNG_B64 }])],
+  })
+  apply(host.ctx, resolveSettings(host.settingsValue))
+  const value = await callJinaPdf(host, { arxivId: '1', apiKey: 'k' }, {
+    session: { header: { cwd: 'C:\\ws' } }, options: { provider: 'p', model: 'm' },
+  })
+  assert.equal(attachments.saved.length, 0, 'nothing must be stored for a route that cannot read it')
+  assert.equal(value.blocks.filter((block) => block.type === 'image').length, 0)
+  assert.match(value.blocks[0].text, /declares text-only input/)
+  assert.match(value.blocks[0].text, /Extracted items: 1/, 'the inventory is still useful')
+})
+
+test('jina_pdf: an unresolvable route still attaches the crops', async () => {
+  const attachments = fakeAttachments()
+  const host = createHost({
+    attachments,
+    llm: { async resolveModelInfo() { throw new Error('no such route') } },
+    responses: [pdfBody([{ type: 'table', number: '1', page: 4, image: PNG_B64 }])],
+  })
+  apply(host.ctx, resolveSettings(host.settingsValue))
+  const value = await callJinaPdf(host, { arxivId: '1', apiKey: 'k' }, {
+    session: { header: { cwd: 'C:\\ws' } }, options: { provider: 'p', model: 'm' },
+  })
+  assert.equal(value.blocks.filter((block) => block.type === 'image').length, 1,
+    'the harness projects images itself, so an unread route must never lose them')
 })
 
 test('settings schema: every reader field is declared as a live (volatile) field', () => {

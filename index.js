@@ -937,6 +937,35 @@ export function apply(ctx, config) {
   }
 
   /**
+   * Whether the calling route declares image input.
+   *
+   * Mirrors the harness's own gate (`read_image` resolves the same route and
+   * requires `inputModalities` to include `image`). The three-way answer matters:
+   * only a *resolved* text-only route justifies skipping the attachments — an
+   * unresolvable route must still attach, because the harness projects images to
+   * a text placeholder on its own and throwing the crops away would lose them
+   * for every caller whose route we merely failed to read.
+   *
+   * @returns `'image'` when the route accepts images, `'text-only'` on positive
+   *   proof that it does not, `'unknown'` when it cannot be resolved.
+   */
+  async function routeImageCapability(exec) {
+    const llm = ctx.get('llm')
+    if (llm === undefined || llm === null || typeof llm.resolveModelInfo !== 'function') return 'unknown'
+    const session = exec && exec.agent ? exec.agent.session : undefined
+    const routed = session && typeof session.requestHeader === 'function' ? (session.requestHeader() || {}).config : undefined
+    const options = exec && exec.agent && exec.agent.options ? exec.agent.options : {}
+    const provider = (routed && routed.provider) || options.provider
+    const model = (routed && routed.model) || options.model
+    if (provider === undefined || model === undefined) return 'unknown'
+    try {
+      const info = await llm.resolveModelInfo(provider, model, exec.signal)
+      if (info === null || typeof info !== 'object' || !Array.isArray(info.inputModalities)) return 'unknown'
+      return info.inputModalities.indexOf('image') === -1 ? 'text-only' : 'image'
+    } catch (err) { return 'unknown' }
+  }
+
+  /**
    * Turn the payload's base64 crops into image blocks the model can actually see.
    *
    * `extract-pdf` returns each detected figure/table/equation as a cropped PNG
@@ -944,13 +973,14 @@ export function apply(ctx, config) {
    * dropping the images would leave a useless inventory. They are handed to the
    * attachment store and returned as image blocks, exactly the shape the
    * built-in `read_image` uses. Every refusal (no store, wrong media type, an
-   * image over the deployment's limits) is reported in the notes rather than
-   * thrown: one oversized figure must not lose the whole extraction.
+   * image over the deployment's limits, a text-only route) is reported in the
+   * notes rather than thrown: one oversized figure must not lose the whole
+   * extraction.
    *
    * @returns `{ blocks, notes, attached }` — image blocks, human-readable
    *   refusals, and the indices of the floats that made it into `blocks`.
    */
-  async function pdfImageBlocks(data, maxImages) {
+  async function pdfImageBlocks(data, maxImages, exec) {
     const store = ctx.get('attachments')
     const floats = data && Array.isArray(data.floats) ? data.floats : []
     const wanted = floats
@@ -960,6 +990,12 @@ export function apply(ctx, config) {
     const notes = []
     const attached = new Set()
     if (wanted.length === 0) return { blocks, notes, attached }
+    // Attaching crops the route cannot read only fills durable history with
+    // blocks the harness must replace by a placeholder on every later request.
+    if (await routeImageCapability(exec) === 'text-only') {
+      notes.push('this model declares text-only input, so the ' + wanted.length + ' extracted image(s) were not attached — switch to a vision-capable model to see them')
+      return { blocks, notes, attached }
+    }
     if (store === undefined || store === null) {
       notes.push('the deployment has no attachment store, so the ' + wanted.length + ' extracted image(s) could not be attached')
       return { blocks, notes, attached }
@@ -1713,7 +1749,7 @@ export function apply(ctx, config) {
       if (args.json === true) return { blocks: [{ type: 'text', text: withKeyNote(res.text, res, true) }] }
       const data = pdfPayload(res.text)
       if (data === undefined) return { blocks: [{ type: 'text', text: withKeyNote(res.text, res, false) }] }
-      const extracted = await pdfImageBlocks(data, args.maxImages)
+      const extracted = await pdfImageBlocks(data, args.maxImages, exec)
       let text = pdfEnvelope(data, extracted.attached)
       if (extracted.blocks.length > 0) {
         text += '\n\n' + extracted.blocks.length + ' extracted image(s) are attached below — those crops are the figures/tables themselves.'
