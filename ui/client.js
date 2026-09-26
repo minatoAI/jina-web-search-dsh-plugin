@@ -57,6 +57,17 @@
 // web server is composed), which answers with the key's Jina identity and
 // credit balance — the same data `jina_primer` reports — and with the endpoint
 // side that probe actually ran through. The key itself never leaves the host.
+//
+// It also owns the low-balance reminder: once the credits behind the pool fall
+// below `LOW_BALANCE_THRESHOLD`, one frame-wide notice appears through the
+// shell's `shell.overlay` list slot — the same `slots` service the card above
+// already uses, so this needs no harness change and no build step (this file
+// IS the bundle). The notice is a client-side surface by construction: DSH has
+// no host-side notification channel, so it shows while a page is open and never
+// wakes an idle session. It polls the primer route the card polls, shows while
+// the pool sits below the threshold, hides when the user dismisses it (a
+// dismissal is remembered, so a reload does not repeat an unchanged condition)
+// and re-arms itself once the pool recovers above the threshold.
 window.__ModuleLoader__.load({
   id: 'dsh-jina',
   factory: function (require) {
@@ -96,6 +107,35 @@ window.__ModuleLoader__.load({
     var REMOVE_SELECTOR_FIELD = 'removeSelector'
     var IMAGE_POLICIES = ['all', 'alt', 'none']
 
+    // ---- low-balance reminder -------------------------------------------------
+    // The credits behind the whole pool below which the frame-wide notice
+    // appears; 0 (or negative) disables the notice entirely. The check itself is
+    // free — it is the same Reader-root GET the card's own refresh makes, which
+    // costs no credits and is what `/api/dsh-jina/primer` already runs.
+    var LOW_BALANCE_THRESHOLD = 1000000
+    // How often the notice re-reads that route while the page stays open.
+    var LOW_BALANCE_POLL_MS = 15 * 60 * 1000
+    // Remembering a dismissal is what keeps the notice from re-appearing on
+    // every reload; recovering above the threshold re-arms it.
+    var LOW_BALANCE_STORE_KEY = 'dsh-jina:low-balance-dismissed'
+    // A profile-level threshold override, so the notice can be *demonstrated*
+    // without editing this bundle: set a number above the current pool total in
+    // the browser console and reload (see README). Unset means the constant.
+    var LOW_BALANCE_THRESHOLD_KEY = 'dsh-jina:low-balance-threshold'
+    // The glow needs a keyframes rule and this bundle ships no stylesheet (no
+    // build step — inline styles only), so one <style> is injected once under
+    // this id and every rule in it is scoped by this class.
+    var LOW_BALANCE_STYLE_ID = 'dsh-jina-low-balance-style'
+    var LOW_BALANCE_CLASS = 'dsh-jina-low-balance'
+    var LOW_BALANCE_CSS = [
+      '@keyframes dsh-jina-low-balance-flash {',
+      '  0% { box-shadow: 0 0 0 1px rgba(224,49,49,.30), 0 0 14px rgba(224,49,49,.30); }',
+      '  45% { box-shadow: 0 0 0 2px rgba(224,49,49,.95), 0 0 26px rgba(224,49,49,.70); }',
+      '  100% { box-shadow: 0 0 0 1px rgba(224,49,49,.30), 0 0 14px rgba(224,49,49,.30); }',
+      '}',
+      '@media (prefers-reduced-motion: reduce) { .' + LOW_BALANCE_CLASS + ' { animation: none !important; } }',
+    ].join('\n')
+
     var S = {
       card: { boxSizing: 'border-box', background: 'var(--dsw-alias-bg-layer-2)', borderRadius: 16, boxShadow: 'var(--dsw-shadow-lv3)', overflow: 'hidden', margin: 0, listStyle: 'none' },
       header: { boxSizing: 'border-box', width: '100%', display: 'flex', alignItems: 'center', gap: 12, border: 'none', background: 'transparent', cursor: 'pointer', padding: '14px 18px', fontFamily: 'inherit', textAlign: 'left', color: 'inherit' },
@@ -121,6 +161,23 @@ window.__ModuleLoader__.load({
       checkRow: { display: 'flex', alignItems: 'flex-start', gap: 8, cursor: 'pointer' },
       checkLabel: { fontSize: 12, lineHeight: '18px', color: 'var(--dsw-alias-label-primary)', flex: 1 },
       select: { boxSizing: 'border-box', height: 32, borderRadius: 8, border: '1px solid rgba(127,127,127,0.35)', background: 'var(--dsw-alias-bg-layer-1, transparent)', color: 'var(--dsw-alias-label-primary)', padding: '0 8px', fontSize: 12, fontFamily: 'inherit' },
+      // The low-balance notice rides the frame-wide overlay slot, so it styles
+      // itself the way the card does (same alias tokens). The seat is the
+      // shell's `[data-shell-overlay]` layer (`position: absolute; inset: 0;
+      // pointer-events: none`, with `> * { pointer-events: auto }`), so an
+      // absolutely-positioned child anchors to the frame and stays clickable —
+      // `fixed` would be anchored to the viewport instead, and to any ancestor
+      // that happens to carry a transform. The red border carries a steady glow
+      // and then pulses twice (`LOW_BALANCE_CSS` owns the keyframes; the base
+      // box-shadow is the same value the animation starts and ends on, so a
+      // profile without a document still gets the glow, just not the pulse).
+      lowBalance: { boxSizing: 'border-box', position: 'absolute', right: 16, bottom: 16, maxWidth: 340, display: 'flex', flexDirection: 'column', gap: 8, background: 'var(--dsw-alias-bg-layer-2, #1f1f1f)', border: '1px solid rgba(224,49,49,0.55)', borderRadius: 12, boxShadow: '0 0 0 1px rgba(224,49,49,0.30), 0 0 14px rgba(224,49,49,0.30)', padding: '10px 12px', animation: 'dsh-jina-low-balance-flash 1.1s ease-in-out 2' },
+      lowBalanceTitle: { fontSize: 13, fontWeight: 600, color: 'var(--dsw-alias-label-primary)', margin: 0 },
+      lowBalanceText: { fontSize: 13, lineHeight: '20px', color: 'var(--dsw-alias-label-secondary, rgba(127,127,127,0.92))', margin: 0 },
+      // The live balance gets the primary colour: it is the number the user
+      // compares against the threshold in the line above it.
+      lowBalanceValue: { fontSize: 13, lineHeight: '20px', color: 'var(--dsw-alias-label-primary)', margin: 0, fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace' },
+      lowBalanceRow: { display: 'flex', alignItems: 'center', gap: 8, justifyContent: 'flex-end' },
     }
 
     function Chevron(props) {
@@ -132,6 +189,157 @@ window.__ModuleLoader__.load({
           d: 'M3.5 5.5L7 9l3.5-3.5', fill: 'none', stroke: 'currentColor',
           strokeWidth: 1.5, strokeLinecap: 'round', strokeLinejoin: 'round',
         }))
+    }
+
+    /** One stored string, or null. Never throws: private mode has no storage. */
+    function readStore(key) {
+      try {
+        if (typeof window === 'undefined' || !window.localStorage) return null
+        return window.localStorage.getItem(key)
+      } catch (err) { return null }
+    }
+
+    /** Store one string, best-effort (a storage-less profile just re-warns). */
+    function writeStore(key, value) {
+      try {
+        if (typeof window !== 'undefined' && window.localStorage) window.localStorage.setItem(key, String(value))
+      } catch (err) { /* nothing to persist */ }
+    }
+
+    /** Drop one stored string, best-effort. */
+    function clearStore(key) {
+      try {
+        if (typeof window !== 'undefined' && window.localStorage) window.localStorage.removeItem(key)
+      } catch (err) { /* nothing to clear */ }
+    }
+
+    /**
+     * The threshold in force: the shipped constant, unless this profile stored
+     * an override under `LOW_BALANCE_THRESHOLD_KEY`.
+     *
+     * The override exists so the notice can be *demonstrated* without touching
+     * this file: set a number above the current pool total in the browser
+     * console and reload, and the notice appears (see README). A malformed or
+     * non-positive override is ignored rather than silently disabling the
+     * reminder.
+     * @returns the credits below which the notice shows.
+     */
+    function effectiveThreshold() {
+      var raw = readStore(LOW_BALANCE_THRESHOLD_KEY)
+      if (raw !== null) {
+        var value = Number(raw)
+        if (Number.isFinite(value) && value > 0) return value
+      }
+      return LOW_BALANCE_THRESHOLD
+    }
+
+    /**
+     * Whether the user dismissed this drop.
+     *
+     * Never throws: a profile without localStorage (or one whose storage is
+     * blocked) simply keeps warning, which is the harmless direction.
+     * @returns whether the dismissal is latched.
+     */
+    function dismissalSeen() {
+      return readStore(LOW_BALANCE_STORE_KEY) !== null
+    }
+
+    /** Latch a dismissal so a reload does not repeat an unchanged condition. */
+    function rememberDismissal() {
+      writeStore(LOW_BALANCE_STORE_KEY, '1')
+    }
+
+    /** Re-arm the notice once the pool is healthy again. */
+    function clearDismissal() {
+      clearStore(LOW_BALANCE_STORE_KEY)
+    }
+
+    /**
+     * Install the notice's keyframes once per page.
+     *
+     * Idempotent by id, and never throws: a profile with no `document` (or one
+     * whose head is unavailable) still renders the notice with the steady glow,
+     * it just loses the two-flash pulse.
+     */
+    function ensureNoticeStyles() {
+      try {
+        if (typeof document === 'undefined' || document.head === undefined) return
+        if (document.getElementById(LOW_BALANCE_STYLE_ID) !== null) return
+        var style = document.createElement('style')
+        style.id = LOW_BALANCE_STYLE_ID
+        style.textContent = LOW_BALANCE_CSS
+        document.head.appendChild(style)
+      } catch (err) { /* the glow still renders; only the pulse is lost */ }
+    }
+
+    /**
+     * The low-balance reminder: one frame-wide notice in the Web shell.
+     *
+     * `shell.overlay` is a plain root-scope list slot the shell renders for
+     * every registered id, so this entry needs neither a harness change nor a
+     * build step — this file is the bundle. It polls the same host route the
+     * card does (free: the probe is the card's own refresh call), shows only
+     * while the pool total sits below `LOW_BALANCE_THRESHOLD` — until the user
+     * dismisses it, or the pool recovers above the threshold — and never crashes
+     * the shell: a failed poll or an unreadable payload means "no balance fact".
+     *
+     * Three lines and one dismissal: a title naming the plugin, the threshold it
+     * crossed, and the balance it is actually at right now. There is no billing
+     * link and no settings jump to click — the jump was tried and dropped, since
+     * it had to drive the shell's DOM (DSH exposes no open-settings API to a
+     * plugin) and behaved unreliably in practice.
+     * @returns the notice element, or null while the pool is healthy.
+     */
+    function LowBalanceNotice() {
+      var [observed, setObserved] = React.useState({ total: undefined, threshold: LOW_BALANCE_THRESHOLD })
+      var [shown, setShown] = React.useState(false)
+      React.useEffect(function () {
+        ensureNoticeStyles()
+        var stopped = false
+        var check = function () {
+          // A failed poll must not become a balance fact, and must not throw
+          // into the slot: both handlers below only set state.
+          fetch('/api/dsh-jina/primer').then(function (response) { return response.json() }).then(function (payload) {
+            if (stopped) return
+            var total = payload && typeof payload.balanceTotal === 'number' ? payload.balanceTotal : undefined
+            var threshold = effectiveThreshold()
+            setObserved({ total: total, threshold: threshold })
+            // A profile with no key pool reports no total (and a threshold of 0
+            // is the documented "off" switch): nothing to run out of, nothing
+            // to remind about.
+            if (!(threshold > 0) || total === undefined) { setShown(false); return }
+            if (total >= threshold) { clearDismissal(); setShown(false); return }
+            // The latch records a *dismissal*, never the notice itself: while the
+            // drop stands and the user has not dismissed it, every poll re-asserts
+            // `shown` so the notice stays up until it is dismissed or the pool
+            // recovers. (An unchanged `true` is a no-op for React.)
+            if (dismissalSeen()) { setShown(false); return }
+            setShown(true)
+          }, function () { /* a failed poll is not a balance fact */ })
+        }
+        check()
+        // The poll only runs while the page is open, and the cleanup is what
+        // stops it when the shell unmounts the entry.
+        if (typeof window === 'undefined' || typeof window.setInterval !== 'function') return undefined
+        var timer = window.setInterval(check, LOW_BALANCE_POLL_MS)
+        return function () { stopped = true; window.clearInterval(timer) }
+      }, [])
+      if (!shown) return null
+      var thresholdText = typeof observed.threshold === 'number' && observed.threshold > 0
+        ? observed.threshold.toLocaleString('en-US')
+        : LOW_BALANCE_THRESHOLD.toLocaleString('en-US')
+      var currentText = typeof observed.total === 'number' ? observed.total.toLocaleString('en-US') : '未知'
+      return React.createElement('div', { className: LOW_BALANCE_CLASS, style: S.lowBalance, role: 'status' },
+        React.createElement('p', { style: S.lowBalanceTitle }, 'Jina Tools'),
+        React.createElement('p', { style: S.lowBalanceText },
+          '该插件可用点数少于 ' + thresholdText + '，请注意补充。'),
+        React.createElement('p', { style: S.lowBalanceValue }, '当前还有 ' + currentText + '。'),
+        React.createElement('div', { style: S.lowBalanceRow },
+          React.createElement('button', {
+            type: 'button',
+            style: S.smallButton,
+            onClick: function () { rememberDismissal(); setShown(false) },
+          }, '知道了')))
     }
 
     function JinaCard(props) {
@@ -576,7 +784,7 @@ window.__ModuleLoader__.load({
       } else if (primer.phase === 'error') {
         primerLines = [
           React.createElement('p', { key: 'e', style: S.statusBad }, '❌ 无法连接 Jina：' + String(primer.error)),
-          React.createElement('p', { key: 'h', style: S.note }, '先确认本地代理正在运行，且「本地代理」里填写的地址/端口与它一致（没有填写时请确认 VPN / 系统代理已开启或环境变量已设置），然后点击右侧「刷新」重试。'),
+          React.createElement('p', { key: 'h', style: S.note }, '先确认本机能连到 Jina（国内镜像 r.jinaai.cn / 国际 r.jina.ai）。启动 dsh 的环境若设了 HTTP_PROXY / HTTPS_PROXY，国际域名的请求会走它、国内域名会自动绕过；也可以把卡片里的「接口域名」改成「自动」或「国际」再点「刷新」重试。'),
         ]
       } else {
         var d = primer.data || {}
@@ -590,6 +798,15 @@ window.__ModuleLoader__.load({
           React.createElement('p', { key: 'total', style: S.mono }, 'Key 总数：' + total + ' 个'),
           React.createElement('p', { key: 'bal', style: S.mono }, '总余额：' + totalBalance),
         ]
+        // The frame-wide notice lives in the shell's overlay layer (z-index 20),
+        // which the full-viewport Settings modal (z-index 1000) covers — and this
+        // card is exactly where a user checking the pool will be looking. So the
+        // verdict is repeated here, in the same words, from the same threshold.
+        var lowLimit = effectiveThreshold()
+        if (typeof d.balanceTotal === 'number' && lowLimit > 0 && d.balanceTotal < lowLimit) {
+          primerLines.push(React.createElement('p', { key: 'low', style: S.statusBad },
+            '⚠️ 总余额已低于提醒阈值 ' + lowLimit.toLocaleString('en-US') + ' credits。'))
+        }
         if (total === 0) {
           primerLines.push(React.createElement('p', { key: 'none', style: S.note }, '尚未保存 key：添加一个即可；当前使用 Jina 匿名免费配额。'))
         }
@@ -720,6 +937,21 @@ window.__ModuleLoader__.load({
           { name: 'settings.plugin.item', key: 'jina-tools' },
           function () {
             return React.createElement(JinaCard, { remote: remote, credentials: credentials })
+          },
+        )
+      })
+
+      // Low-balance reminder: one frame-wide notice while the credits behind the
+      // pool sit below `LOW_BALANCE_THRESHOLD`. `shell.overlay` is a plain
+      // root-scope LIST slot — the shell renders every registered id, no
+      // allowlist — so this is an ordinary plugin entry, not a harness change.
+      // `slots.inject` waits for the declarer and unregisters with it, so a
+      // harness without that slot simply never shows the notice.
+      ctx.slots.inject('shell.overlay', function () {
+        return slots.register(
+          { name: 'shell.overlay', id: 'jina.balance' },
+          function () {
+            return React.createElement(LowBalanceNotice, {})
           },
         )
       })

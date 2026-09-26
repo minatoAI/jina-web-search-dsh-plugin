@@ -113,6 +113,20 @@ test('client bundle: the card offers exactly the three endpoint modes', () => {
   assert.equal(/JINA_PROXY_URL/.test(SOURCE), false, 'the retired proxy env var must not be referenced')
 })
 
+test('client bundle: the connection hint does not advise a proxy the plugin no longer has', () => {
+  // The proxy machinery went in 0.12.0 (settings.js: the endpoint policy "never
+  // touches a proxy"), but the connection-failure hint kept telling users to
+  // check a 本地代理 address/port and a proxy field that no longer exist. It now
+  // names the endpoints and the one proxy fact that is still true — an inherited
+  // HTTP_PROXY carries the global hosts, while the CN attempt bypasses it.
+  assert.match(SOURCE, /接口域名」改成「自动」或「国际」/, 'the hint offers the reachable modes')
+  assert.match(SOURCE, /HTTP_PROXY \/ HTTPS_PROXY/, 'and names the inherited proxy honestly')
+  assert.match(SOURCE, /国内域名会自动绕过/, 'including which side bypasses it')
+  assert.equal(/本地代理/.test(SOURCE), false, 'the retired proxy-address hint must stay gone')
+  assert.equal(/填写的地址\/端口/.test(SOURCE), false, 'nor its address/port wording')
+  assert.equal(/本地代理正在运行/.test(SOURCE), false, 'nor its "is the proxy running" advice')
+})
+
 test('client bundle: the reader options ride the same namespace and write path', () => {
   // The bundle is hand-edited, so a dropped field would silently make the
   // control a no-op: the card would render a checkbox that writes nothing.
@@ -170,4 +184,63 @@ test('client bundle: the pool copy names the failover and auto-discard contract'
   assert.match(SOURCE, /401/)
   assert.match(SOURCE, /402/)
   assert.match(SOURCE, /429/)
+})
+
+test('client bundle: the low-balance reminder rides the shell overlay slot', () => {
+  // The seat is a plain root-scope LIST slot: the shell renders every registered
+  // id, so this is an ordinary plugin entry — no harness change, no allowlist.
+  // A renamed id would leave the notice registered but never drawn, and a
+  // renamed slot would leave it unregistered entirely.
+  assert.match(SOURCE, /name:\s*'shell\.overlay'/)
+  assert.match(SOURCE, /id:\s*'jina\.balance'/)
+  assert.match(SOURCE, /ctx\.slots\.inject\('shell\.overlay'/)
+})
+
+test('client bundle: the reminder is titled, names the threshold, and shows the live balance', () => {
+  // The number is load-bearing in both directions: a typo'd order of magnitude
+  // either never fires or fires on a healthy pool.
+  const threshold = /LOW_BALANCE_THRESHOLD\s*=\s*([0-9_]+)/.exec(SOURCE)
+  assert.ok(threshold, 'the bundle must declare the reminder threshold')
+  assert.equal(Number(threshold[1].replace(/_/g, '')), 1000000)
+  assert.match(SOURCE, /balanceTotal/, 'the reminder reads the pool total the host reports')
+  assert.match(SOURCE, /'Jina Tools'/, 'the notice is titled with the plugin name')
+  assert.match(SOURCE, /该插件可用点数少于 /, 'the body names the threshold it crossed')
+  assert.match(SOURCE, /请注意补充/, 'and asks the user to top up')
+  assert.match(SOURCE, /当前还有 /, 'the next line states the balance it is actually at')
+  assert.match(SOURCE, /'知道了'/, 'and one action dismisses the notice')
+  // The old billing link must not come back.
+  assert.equal(/去充值/.test(SOURCE), false, 'the billing link must stay gone')
+})
+
+test('client bundle: the settings jump stays gone', () => {
+  // It was tried and dropped: DSH exposes no open-settings API to a plugin
+  // (`openSettings` is owner props for the SINGLE `settings.launcher` seat,
+  // already owned by the account menu, and the panel has no URL route), so it
+  // had to drive the shell's DOM through `aria-haspopup` / `nav button` /
+  // 插件|plugins — and it behaved unreliably in practice. Nothing may quietly
+  // reintroduce that coupling.
+  assert.equal(/打开设置/.test(SOURCE), false, 'the settings button must not come back')
+  assert.equal(/aria-haspopup/.test(SOURCE), false, 'nor the DOM hook it used')
+  assert.equal(/data-shortcut-modal/.test(SOURCE), false, 'nor the panel locator')
+  assert.equal(/openPluginSettings/.test(SOURCE), false, 'nor the function itself')
+})
+
+test('client bundle: the reminder owns the glow and the two-flash pulse', () => {
+  // The border glow is the reason this bundle injects a <style>: keyframes
+  // cannot be expressed in an inline style. A rename anywhere here leaves the
+  // notice static — the exact state the user rejected.
+  assert.match(SOURCE, /@keyframes dsh-jina-low-balance-flash/)
+  assert.match(SOURCE, /animation: 'dsh-jina-low-balance-flash 1\.1s ease-in-out 2'/, 'two flashes, then settle')
+  assert.match(SOURCE, /LOW_BALANCE_STYLE_ID/, 'the stylesheet is injected under a stable id')
+  assert.match(SOURCE, /document\.getElementById\(LOW_BALANCE_STYLE_ID\)/, 'and injected only once per page')
+  assert.match(SOURCE, /prefers-reduced-motion/, 'a reduced-motion profile must not be flashed at')
+  assert.match(SOURCE, /boxShadow: '0 0 0 1px rgba\(224,49,49/, 'the steady glow is inline, so it survives a missing document')
+})
+
+test('client bundle: the threshold can be overridden for a live demonstration', () => {
+  // The README documents this as the manual trigger ("set a number above the
+  // pool total, reload"); a rename here would silently break those steps while
+  // every other test kept passing.
+  assert.match(SOURCE, /LOW_BALANCE_THRESHOLD_KEY\s*=\s*'dsh-jina:low-balance-threshold'/)
+  assert.match(SOURCE, /function effectiveThreshold\(\)/)
 })

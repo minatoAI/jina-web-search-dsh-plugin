@@ -324,3 +324,73 @@ test('client bundle: a profile without a credential plane degrades instead of lo
   assert.equal(passwords.length, 1)
   assert.equal(passwords[0].disabled, true, 'the input cannot be used without a credential plane')
 })
+
+/** The frame-wide reminder entry (`shell.overlay`) the bundle registers. */
+function overlayEntry(registrations) {
+  const entry = registrations.find(candidate => candidate.options.name === 'shell.overlay')
+  assert.ok(entry !== undefined, 'the bundle must register the low-balance reminder in the shell overlay')
+  return entry
+}
+
+test('client bundle: the reminder is titled, names the threshold, and carries two actions', () => {
+  // The reminder's two `useState` calls are the observed payload and the shown
+  // flag, so the stub drives it straight into the alerted state. Rendering it
+  // for real is the point: this entry rides the shell's overlay slot, where a
+  // missing local binding would blank the notice instead of the whole page.
+  const { registrations, elements } = mount([{ total: 987654, keyCount: 5, threshold: 1000000 }, true])
+  const tree = renderView(overlayEntry(registrations), undefined)
+  assert.equal(tree.type, 'div')
+  const texts = elements.filter(node => node.type === 'p')
+    .map(node => (Array.isArray(node.props.children) ? node.props.children.join('') : node.props.children))
+    .filter(text => typeof text === 'string')
+  assert.deepEqual(texts, ['Jina Tools', '该插件可用点数少于 1,000,000，请注意补充。', '当前还有 987,654。'],
+    'a title line, the threshold it crossed, and the balance it is actually at')
+  assert.equal(elements.some(node => node.type === 'a'), false, 'no billing link')
+  assert.equal(texts.some(text => text.includes('个 key')), false, 'and no key-count detail')
+  const buttons = elements.filter(node => node.type === 'button').map(node => node.props)
+  assert.deepEqual(buttons.map(props => props.children), [['知道了']],
+    'one action only: the settings jump was dropped')
+  assert.ok(buttons.every(props => typeof props.onClick === 'function'), 'and it works')
+  // The glow cannot live in an inline style: the box must carry the class the
+  // injected stylesheet scopes, plus the animation that uses its keyframes.
+  assert.equal(tree.props.className, 'dsh-jina-low-balance')
+  assert.match(String(tree.props.style.animation), /dsh-jina-low-balance-flash 1\.1s ease-in-out 2/)
+  assert.match(String(tree.props.style.boxShadow), /rgba\(224,49,49/)
+  assert.match(String(tree.props.style.border), /rgba\(224,49,49/)
+})
+
+test('client bundle: the low-balance reminder stays silent while the pool is healthy', () => {
+  // `shown === false` is every state the component reaches without a breach:
+  // the first render, a healthy total, an unreadable payload, a failed poll.
+  // Nothing may be built at all — a hidden-but-rendered notice would still sit
+  // in the shell's overlay stack.
+  const { registrations, elements } = mount([{ total: 19963559, keyCount: 5, threshold: 1000000 }, false])
+  assert.equal(renderView(overlayEntry(registrations), undefined), null, 'no notice while the pool is healthy')
+  assert.equal(elements.filter(node => node.type === 'p').length, 0, 'and nothing is built for it')
+})
+
+test('client bundle: the card repeats the below-threshold verdict where the user is looking', () => {
+  // The frame-wide notice sits in the shell's overlay layer (z-index 20), which
+  // the full-viewport Settings modal (z-index 1000) covers — and the card is
+  // exactly where someone checking the pool will be. So the card must state the
+  // same verdict from the same threshold, or a user inside Settings sees nothing.
+  const views = {}
+  for (const ref of KEY_REFS) views[ref] = { configured: false, writable: true }
+  views[KEY_REFS[0]] = { configured: true, source: 'file', writable: true }
+  const endpoint = { mode: 'cn', side: 'cn', base: 'https://r.jinaai.cn/' }
+  const textsOf = (elements) => elements.filter(node => node.type === 'p')
+    .map(node => (Array.isArray(node.props.children) ? node.props.children.join('') : node.props.children))
+    .filter(text => typeof text === 'string')
+
+  const low = { phase: 'ok', data: { ok: true, keyCount: 1, discardedCount: 0, balanceTotal: 800000, endpoint }, error: undefined }
+  const first = mount([undefined, views, undefined, undefined, low])
+  renderView(bundleEntry(first.registrations), 'page')
+  assert.ok(textsOf(first.elements).some(text => text.includes('总余额已低于提醒阈值') && text.includes('1,000,000')),
+    'the card must carry the reminder verdict, not just the overlay notice')
+
+  const healthy = { phase: 'ok', data: { ok: true, keyCount: 1, discardedCount: 0, balanceTotal: 5000000, endpoint }, error: undefined }
+  const second = mount([undefined, views, undefined, undefined, healthy])
+  renderView(bundleEntry(second.registrations), 'page')
+  assert.equal(textsOf(second.elements).some(text => text.includes('总余额已低于提醒阈值')), false,
+    'a healthy pool must not warn in the card either')
+})

@@ -10,14 +10,17 @@ A [Jina AI](https://jina.ai/) plugin (bundle) for DeepSeek Harness: it exposes J
 
 > Only the latest release is listed here; the full version history lives in [change-log.en.md](./change-log.en.md).
 
-### 0.12.1 (2026-09-24)
+### 0.13.0 (2026-09-26)
 
-- **fix** **`jina_read` no longer hangs on the default selector group.** `X-Target-Selector` implies the server-side `X-Wait-For-Selector`, so a selector that never appears keeps the Reader waiting until `X-Timeout` — 120 s, exactly the client's own ceiling, which turned "the default selector list does not match this page" into a **network timeout** (measured: a news page sat for more than 45 s with the group and answered in 30 s without it; the 36kr page is the one that hit this). The selector attempt now uses a 30 s server patience and a 45 s client ceiling, so the server answers first (usually the existing 422) and the whole-page fallback runs; a **third fallback shape** was added for a selector attempt that simply times out (status 0). **Verified live**: the 163.com page 4.3 s, 36kr 1.9 s, two attempts each.
-- **fix** **`targetSelector: ""` now really reads the whole page.** An empty string used to fall back to the built-in list, which made the `retry with targetSelector: ""` advice in the 422 hint a no-op; only an *unset* argument falls back now.
-- **fix** **`jina_primer`'s network section is back.** The `ipinfo.io` request had been swallowed by the new endpoint routing (`network` was always `null`); `jinaRequest` has an explicit absolute-URL escape hatch again, and only Jina hosts go through the endpoint table. Verified live: a real public IP / city / ASN.
-- **test** Full suite: **155 tests (154 pass, 1 opt-in skip, 0 fail)**, with 4 new cases plus the ipinfo regression test.
+- **feat** **Low-balance reminder**: when the total credits behind the pool cross **1,000,000**, a small card appears in the bottom-right corner of the Web UI with **three lines and one action** — title `Jina Tools`, "该插件可用点数少于 <threshold>，请注意补充。", "当前还有 <balance>。", and a single "知道了". It re-reads the card's own `/api/dsh-jina/primer` every 15 minutes (**that probe is free** — measured: eight consecutive probes moved no balance); it stays up for as long as the pool is below the threshold, a dismissal hides it and is remembered (a reload never repeats an unchanged drop), and a top-up above the threshold re-arms it. The threshold is the `LOW_BALANCE_THRESHOLD` constant in `ui/client.js`.
+- **change** **The "打开设置" jump was removed**: it had to be DOM-driven (DSH exposes no open-settings API to a plugin) and **did not behave well in practice**, so the whole thing is gone on request, with a regression assertion keeping it out.
+- **feat** **A glowing border that flashes twice**: a red border with a `box-shadow` glow, pulsing twice on appearance (`@keyframes` + `animation: … 1.1s ease-in-out 2`; the keyframes live in an injected `<style id="dsh-jina-low-balance-style">`, idempotently injected once). Skipped under `prefers-reduced-motion`; a profile with no `document` keeps the steady glow without the pulse.
+- **feat** **It can be demonstrated on the spot**: run `localStorage.setItem('dsh-jina:low-balance-threshold','20000000')` in the page console and reload — the notice appears immediately (the current total is about 18.17M); `localStorage.removeItem('dsh-jina:low-balance-threshold')` and a reload restore the shipped threshold. A malformed value is ignored, so a console typo never becomes "reminder permanently off".
+- **change** **It is only visible while a page is open, and it needs no DeepSeek Harness change**: it rides the shell's `shell.overlay` slot (a root-scope list slot that renders every registered id, with no allowlist), while the plugin's client half already used that same `slots` service for its card. DSH has **no** host-side notification channel, so it never wakes an idle session and does not reach headless/CLI use.
+- **fix** **The connection hint's retired proxy advice is gone**: it no longer tells you to check a 本地代理 address/port that no longer exists. It now states what is true — confirm the machine can reach Jina (mainland `r.jinaai.cn` / global `r.jina.ai`); if the environment that launched dsh carries `HTTP_PROXY` / `HTTPS_PROXY`, global requests ride it while mainland requests bypass it.
+- **test** Full suite: **170 tests (169 pass, 1 opt-in skip, 0 fail)**, with 15 new cases including 6 **instrumented** ones (a tiny React runtime whose setters re-render, plus controllable `setInterval` / `localStorage` / `fetch` / `document`, driving the real bundle through the whole poll path: appearing, surviving the next poll while un-dismissed, hiding on dismissal and staying hidden across a reload, re-arming after a top-up, a failed poll not changing state, the override applying while a malformed override is ignored, and the stylesheet injected exactly once), plus the glow/two-flash contract, a render assertion for the three lines and the single action, and regression assertions keeping **both the settings jump and the retired proxy wording** out. Also **mutation-checked**: restoring the first version's "latch on show" logic makes 2 of those 3 cases fail.
 
-> The full 0.12.0 notes (the endpoint switch, the five removed tools, the deleted proxy machinery) live in [change-log.en.md](./change-log.en.md).
+> The full 0.12.1 notes (`jina_read` selector-timeout fix and friends) live in [change-log.en.md](./change-log.en.md).
 
 ## Features
 
@@ -139,6 +142,20 @@ The plugin is a profile dependency, so an upgrade is **make the profile fetch th
 The same card also carries the **endpoint domains**: a three-way select deciding which pair of domains each call uses — **mainland** (`r.jinaai.cn` / `s.jinaai.cn`, Jina's official mainland mirrors, a domestic CDN reached directly with no proxy/VPN), **global** (`r.jina.ai` / `s.jina.ai`) and **auto** (the default: use whichever side answered last, and switch to the other when it fails). Selecting saves immediately, and the next tool call uses it — no dsh restart.
 
 The card's **API key / connection check** section reports only two things: **how many keys it holds** and **the total balance** (the credits behind the surviving keys), plus the connection state and **the endpoint domains the check actually used**; click **Refresh** to re-check (adding a key or changing the endpoint also triggers an automatic re-check). **Nothing per key is shown** — no plaintext, no fingerprint, no "which one is in use", and no manual removal. This data is served by the host-side plugin through the `/api/dsh-jina/primer` route (the same endpoint the `jina_primer` tool uses); **the plaintext key never leaves the host**.
+
+While the pool is working it also **raises a low-balance reminder on its own**: once the total drops below the threshold (default **1,000,000 credits**), a small card appears in the bottom-right corner of the Web UI with **three lines and one action** — title `Jina Tools`, "该插件可用点数少于 <threshold>，请注意补充。", "当前还有 <balance>。", and a single "知道了" — with a red border that glows and **flashes twice**, and it **stays up for as long as the pool is below it**; a dismissal hides it and is remembered (a reload never repeats an unchanged drop), and a top-up above the threshold re-arms it. The threshold is the `LOW_BALANCE_THRESHOLD` constant in `ui/client.js` (set it to `0` to disable).
+
+**To see it on the spot** (no code change, no restart): open the Web page, press F12 for the console and run
+
+```js
+localStorage.setItem('dsh-jina:low-balance-threshold', '20000000') // temporarily above the current total (~18.17M)
+```
+
+then reload — the notice appears; run `localStorage.removeItem('dsh-jina:low-balance-threshold')` and reload to restore the shipped threshold. The override belongs to that browser profile only, and a malformed value (empty, `abc`, `0`, negative) is ignored.
+
+The notice rides the shell's `shell.overlay` slot and is a **client-side** surface: it is **only visible while a page is open** and never wakes an idle session (DSH has no host-side notification channel).
+
+⚠️ **Note that the Settings page covers it**: the `shell.overlay` layer is `z-index: 20` while Settings is a full-viewport modal (`z-index: 1000`), so the bottom-right notice is **not visible inside Settings → Plugins → Jina Tools** (a child cannot escape its parent's stacking context). The card therefore re-evaluates the **same threshold** in its "API key / connection check" block and adds a red line "⚠️ 总余额已低于提醒阈值 N credits" when crossed; on the **main view** (with Settings closed) the floating notice is what shows.
 
 ## API key resolution, rotation and automatic discard
 
