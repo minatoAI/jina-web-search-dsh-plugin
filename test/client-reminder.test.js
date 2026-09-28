@@ -5,15 +5,21 @@
  * proves the elements exist but never exercises the *decision*. This file drives
  * the real path instead: the committed bundle in a VM, a small stateful React
  * runtime that re-renders when a setter runs, a controllable
- * `window.setInterval`, a fake `localStorage` shared across "reloads", and a
- * `fetch` whose payload the test swaps between polls.
+ * `window.setInterval`, a fake `localStorage` shared across "reloads", a
+ * controllable clock, and a `fetch` whose answer the test swaps between reads.
  *
  * It is the difference between "the notice renders" and "the notice appears
- * exactly when the pool runs low, survives the next poll, honours a dismissal
+ * exactly when the pool runs low, survives the next read, honours a dismissal
  * across a reload, and warns again after a top-up and a later drop". The first
  * version of this feature latched the notice when it *showed* rather than when
  * it was *dismissed*, so the very next poll hid a notice the user may never have
  * seen — a defect pre-seeded rendering cannot reach.
+ *
+ * Since the ledger rework the notice does not probe anything: it reads the
+ * host's balance ledger, a local route that spends no credits and never reaches
+ * the vendor. The tests below therefore assert not only *what* the notice does
+ * but *where it gets its number* — a regression back to probing the vendor on a
+ * page-owned clock is the failure this file is now positioned to catch.
  */
 
 import { test } from 'node:test'
@@ -25,6 +31,10 @@ const SOURCE = await readFile(new URL('../ui/client.js', import.meta.url), 'utf8
 
 /** The threshold the bundle ships; the tests speak in terms of this number. */
 const THRESHOLD = Number(/LOW_BALANCE_THRESHOLD\s*=\s*([0-9_]+)/.exec(SOURCE)[1].replace(/_/g, ''))
+
+/** The ledger route the notice must read, and the one it must no longer touch. */
+const LEDGER_ROUTE = '/api/dsh-jina/balance'
+const PRIMER_ROUTE = '/api/dsh-jina/primer'
 
 /** Minimal stateful React: hooks persist across renders, a setter re-renders. */
 function reactRuntime() {
@@ -119,20 +129,35 @@ function fakeDocument() {
   }
 }
 
+/** A clock the test moves by hand, so "17 分钟前更新" is a fact and not a race. */
+function fakeClock(at = 1750000000000) {
+  const clock = {
+    at,
+    advance(ms) { this.at += ms; return this.at },
+  }
+  // `now` closes over the clock rather than reading `this`: inside a static
+  // method `this` is the class, not the instance the sandbox handed around.
+  clock.date = class extends Date { static now() { return clock.at } }
+  return clock
+}
+
 /**
  * Boot the committed bundle against a fake shell and mount the reminder.
- * @param initialPayload - what `/api/dsh-jina/primer` answers first.
+ * @param initial - what the ledger route answers first: `{ total, updatedAt, pending }`.
  * @param storage - the persistent store, shared to model a reload.
  * @param doc - the document stub, shared to model two mounts in one page.
+ * @param clock - the controllable clock, shared so a re-boot is the same moment.
  */
-function bootReminder(initialPayload, storage = new Map(), doc = fakeDocument()) {
+function bootReminder(initial, storage = new Map(), doc = fakeDocument(), clock = fakeClock()) {
   let registration
-  let payload = initialPayload
+  let payload = initial
   let offline = false
   const intervals = []
+  const requests = []
   const runtime = reactRuntime()
   const sandbox = {
     document: doc,
+    Date: clock.date,
     window: {
       __ModuleLoader__: { load: (entry) => { registration = entry } },
       localStorage: {
@@ -143,9 +168,11 @@ function bootReminder(initialPayload, storage = new Map(), doc = fakeDocument())
       setInterval: (callback) => { intervals.push(callback); return intervals.length },
       clearInterval: () => {},
     },
-    fetch: () => (offline
-      ? Promise.reject(new Error('offline'))
-      : Promise.resolve({ json: () => Promise.resolve(payload) })),
+    fetch: (url) => {
+      requests.push(url)
+      if (offline) return Promise.reject(new Error('offline'))
+      return Promise.resolve({ json: () => Promise.resolve(payload) })
+    },
   }
   new Script(SOURCE, { filename: 'ui/client.js' }).runInContext(createContext(sandbox))
   assert.ok(registration !== undefined, 'the bundle must register through window.__ModuleLoader__.load')
@@ -168,19 +195,21 @@ function bootReminder(initialPayload, storage = new Map(), doc = fakeDocument())
   assert.equal(entry.options.id, 'jina.balance', 'under the id the shell renders')
   runtime.mount(entry.render({}).type)
 
-  /** Settle the poll's promise chain, then apply the state it produced. */
+  /** Settle the read's promise chain, then apply the state it produced. */
   const settle = async () => { for (let i = 0; i < 6; i++) await Promise.resolve(); return runtime.flush() }
   return {
     runtime,
     storage,
+    clock,
     intervals,
     document: doc,
+    requests,
     settle,
-    /** Answer the next poll with this payload. */
+    /** Answer the next read with this ledger payload. */
     answer: (next) => { payload = next; offline = false },
-    /** Make the next poll fail at the transport. */
+    /** Make the next read fail at the transport. */
     fail: () => { offline = true },
-    /** Run one poll exactly the way the registered interval would. */
+    /** Run one read exactly the way the registered interval would. */
     poll: async () => { for (const callback of intervals) callback(); return settle() },
     visible: () => runtime.tree !== null,
     paragraphs: () => paragraphs(runtime.tree),
@@ -188,8 +217,25 @@ function bootReminder(initialPayload, storage = new Map(), doc = fakeDocument())
   }
 }
 
-test('reminder: shows below the threshold, and an un-dismissed notice survives the next poll', async () => {
-  const boot = bootReminder({ balanceTotal: THRESHOLD - 12346, keyCount: 5 })
+/** A ledger payload the tests can pass around without repeating the shape. */
+const ledger = (total, updatedAt, pending = false) => ({ total, updatedAt, pending })
+
+test('reminder: it reads the host ledger, and never probes the vendor itself', async () => {
+  // The whole point of the rework: the host owns when a probe is due (it is where
+  // the calls that spend credits happen), and the page only reads the result. A
+  // regression back to the page's own 15-minute vendor poll would show up here as
+  // a request to the primer route.
+  const boot = bootReminder(ledger(800000, 1750000000000))
+  await boot.settle()
+  assert.equal(boot.visible(), true)
+  await boot.poll()
+  assert.ok(boot.requests.length >= 2, 'the notice reads on mount and then on its interval')
+  assert.deepEqual([...new Set(boot.requests)], [LEDGER_ROUTE], 'and every read is the free local ledger route')
+  assert.equal(boot.requests.includes(PRIMER_ROUTE), false, 'it must never drive the vendor probe itself')
+})
+
+test('reminder: shows below the threshold, and an un-dismissed notice survives the next read', async () => {
+  const boot = bootReminder(ledger(THRESHOLD - 12346, 0))
   await boot.settle()
   assert.equal(boot.visible(), true, 'a pool below the threshold must show the notice')
   assert.deepEqual(boot.paragraphs(),
@@ -199,7 +245,44 @@ test('reminder: shows below the threshold, and an un-dismissed notice survives t
   // Only a dismissal may hide it. The first version latched on *show*, so this
   // very poll hid a notice the user might never have seen.
   await boot.poll()
-  assert.equal(boot.visible(), true, 'an un-dismissed notice must survive the next poll')
+  assert.equal(boot.visible(), true, 'an un-dismissed notice must survive the next read')
+})
+
+test('reminder: the balance line carries how long ago it was confirmed', async () => {
+  // "When did we last look" and "when did the number last change" are different
+  // questions, and a probe that finds the same figure still confirms it — so the
+  // line counts from the last confirmation, not from the last change.
+  const clock = fakeClock()
+  const boot = bootReminder(ledger(800000, clock.at), new Map(), fakeDocument(), clock)
+  await boot.settle()
+  assert.equal(boot.paragraphs()[3], '刚刚更新', 'a fresh confirmation reads as "just now"')
+
+  clock.advance(60 * 1000)
+  await boot.poll()
+  assert.equal(boot.paragraphs()[3], '1 分钟前更新')
+
+  clock.advance(17 * 60 * 1000)
+  await boot.poll()
+  assert.equal(boot.paragraphs()[3], '18 分钟前更新')
+
+  clock.advance(60 * 60 * 1000)
+  await boot.poll()
+  assert.equal(boot.paragraphs()[3], '1 小时前更新', 'past an hour the line switches bucket')
+
+  clock.advance(5 * 60 * 60 * 1000)
+  await boot.poll()
+  assert.equal(boot.paragraphs()[3], '6 小时前更新')
+})
+
+test('reminder: a balance that was never confirmed shows no age line at all', async () => {
+  // `updatedAt: 0` means no probe has confirmed anything yet. Showing "0 分钟前"
+  // would be a lie about freshness; showing nothing says the same thing quietly.
+  const boot = bootReminder(ledger(800000, 0))
+  await boot.settle()
+  assert.equal(boot.visible(), true, 'the breach itself still warns')
+  assert.deepEqual(boot.paragraphs(),
+    ['Jina Tools', '该插件可用点数少于 1,000,000，请注意补充。', '当前还有 800,000。'],
+    'but there is nothing to date, so the age line is absent rather than invented')
 })
 
 test('reminder: the glow stylesheet is injected once per page, and never flashes a reduced-motion profile', async () => {
@@ -208,7 +291,7 @@ test('reminder: the glow stylesheet is injected once per page, and never flashes
   // the entry can remount (a surface swap), and a second copy of the keyframes
   // would restart the pulse on every mount.
   const shared = fakeDocument()
-  const first = bootReminder({ balanceTotal: 800000, keyCount: 5 }, new Map(), shared)
+  const first = bootReminder(ledger(800000, 1750000000000), new Map(), shared)
   await first.settle()
   assert.equal(shared.styles.length, 1, 'exactly one stylesheet is injected')
   assert.equal(shared.styles[0].id, 'dsh-jina-low-balance-style')
@@ -217,14 +300,14 @@ test('reminder: the glow stylesheet is injected once per page, and never flashes
   assert.match(shared.styles[0].textContent, /\.dsh-jina-low-balance/, 'and every rule is scoped by the box class')
 
   // A second mount in the same page (same document) must not inject again.
-  const second = bootReminder({ balanceTotal: 800000, keyCount: 5 }, new Map(), shared)
+  const second = bootReminder(ledger(800000, 1750000000000), new Map(), shared)
   await second.settle()
   assert.equal(shared.styles.length, 1, 'a remount must not stack a second copy')
 })
 
 test('reminder: a dismissal hides it, survives a reload, and re-arms after a top-up', async () => {
   const storage = new Map()
-  const first = bootReminder({ balanceTotal: 987654, keyCount: 5 }, storage)
+  const first = bootReminder(ledger(987654, 0), storage)
   await first.settle()
   assert.equal(first.visible(), true)
 
@@ -236,47 +319,47 @@ test('reminder: a dismissal hides it, survives a reload, and re-arms after a top
   assert.equal(storage.size, 1, 'and latches the dismissal')
 
   await first.poll()
-  assert.equal(first.visible(), false, 'a later poll must not resurrect a dismissed notice')
+  assert.equal(first.visible(), false, 'a later read must not resurrect a dismissed notice')
 
   // A reload is a fresh component over the same storage.
-  const second = bootReminder({ balanceTotal: 900000, keyCount: 5 }, storage)
+  const second = bootReminder(ledger(900000, 0), storage)
   await second.settle()
   assert.equal(second.visible(), false, 'the dismissal must survive a reload')
 
   // A top-up above the threshold re-arms it...
-  second.answer({ balanceTotal: 5000000, keyCount: 5 })
+  second.answer(ledger(5000000, 0))
   await second.poll()
   assert.equal(second.visible(), false)
   assert.equal(storage.size, 0, 'recovering above the threshold clears the latch')
   // ...so a later drop warns again.
-  second.answer({ balanceTotal: 800000, keyCount: 5 })
+  second.answer(ledger(800000, 0))
   await second.poll()
   assert.equal(second.visible(), true, 'a later drop must warn again')
 })
 
-test('reminder: "no balance fact" is never treated as a breach, and a failed poll changes nothing', async () => {
+test('reminder: "no balance fact" is never treated as a breach, and a failed read changes nothing', async () => {
   // No key pool at all: the host reports no total, so there is nothing to run
   // out of and nothing to warn about.
-  const empty = bootReminder({ ok: true, keyCount: 0, balanceTotal: null })
+  const empty = bootReminder(ledger(null, 0))
   await empty.settle()
   assert.equal(empty.visible(), false, 'a pool with no total must not warn')
 
   // A transport failure must leave the last known state alone rather than flip
   // it: an offline moment is not evidence that the credits came back.
-  const low = bootReminder({ balanceTotal: 800000, keyCount: 5 })
+  const low = bootReminder(ledger(800000, 0))
   await low.settle()
   assert.equal(low.visible(), true)
   low.fail()
   await low.poll()
-  assert.equal(low.visible(), true, 'a failed poll must keep the notice it already had')
+  assert.equal(low.visible(), true, 'a failed read must keep the notice it already had')
 
-  // ...and a later good poll still shows it, so the failure did not latch.
-  low.answer({ balanceTotal: 700000, keyCount: 5 })
+  // ...and a later good read still shows it, so the failure did not latch.
+  low.answer(ledger(700000, 0))
   await low.poll()
   assert.equal(low.visible(), true)
 
-  // The poll is registered once, on the interval, and torn down with the entry.
-  assert.equal(low.intervals.length, 1, 'exactly one poll loop')
+  // The read is registered once, on the interval, and torn down with the entry.
+  assert.equal(low.intervals.length, 1, 'exactly one read loop')
   low.runtime.unmount()
 })
 
@@ -285,7 +368,7 @@ test('reminder: a stored override lets the notice be triggered live, and removin
   // total in the profile, reload, and the notice appears — no bundle edit, so
   // the shipped default and the test that pins it both stay intact.
   const storage = new Map([['dsh-jina:low-balance-threshold', '20000000']])
-  const boot = bootReminder({ balanceTotal: 18168993, keyCount: 5 }, storage)
+  const boot = bootReminder(ledger(18168993, 0), storage)
   await boot.settle()
   assert.equal(boot.visible(), true, 'the override must raise the threshold for this profile')
   assert.deepEqual(boot.paragraphs(),
@@ -293,7 +376,7 @@ test('reminder: a stored override lets the notice be triggered live, and removin
     'and the copy must name the override actually in force')
 
   storage.delete('dsh-jina:low-balance-threshold')
-  const restored = bootReminder({ balanceTotal: 18168993, keyCount: 5 }, storage)
+  const restored = bootReminder(ledger(18168993, 0), storage)
   await restored.settle()
   assert.equal(restored.visible(), false, 'without the override the shipped threshold applies again')
 })
@@ -303,7 +386,7 @@ test('reminder: a malformed override is ignored, never silently disabling the re
   // back to the shipped constant, which still warns at 800k.
   for (const bad of ['', 'abc', '0', '-5', 'NaN', 'Infinity']) {
     const storage = new Map([['dsh-jina:low-balance-threshold', bad]])
-    const boot = bootReminder({ balanceTotal: 800000, keyCount: 5 }, storage)
+    const boot = bootReminder(ledger(800000, 0), storage)
     await boot.settle()
     assert.equal(boot.visible(), true, `a stored threshold of "${bad}" must not disable the reminder`)
   }

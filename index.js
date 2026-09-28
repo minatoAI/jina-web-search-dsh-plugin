@@ -158,6 +158,36 @@ export function apply(ctx, config) {
    */
   let keyPoolState = { signature: 0, states: [], lastUsed: -1 }
   /**
+   * The balance ledger: one number the page and the low-balance notice both read,
+   * instead of each of them polling the vendor on its own clock.
+   *
+   * `perKey` is the per-key credit balance, keyed by the key value, and is never
+   * exposed (no value, no fingerprint, no per-key figure ever crosses the wire).
+   * `total` is the sum over `poolKeys` — the pool as of the last write — so a key
+   * that is dropped from the pool stops contributing without a probe.
+   * `updatedAt` is when a probe last *confirmed* the total, which is the question
+   * the page asks; it is not "when the number last changed", so a round that
+   * confirms at least one key's figure advances it even when the sum is the same,
+   * while a round that confirmed nothing leaves it alone.
+   *
+   * The probe window is what replaced the page's 15-minute poll. A call marks
+   * its key as used and opens a window anchored at the FIRST such call; the
+   * probe fires one window later and closes it. Calls inside an open window do
+   * not reschedule it, so a burst yields exactly one probe and a continuous
+   * stream of calls still yields one per window — it cannot starve, which is
+   * why there is no deferred-maximum. No call, no window, no probe: without
+   * calls nothing spends credits, so there is nothing to re-read.
+   */
+  let balanceLedger = {
+    perKey: new Map(),
+    poolKeys: [],
+    total: null,
+    updatedAt: 0,
+    windowStartedAt: 0,
+    windowKeys: new Set(),
+    timer: undefined,
+  }
+  /**
    * The endpoint side that answered last (`'global'` before any call). `auto`
    * mode tries it first and the other side second, so the process pays for the
    * unreachable side once and then stops — and still falls back if the working
@@ -368,7 +398,185 @@ export function apply(ctx, config) {
     if (keyPoolState.signature !== signature || keyPoolState.states.length !== pool.length) {
       keyPoolState = { signature, states: pool.map(() => clearKeyState()), lastUsed: -1 }
     }
+    syncBalancePool(pool)
     return keyPoolState
+  }
+
+  // ---- the balance ledger ----------------------------------------------------
+  // One number, read by the card and the low-balance notice alike, so neither of
+  // them polls the vendor on its own clock and both read the same figure. The
+  // per-key balances that back it are keyed by the key value and stay in memory:
+  // nothing here ever crosses the wire except the total and a timestamp.
+
+  /**
+   * The gap between the first call of a window and the probe that confirms what
+   * it spent. Long enough for the vendor to settle the balance (a probe taken
+   * immediately after a call still reads the pre-call number), and it doubles as
+   * the coalescing interval: a burst of calls shares one probe.
+   */
+  const BALANCE_WINDOW_MS = 60000
+
+  /** Re-add the pool's credits from the per-key cache, over the current pool. */
+  function recomputeBalanceTotal() {
+    let sum = 0
+    let any = false
+    for (const value of balanceLedger.poolKeys) {
+      const credits = balanceLedger.perKey.get(value)
+      if (typeof credits === 'number') { sum += credits; any = true }
+    }
+    balanceLedger.total = any ? sum : null
+  }
+
+  /**
+   * Point the ledger at the pool a probe just ran against.
+   *
+   * Called from `keyStateFor`, which every path that resolves the pool already
+   * goes through, so a key added or removed anywhere re-bases the total without
+   * this module having to watch for it. A key that leaves the pool stops
+   * contributing; a key that joins has no cached balance yet and contributes
+   * nothing until something probes it.
+   */
+  function syncBalancePool(pool) {
+    const values = pool.map((entry) => entry.value)
+    const same = values.length === balanceLedger.poolKeys.length
+      && values.every((value, index) => value === balanceLedger.poolKeys[index])
+    if (same) return
+    balanceLedger.poolKeys = values
+    recomputeBalanceTotal()
+  }
+
+  /**
+   * Fold one probe round into the ledger.
+   * @param probed - `Map` of key value to its reported `balanceLeft`, or to
+   *   `null` when the probe said nothing (a transport failure is not a fact).
+   * @param live - the pool's surviving key values, when the caller just re-based
+   *   it (the health check discards as it probes, so it knows the answer).
+   *   Omitted, the ledger keeps the pool it already has.
+   */
+  function recordBalanceProbe(probed, live) {
+    let confirmed = false
+    for (const [value, credits] of probed) {
+      if (typeof credits === 'number') {
+        balanceLedger.perKey.set(value, credits)
+        confirmed = true
+      }
+    }
+    if (live !== undefined) balanceLedger.poolKeys = live
+    recomputeBalanceTotal()
+    // An unchanged total still counts as checked: the page asks "how long ago
+    // did we last look", not "when did the number last move". A round that
+    // confirmed *nothing* must not though. Every probe failing at the transport,
+    // or answering without a number, leaves the page holding a figure nobody
+    // re-read; stamping it "刚刚更新" would dress a stale number up as a fresh
+    // one, which is the one lie an age line exists to prevent. The age keeps
+    // growing instead, and the next window re-reads.
+    if (confirmed) balanceLedger.updatedAt = Date.now()
+  }
+
+  /**
+   * Drop one key's contribution the moment it stops backing the pool.
+   *
+   * A 401/402 is a verdict, not a reading: the key cannot serve a call any more,
+   * so whatever the cache still credits it with is not behind anything the pool
+   * can use. Waiting for the window would keep the total inflated for up to a
+   * minute, on exactly the call that just proved the key empty.
+   *
+   * @param value - the key value to stop counting.
+   */
+  function dropBalanceKey(value) {
+    const cached = balanceLedger.perKey.delete(value)
+    // A cached value the pool no longer carries was not part of the number the
+    // page reads, so dropping it is not an account of anything.
+    if (balanceLedger.poolKeys.indexOf(value) < 0) return
+    balanceLedger.poolKeys = balanceLedger.poolKeys.filter((entry) => entry !== value)
+    recomputeBalanceTotal()
+    // Only a key that was actually carrying credits moves the total, and only a
+    // total that moved may be re-dated. A key with no cached figure contributed
+    // nothing, so dropping it changes neither — and stamping the total then would
+    // present the *other* keys' older figure as freshly confirmed.
+    if (cached) balanceLedger.updatedAt = Date.now()
+  }
+
+  /**
+   * Record that a call was served by one key, and open the probe window.
+   *
+   * The window is anchored at the first call: later calls inside it add their
+   * key to the set to probe but never reschedule the timer, so a burst produces
+   * exactly one probe and an unbroken stream of calls still produces one per
+   * window. Calls on a path that serves no pool key (an explicit `apiKey`, the
+   * anonymous tier) are not tracked — the ledger only ever speaks about the pool.
+   */
+  function noteBalanceUse(value) {
+    if (typeof value !== 'string' || value === '') return
+    balanceLedger.windowKeys.add(value)
+    if (balanceLedger.windowStartedAt !== 0) return
+    balanceLedger.windowStartedAt = Date.now()
+    balanceLedger.timer = setTimeout(runBalanceProbe, BALANCE_WINDOW_MS)
+    // A pending window must never be the reason the host stays alive.
+    if (balanceLedger.timer !== undefined && typeof balanceLedger.timer.unref === 'function') balanceLedger.timer.unref()
+  }
+
+  /**
+   * Confirm what the window spent — one request per key the window actually
+   * used, and no request at all for the keys it did not.
+   *
+   * A key that answers 401/402 here is dropped from the ledger (it backs no
+   * call any more) but is *not* deleted from the credentials: the call path and
+   * the primer route own discarding, and a third site racing them could delete a
+   * key the health check just called healthy.
+   *
+   * This runs off a timer, so nobody is above it to catch a throw: escaping
+   * would land as a process-level unhandled rejection and could take the host
+   * down over a background nicety. The window is closed before the first await,
+   * so a failure here cannot wedge it open either — the next call opens a fresh
+   * one and the reading is simply retried then.
+   */
+  async function runBalanceProbe() {
+    balanceLedger.timer = undefined
+    balanceLedger.windowStartedAt = 0
+    const used = [...balanceLedger.windowKeys]
+    balanceLedger.windowKeys.clear()
+    if (used.length === 0) return
+    try {
+      const pool = await loadKeyPool()
+      const wanted = pool.filter((entry) => used.indexOf(entry.value) >= 0)
+      // Every key the window used is gone (discarded meanwhile). There is nothing
+      // left to ask, and nothing to re-base: the ledger's own pool view is owned
+      // by `keyStateFor` (every call and the health check) and by `dropBalanceKey`
+      // (every discard), so re-basing it here would only risk putting back a key
+      // a concurrent 402 had just removed.
+      if (wanted.length === 0) return
+      const probed = new Map()
+      const dead = []
+      await Promise.all(wanted.map(async (entry) => {
+        const probe = await probeKey(entry.value)
+        if (probe.ok === true) {
+          probed.set(entry.value, primerData(probe.text).balanceLeft)
+        } else if (probe.status === 401 || probe.status === 402) {
+          // A verdict, not a transport failure: this key just proved it cannot
+          // serve, so its cached credits must stop backing the pool now rather
+          // than keep the total inflated until some later call walks onto it.
+          dead.push(entry.value)
+        } else {
+          // A rate limit or a network failure is not a fact: keep the cache.
+          probed.set(entry.value, null)
+        }
+      }))
+      for (const value of dead) dropBalanceKey(value)
+      recordBalanceProbe(probed)
+    } catch (err) {
+      // Leave the ledger as it is: an unread balance is not a fact, and the
+      // timestamp must not move on a round that confirmed nothing.
+    }
+  }
+
+  /** What the page reads: the total, when it was last confirmed, and a pending flag. */
+  function balanceSnapshot() {
+    return {
+      total: balanceLedger.total,
+      updatedAt: balanceLedger.updatedAt,
+      pending: balanceLedger.windowStartedAt !== 0,
+    }
   }
 
   /**
@@ -390,6 +598,11 @@ export function apply(ctx, config) {
       const svc = ctx.get('credentials')
       if (svc === undefined || typeof svc.unset !== 'function') return false
       await svc.unset(entry.ref)
+      // Whatever credits this key held stop backing the pool at the moment it
+      // leaves it, so the ledger drops it without waiting for a probe. A key the
+      // seam refused to delete (read-only, or from a file) is still serving, so
+      // its credits stay in the total — correctly, since the pool still has it.
+      dropBalanceKey(entry.value)
       return true
     } catch (err) {
       return false
@@ -548,7 +761,14 @@ export function apply(ctx, config) {
       if (!isKeyFailoverStatus(res.status)) return { res, index, fatal: true }
       // A revoked or overdrawn key is discarded, not parked: the user only ever
       // adds keys, the plugin keeps the pool clean. 429 stays (temporary).
-      const discarded = res.status === 401 || res.status === 402 ? await discardKey(entry) : false
+      const dry = res.status === 401 || res.status === 402
+      const discarded = dry ? await discardKey(entry) : false
+      // A key that answers 401/402 backs no call, whether or not the seam let us
+      // delete it: a slot from `jina-api-key.txt`, or one the launching
+      // environment supplies read-only, stays in the pool (the walk skips it) but
+      // cannot serve, so its cached credits stop counting here too. A key we did
+      // delete is already out of the ledger, which makes this a no-op for it.
+      if (dry) dropBalanceKey(entry.value)
       attempts.push({ index, status: res.status, entry, discarded })
       state.states[index] = keyStateAfter(state.states[index], res.status, Date.now())
       last = res
@@ -590,6 +810,10 @@ export function apply(ctx, config) {
     let outcome = await walkKeyPool(pool, state, attempts, tried, mkKeyRequest)
     if (outcome.res !== undefined && outcome.res.ok) {
       if (attempts.length > 0) outcome.res.keySwitch = keySwitchOf(pool, attempts, outcome.index)
+      // Credits just left the account behind that key. Recording it opens the
+      // ledger's window — it does not block, does not probe, and does not add a
+      // request to this call.
+      noteBalanceUse(pool[outcome.index] !== undefined ? pool[outcome.index].value : undefined)
       return outcome.res
     }
     if (outcome.fatal) return attempts.length > 0 ? { ...outcome.res, keyAttempts: attempts } : outcome.res
@@ -603,6 +827,7 @@ export function apply(ctx, config) {
       outcome = await walkKeyPool(refreshed, freshState, attempts, tried, mkKeyRequest)
       if (outcome.res !== undefined && outcome.res.ok) {
         if (attempts.length > 0) outcome.res.keySwitch = keySwitchOf(refreshed, attempts, outcome.index)
+        noteBalanceUse(refreshed[outcome.index] !== undefined ? refreshed[outcome.index].value : undefined)
         return outcome.res
       }
     }
@@ -1339,8 +1564,10 @@ export function apply(ctx, config) {
   // serve a call, plus the total credits behind them (jina-cli `primer`), and
   // which endpoint side answered. Registered when the deployment composes a
   // web server (the web profile); profiles without one simply never get the
-  // route. Nothing per key leaves the host: the payload carries counts and one
-  // total, never a key, its fingerprint, or its individual balance — and a key
+  // route. No key material and no per-key list ever leaves the host: the payload
+  // carries counts, one total, and — for the connection state only, never
+  // rendered by the page — the head key's `authenticatedAs` / `balanceLeft`,
+  // which is not a per-key list and never names a key. A key
   // that answers 401/402 or reports no credits left is discarded here, so the
   // page never has to offer the user a list to manage.
 
@@ -1394,7 +1621,8 @@ export function apply(ctx, config) {
         const probes = await Promise.all(pool.map((entry) => probeKey(entry.value)))
         const discarded = []
         const survived = []
-        const counts = { keyCount: 0, balanceTotal: null }
+        const probedBalances = new Map()
+        let keyCount = 0
         await Promise.all(pool.map(async (entry, index) => {
           const probe = probes[index]
           const ok = probe.ok === true
@@ -1407,15 +1635,21 @@ export function apply(ctx, config) {
           const doomed = !ok ? (probe.status === 401 || probe.status === 402) : exhausted
           if (doomed && await discardKey(entry)) discarded.push(entry)
           survived[index] = !doomed
-          if (!doomed) counts.keyCount++
-          if (!doomed && typeof data.balanceLeft === 'number') {
-            counts.balanceTotal = (counts.balanceTotal === null ? 0 : counts.balanceTotal) + data.balanceLeft
+          if (!doomed) {
+            keyCount++
+            probedBalances.set(entry.value, typeof data.balanceLeft === 'number' ? data.balanceLeft : null)
           }
           // The card's refresh is also a health check: a key that answers here
           // updates the same rotation state the failover walk uses, so topping
           // an account up clears its cooldown without a restart.
           state.states[index] = ok ? clearKeyState() : keyStateAfter(state.states[index], probe.status, Date.now())
         }))
+        // This health check probes every key, so it is a full read of the pool:
+        // folding it into the ledger is what lets the card's "refresh" also
+        // refresh the low-balance notice, with no second poll of its own. The
+        // surviving keys are re-based last, so a key this same check just
+        // discarded stays out of the total.
+        recordBalanceProbe(probedBalances, pool.filter((entry, index) => survived[index] === true).map((entry) => entry.value))
         // The headline probe answers "can this profile reach Jina at all" and
         // must describe a key that is still there: the first surviving key whose
         // probe worked, else the first surviving key, else — nothing left — the
@@ -1439,8 +1673,13 @@ export function apply(ctx, config) {
             base: out.endpoint === undefined ? null : out.endpoint.base,
           },
           settingsLive: settingsAreLive(settingsConfig),
-          keyCount: counts.keyCount,
-          balanceTotal: counts.balanceTotal,
+          keyCount,
+          // Read back from the ledger rather than summed here, so this route and
+          // `/balance` can never report two different totals. It is `null` when
+          // no key reported a balance, so the page can say "unknown" instead of
+          // "0". `balanceUpdatedAt` is when a probe last confirmed it.
+          balanceTotal: balanceLedger.total,
+          balanceUpdatedAt: balanceLedger.updatedAt,
           discardedCount: discarded.length,
         }
         let payload
@@ -1462,6 +1701,26 @@ export function apply(ctx, config) {
         }
         res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' })
         res.end(JSON.stringify(payload))
+      },
+    })
+
+    // The balance route the low-balance notice reads. It is the deliberate
+    // opposite of `/primer`: a pure read of memory that never touches the
+    // network, so the page can look at it as often as it likes without spending
+    // credits or waiting on the vendor. All the work — when to probe, which keys
+    // to probe — is decided host-side, where the calls that spend the credits
+    // actually happen.
+    rpcCtx.webServer.register({
+      kind: 'exact',
+      path: '/api/dsh-jina/balance',
+      handler: (req, res) => {
+        if (req.method !== 'GET') {
+          res.writeHead(405, { Allow: 'GET' })
+          res.end()
+          return
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' })
+        res.end(JSON.stringify(balanceSnapshot()))
       },
     })
   })

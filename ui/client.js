@@ -109,12 +109,24 @@ window.__ModuleLoader__.load({
 
     // ---- low-balance reminder -------------------------------------------------
     // The credits behind the whole pool below which the frame-wide notice
-    // appears; 0 (or negative) disables the notice entirely. The check itself is
-    // free — it is the same Reader-root GET the card's own refresh makes, which
-    // costs no credits and is what `/api/dsh-jina/primer` already runs.
+    // appears; 0 (or negative) disables the notice entirely.
+    //
+    // The number behind it is the host's balance ledger, not a probe of this
+    // page's own: the host is where the calls that spend credits actually
+    // happen, so it is the host that decides when a real probe is due. This page
+    // only reads the result, which costs nothing.
     var LOW_BALANCE_THRESHOLD = 1000000
-    // How often the notice re-reads that route while the page stays open.
-    var LOW_BALANCE_POLL_MS = 15 * 60 * 1000
+    // How often the page re-reads that ledger. This is a local read of host
+    // memory — no credits, no vendor round-trip, no waiting — so it can be
+    // frequent. The ledger is refreshed by a call a minute after it happened, so
+    // this only decides how quickly the page *notices* that.
+    var BALANCE_LEDGER_POLL_MS = 10 * 1000
+    // How often the settings card re-renders its own "N 分钟前更新" line. That
+    // card is a snapshot with no timer of its own, so without this its age line
+    // would freeze at whatever it read when the card last rendered — "刚刚更新"
+    // for as long as the page stays open. An age line that never ages is worse
+    // than no line: it is the one thing that tells the user the figure is old.
+    var FRESHNESS_TICK_MS = 30 * 1000
     // Remembering a dismissal is what keeps the notice from re-appearing on
     // every reload; recovering above the threshold re-arms it.
     var LOW_BALANCE_STORE_KEY = 'dsh-jina:low-balance-dismissed'
@@ -177,6 +189,7 @@ window.__ModuleLoader__.load({
       // The live balance gets the primary colour: it is the number the user
       // compares against the threshold in the line above it.
       lowBalanceValue: { fontSize: 13, lineHeight: '20px', color: 'var(--dsw-alias-label-primary)', margin: 0, fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace' },
+      lowBalanceFresh: { fontSize: 12, lineHeight: '18px', color: 'var(--dsw-alias-label-tertiary, rgba(127,127,127,0.6))', margin: 0 },
       lowBalanceRow: { display: 'flex', alignItems: 'center', gap: 8, justifyContent: 'flex-end' },
     }
 
@@ -273,55 +286,103 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * The host's balance ledger: the pool total, when a probe last confirmed it,
+     * and whether a window is counting down to the next confirmation.
+     *
+     * A read of host memory, so it spends no credits and never reaches the
+     * vendor — which is why the page may do it on a ten-second clock while the
+     * host keeps the real probing on its own, far slower schedule. Never throws.
+     * @returns a promise of `{ total, updatedAt, pending }`, or `null` when the
+     *   read failed — which is deliberately *not* the same as "no balance": a
+     *   caller must be able to tell an offline moment from an empty pool, or it
+     *   will drop a warning that is still true.
+     */
+    function readBalanceLedger() {
+      return fetch('/api/dsh-jina/balance')
+        .then(function (response) { return response.json() })
+        .then(function (payload) {
+          return {
+            total: payload && typeof payload.total === 'number' ? payload.total : null,
+            updatedAt: payload && typeof payload.updatedAt === 'number' ? payload.updatedAt : 0,
+            pending: payload !== null && typeof payload === 'object' && payload.pending === true,
+          }
+        })
+        .catch(function () { return null })
+    }
+
+    /**
+     * How long ago a probe confirmed the balance, in the page's own language.
+     *
+     * "When did we last look" and "when did the number last change" are different
+     * questions: a probe that finds the same figure still confirms it, so this
+     * counts from the last confirmation. It ticks on its own — the page re-reads
+     * the ledger every few seconds, which re-renders this line as the minute
+     * bucket rolls over.
+     * @param updatedAt - epoch millis of the last confirmation; 0 if never.
+     * @param now - the current epoch millis.
+     * @returns the line to show, or null when nothing has been confirmed yet.
+     */
+    function freshnessText(updatedAt, now) {
+      if (typeof updatedAt !== 'number' || updatedAt <= 0 || typeof now !== 'number') return null
+      var minutes = Math.floor(Math.max(0, now - updatedAt) / 60000)
+      if (minutes < 1) return '刚刚更新'
+      if (minutes < 60) return minutes + ' 分钟前更新'
+      return Math.floor(minutes / 60) + ' 小时前更新'
+    }
+
+    /**
      * The low-balance reminder: one frame-wide notice in the Web shell.
      *
      * `shell.overlay` is a plain root-scope list slot the shell renders for
      * every registered id, so this entry needs neither a harness change nor a
-     * build step — this file is the bundle. It polls the same host route the
-     * card does (free: the probe is the card's own refresh call), shows only
+     * build step — this file is the bundle. It reads the same host ledger the
+     * card does (a free read of memory, not a probe of the vendor), shows only
      * while the pool total sits below `LOW_BALANCE_THRESHOLD` — until the user
      * dismisses it, or the pool recovers above the threshold — and never crashes
-     * the shell: a failed poll or an unreadable payload means "no balance fact".
+     * the shell: a failed read or a missing number means "no balance fact".
      *
      * Three lines and one dismissal: a title naming the plugin, the threshold it
-     * crossed, and the balance it is actually at right now. There is no billing
-     * link and no settings jump to click — the jump was tried and dropped, since
-     * it had to drive the shell's DOM (DSH exposes no open-settings API to a
-     * plugin) and behaved unreliably in practice.
+     * crossed, and the balance it is actually at right now, with how long ago
+     * that figure was confirmed. There is no billing link and no settings jump
+     * to click — the jump was tried and dropped, since it had to drive the
+     * shell's DOM (DSH exposes no open-settings API to a plugin) and behaved
+     * unreliably in practice.
      * @returns the notice element, or null while the pool is healthy.
      */
     function LowBalanceNotice() {
-      var [observed, setObserved] = React.useState({ total: undefined, threshold: LOW_BALANCE_THRESHOLD })
+      var [observed, setObserved] = React.useState({ total: undefined, updatedAt: 0, threshold: LOW_BALANCE_THRESHOLD })
       var [shown, setShown] = React.useState(false)
       React.useEffect(function () {
         ensureNoticeStyles()
         var stopped = false
         var check = function () {
-          // A failed poll must not become a balance fact, and must not throw
-          // into the slot: both handlers below only set state.
-          fetch('/api/dsh-jina/primer').then(function (response) { return response.json() }).then(function (payload) {
-            if (stopped) return
-            var total = payload && typeof payload.balanceTotal === 'number' ? payload.balanceTotal : undefined
+          // A failed read must not become a balance fact, and must not throw
+          // into the slot: the handler below only sets state, and a read that
+          // never arrived leaves the last known state alone — an offline moment
+          // is not evidence that the credits came back.
+          readBalanceLedger().then(function (ledger) {
+            if (stopped || ledger === null) return
+            var total = typeof ledger.total === 'number' ? ledger.total : undefined
             var threshold = effectiveThreshold()
-            setObserved({ total: total, threshold: threshold })
+            setObserved({ total: total, updatedAt: ledger.updatedAt, threshold: threshold })
             // A profile with no key pool reports no total (and a threshold of 0
             // is the documented "off" switch): nothing to run out of, nothing
             // to remind about.
             if (!(threshold > 0) || total === undefined) { setShown(false); return }
             if (total >= threshold) { clearDismissal(); setShown(false); return }
             // The latch records a *dismissal*, never the notice itself: while the
-            // drop stands and the user has not dismissed it, every poll re-asserts
+            // drop stands and the user has not dismissed it, every read re-asserts
             // `shown` so the notice stays up until it is dismissed or the pool
             // recovers. (An unchanged `true` is a no-op for React.)
             if (dismissalSeen()) { setShown(false); return }
             setShown(true)
-          }, function () { /* a failed poll is not a balance fact */ })
+          })
         }
         check()
-        // The poll only runs while the page is open, and the cleanup is what
+        // The read only runs while the page is open, and the cleanup is what
         // stops it when the shell unmounts the entry.
         if (typeof window === 'undefined' || typeof window.setInterval !== 'function') return undefined
-        var timer = window.setInterval(check, LOW_BALANCE_POLL_MS)
+        var timer = window.setInterval(check, BALANCE_LEDGER_POLL_MS)
         return function () { stopped = true; window.clearInterval(timer) }
       }, [])
       if (!shown) return null
@@ -329,11 +390,13 @@ window.__ModuleLoader__.load({
         ? observed.threshold.toLocaleString('en-US')
         : LOW_BALANCE_THRESHOLD.toLocaleString('en-US')
       var currentText = typeof observed.total === 'number' ? observed.total.toLocaleString('en-US') : '未知'
+      var freshText = freshnessText(observed.updatedAt, Date.now())
       return React.createElement('div', { className: LOW_BALANCE_CLASS, style: S.lowBalance, role: 'status' },
         React.createElement('p', { style: S.lowBalanceTitle }, 'Jina Tools'),
         React.createElement('p', { style: S.lowBalanceText },
           '该插件可用点数少于 ' + thresholdText + '，请注意补充。'),
         React.createElement('p', { style: S.lowBalanceValue }, '当前还有 ' + currentText + '。'),
+        freshText === null ? null : React.createElement('p', { style: S.lowBalanceFresh }, freshText),
         React.createElement('div', { style: S.lowBalanceRow },
           React.createElement('button', {
             type: 'button',
@@ -375,6 +438,9 @@ window.__ModuleLoader__.load({
       var [removeSelectorInput, setRemoveSelectorInput] = React.useState('')
       var [optsStatus, setOptsStatus] = React.useState('')
       var [optsStatusKind, setOptsStatusKind] = React.useState('info')
+      // Only ever written, to re-render the card so its balance age line moves
+      // on its own; the value itself is not read.
+      var [, setFreshTick] = React.useState(0)
       var optsDirty = React.useRef(false)
 
       var settingsApi = function () {
@@ -515,6 +581,13 @@ window.__ModuleLoader__.load({
         refresh()
         loadNs()
         loadPrimer()
+        // The age line next to the balance has to keep moving: this card is a
+        // snapshot (it re-reads on "refresh", on a key change and on an endpoint
+        // change), so a line rendered once would keep claiming "刚刚更新" long
+        // after the figure went stale. A plain local re-render, no network.
+        var ticker = typeof window !== 'undefined' && typeof window.setInterval === 'function'
+          ? window.setInterval(function () { setFreshTick(function (n) { return n + 1 }) }, FRESHNESS_TICK_MS)
+          : undefined
         var disposers = [
           remote.$on('credentials/reference-updated', function (ref) {
             // Any pool slot: a key saved in another tab, or cleared by a
@@ -531,6 +604,7 @@ window.__ModuleLoader__.load({
           }),
         ]
         return function () {
+          if (ticker !== undefined) window.clearInterval(ticker)
           for (var i = 0; i < disposers.length; i++) if (typeof disposers[i] === 'function') disposers[i]()
         }
       }, [remote])
@@ -793,11 +867,22 @@ window.__ModuleLoader__.load({
         // an unusable key is discarded by the host, so the count is the count.
         var total = typeof d.keyCount === 'number' ? d.keyCount : 0
         var totalBalance = typeof d.balanceTotal === 'number' ? d.balanceTotal.toLocaleString('en-US') + ' credits' : '未知'
+        // Both the figure and its age come from the host's balance ledger, the
+        // same one the floating notice reads — so the two can never disagree, and
+        // the age line says plainly how much the number is worth. This card is a
+        // snapshot: it re-reads on "refresh", on a key change and on an endpoint
+        // change, and the age line is what makes the wait visible meanwhile.
+        // Only a known figure gets dated: stamping an unknown balance as freshly
+        // confirmed would date a number the card does not have.
+        var freshText = typeof d.balanceTotal === 'number' ? freshnessText(d.balanceUpdatedAt, Date.now()) : null
         primerLines = [
           React.createElement('p', { key: 'ok', style: S.statusOk }, '✅ 连接正常，key 可用'),
           React.createElement('p', { key: 'total', style: S.mono }, 'Key 总数：' + total + ' 个'),
           React.createElement('p', { key: 'bal', style: S.mono }, '总余额：' + totalBalance),
         ]
+        if (freshText !== null) {
+          primerLines.push(React.createElement('p', { key: 'fresh', style: S.note }, freshText))
+        }
         // The frame-wide notice lives in the shell's overlay layer (z-index 20),
         // which the full-viewport Settings modal (z-index 1000) covers — and this
         // card is exactly where a user checking the pool will be looking. So the

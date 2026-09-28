@@ -49,11 +49,19 @@ function reactStub(stateOverrides = []) {
   }
 }
 
-/** Execute the committed bundle and return its registration. */
+/** Execute the committed bundle and return its registration, plus any timers it asked for. */
 function loadBundle() {
   let registration
+  const timers = []
+  const cleared = []
   const sandbox = {
-    window: { __ModuleLoader__: { load: (entry) => { registration = entry } } },
+    window: {
+      __ModuleLoader__: { load: (entry) => { registration = entry } },
+      // The card and the notice both schedule local re-renders of their own;
+      // recording them is what lets a test prove the age line is kept moving.
+      setInterval: (callback, ms) => { timers.push({ callback, ms }); return timers.length },
+      clearInterval: (id) => { cleared.push(id) },
+    },
     // The card's key-health probe fetches its own host route; the effect that
     // starts it runs in this VM, so the global has to exist.
     fetch: () => Promise.resolve({ json: () => Promise.resolve({ ok: false, error: 'stub' }) }),
@@ -61,7 +69,7 @@ function loadBundle() {
   new Script(SOURCE, { filename: 'ui/client.js' }).runInContext(createContext(sandbox))
   assert.ok(registration !== undefined, 'the bundle must register through window.__ModuleLoader__.load')
   assert.equal(registration.id, 'dsh-jina')
-  return registration
+  return { registration, timers, cleared }
 }
 
 /**
@@ -72,7 +80,7 @@ function loadBundle() {
  *   reports as configured (defaults to slot 1 only).
  */
 function mount(stateOverrides = [], options = {}) {
-  const registration = loadBundle()
+  const { registration, timers, cleared } = loadBundle()
   const { React, elements } = reactStub(stateOverrides)
   const exported = registration.factory((specifier) => {
     if (specifier === 'react') return React
@@ -116,7 +124,7 @@ function mount(stateOverrides = [], options = {}) {
   const ctx = { get: (name) => services[name], slots }
 
   exported.apply(ctx)
-  return { registrations, elements, credentialCalls }
+  return { registrations, elements, credentialCalls, timers, cleared }
 }
 
 /** The entry the Plugins page dispatches for the `dsh-jina` bundle. */
@@ -357,6 +365,68 @@ test('client bundle: the reminder is titled, names the threshold, and carries tw
   assert.match(String(tree.props.style.animation), /dsh-jina-low-balance-flash 1\.1s ease-in-out 2/)
   assert.match(String(tree.props.style.boxShadow), /rgba\(224,49,49/)
   assert.match(String(tree.props.style.border), /rgba\(224,49,49/)
+})
+
+test('client bundle: both places that print a balance also say how old it is', () => {
+  // A balance the user cannot date is a balance they cannot act on, and the
+  // ledger is confirmed on a host schedule rather than live — so the age is the
+  // information that makes the number honest. Both the notice and the card
+  // render it, from the same formatter, so they can never word it differently.
+  const seen = Date.now() - 17 * 60 * 1000
+
+  const overlay = mount([{ total: 987654, updatedAt: seen, threshold: 1000000 }, true])
+  renderView(overlayEntry(overlay.registrations), undefined)
+  const noticeTexts = overlay.elements.filter(node => node.type === 'p')
+    .map(node => (Array.isArray(node.props.children) ? node.props.children.join('') : node.props.children))
+  assert.ok(noticeTexts.includes('17 分钟前更新'), 'the notice dates its figure')
+
+  const views = {}
+  for (const ref of KEY_REFS) views[ref] = { configured: false, writable: true }
+  views[KEY_REFS[0]] = { configured: true, source: 'file', writable: true }
+  const card = mount([undefined, views, undefined, undefined, {
+    phase: 'ok',
+    data: { ok: true, keyCount: 1, discardedCount: 0, balanceTotal: 987654, balanceUpdatedAt: seen, endpoint: { mode: 'cn', side: 'cn', base: 'https://r.jinaai.cn/' } },
+    error: undefined,
+  }])
+  renderView(bundleEntry(card.registrations), 'page')
+  const cardTexts = card.elements.filter(node => node.type === 'p')
+    .map(node => (Array.isArray(node.props.children) ? node.props.children.join('') : node.props.children))
+  assert.ok(cardTexts.includes('17 分钟前更新'), 'and the card dates the same figure the same way')
+
+  // Nothing confirmed yet: no line, rather than a fabricated "0 分钟前".
+  const never = mount([{ total: 987654, updatedAt: 0, threshold: 1000000 }, true])
+  renderView(overlayEntry(never.registrations), undefined)
+  const undated = never.elements.filter(node => node.type === 'p')
+    .map(node => (Array.isArray(node.props.children) ? node.props.children.join('') : node.props.children))
+  assert.equal(undated.some(text => typeof text === 'string' && text.includes('更新')), false,
+    'a figure that was never confirmed carries no age line')
+})
+
+test('client bundle: the card dates a figure only when it has one, and keeps the date moving', () => {
+  // Two ways this line can lie, both of them worse than having no line at all:
+  // dating an *unknown* balance ("总余额：未知" over "刚刚更新"), and freezing at
+  // whatever age the card happened to render — the card is a snapshot with no
+  // poll of its own, so without a local ticker it would claim "刚刚更新" for as
+  // long as the settings page stays open.
+  const views = {}
+  for (const ref of KEY_REFS) views[ref] = { configured: false, writable: true }
+  views[KEY_REFS[0]] = { configured: true, source: 'file', writable: true }
+  const unknown = mount([undefined, views, undefined, undefined, {
+    phase: 'ok',
+    data: { ok: true, keyCount: 1, discardedCount: 0, balanceTotal: null, balanceUpdatedAt: Date.now(), endpoint: { mode: 'cn', side: 'cn', base: 'https://r.jinaai.cn/' } },
+    error: undefined,
+  }])
+  renderView(bundleEntry(unknown.registrations), 'page')
+  const texts = unknown.elements.filter(node => node.type === 'p')
+    .map(node => (Array.isArray(node.props.children) ? node.props.children.join('') : node.props.children))
+  assert.ok(texts.includes('总余额：未知'), 'an unknown balance is what the card says when the ledger has no figure')
+  assert.equal(texts.some(text => typeof text === 'string' && text.includes('更新')), false,
+    'and it must not stamp that unknown figure as freshly confirmed')
+
+  const ticker = unknown.timers.find(timer => timer.ms === 30000)
+  assert.ok(ticker !== undefined, 'the card must schedule its own re-render, or the age line never ages')
+  assert.equal(typeof ticker.callback, 'function', 'and it must be the re-render, not a vendor call')
+  assert.ok(unknown.cleared.length >= 1, 'and it must be torn down with the entry, not leak per mount')
 })
 
 test('client bundle: the low-balance reminder stays silent while the pool is healthy', () => {

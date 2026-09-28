@@ -202,7 +202,7 @@ test('client bundle: the reminder is titled, names the threshold, and shows the 
   const threshold = /LOW_BALANCE_THRESHOLD\s*=\s*([0-9_]+)/.exec(SOURCE)
   assert.ok(threshold, 'the bundle must declare the reminder threshold')
   assert.equal(Number(threshold[1].replace(/_/g, '')), 1000000)
-  assert.match(SOURCE, /balanceTotal/, 'the reminder reads the pool total the host reports')
+  assert.match(SOURCE, /function readBalanceLedger\(\)/, 'the reminder reads the host ledger')
   assert.match(SOURCE, /'Jina Tools'/, 'the notice is titled with the plugin name')
   assert.match(SOURCE, /该插件可用点数少于 /, 'the body names the threshold it crossed')
   assert.match(SOURCE, /请注意补充/, 'and asks the user to top up')
@@ -210,6 +210,44 @@ test('client bundle: the reminder is titled, names the threshold, and shows the 
   assert.match(SOURCE, /'知道了'/, 'and one action dismisses the notice')
   // The old billing link must not come back.
   assert.equal(/去充值/.test(SOURCE), false, 'the billing link must stay gone')
+})
+
+test('client bundle: the reminder reads the ledger and never probes the vendor', () => {
+  // The host owns when a probe is due — it is where the calls that spend credits
+  // happen — and the page only reads the result. A regression to a page-driven
+  // probe would put the timing back on a browser clock (slow, closed tab, and a
+  // wasted request per read), which is the whole defect this design removed.
+  // (That the *notice* never reaches the vendor is proven at runtime, over a
+  // mounted component, in test/client-reminder.test.js; what a source scan can
+  // settle is which route its read goes to, and that the old poll is gone.)
+  const routes = [...SOURCE.matchAll(/fetch\('([^']+)'\)/g)].map(match => match[1])
+  assert.deepEqual([...new Set(routes)].sort(), ['/api/dsh-jina/balance', '/api/dsh-jina/primer'],
+    'exactly two routes in the bundle: the ledger the notice reads, and the health check the card runs on demand')
+  assert.match(SOURCE, /function readBalanceLedger\(\)[\s\S]*?fetch\('\/api\/dsh-jina\/balance'\)/,
+    'and the read the notice depends on is the ledger, not the probing health check')
+  assert.equal(/setInterval\(check, LOW_BALANCE_POLL_MS\)/.test(SOURCE), false,
+    'the old 15-minute page-owned poll must not come back')
+  assert.match(SOURCE, /setInterval\(check, BALANCE_LEDGER_POLL_MS\)/,
+    'what replaced it is a short read of local memory, not a vendor probe')
+})
+
+test('client bundle: the balance is shown with how long ago it was confirmed', () => {
+  // A number without a date is a number the user cannot reason about: the point
+  // of the ledger is that it is confirmed, and by a host schedule, not live.
+  assert.match(SOURCE, /function freshnessText\(updatedAt, now\)/)
+  assert.match(SOURCE, /'刚刚更新'/, 'a fresh confirmation')
+  assert.match(SOURCE, /分钟前更新/, 'and a counted age in minutes')
+  assert.match(SOURCE, /小时前更新/, 'rolling over into hours')
+  // Both places that print a balance must date it, through the one formatter.
+  // Anchored on the *render* expression, not on the bare label: a comment that
+  // happens to quote the copy is not a place the user sees a balance.
+  const printed = [...SOURCE.matchAll(/'总余额：' \+|'当前还有 ' \+/g)]
+  assert.equal(printed.length, 2, 'the card and the notice are the two places a balance is printed')
+  assert.equal([...SOURCE.matchAll(/freshnessText\(/g)].length, 3, 'definition plus both call sites')
+  // And the card dates only a figure it actually has: an unknown balance must
+  // not carry an age stamp.
+  assert.match(SOURCE, /var freshText = typeof d\.balanceTotal === 'number' \? freshnessText\(d\.balanceUpdatedAt, Date\.now\(\)\) : null/,
+    'the card must not date a balance it does not have')
 })
 
 test('client bundle: the settings jump stays gone', () => {
